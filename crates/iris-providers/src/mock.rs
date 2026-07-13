@@ -42,7 +42,10 @@ impl MessageProvider for MockProvider {
             unread_count: Some(0),
             metadata: serde_json::Value::Null,
         }];
-        Ok(threads.into_iter().take(limit.unwrap_or(50) as usize).collect())
+        Ok(threads
+            .into_iter()
+            .take(limit.unwrap_or(50) as usize)
+            .collect())
     }
 
     async fn list_messages(
@@ -71,7 +74,10 @@ impl MessageProvider for MockProvider {
             is_outbound: false,
             metadata: serde_json::Value::Null,
         }];
-        Ok(messages.into_iter().take(limit.unwrap_or(50) as usize).collect())
+        Ok(messages
+            .into_iter()
+            .take(limit.unwrap_or(50) as usize)
+            .collect())
     }
 
     async fn list_contacts(&self, _limit: Option<u32>) -> Result<Vec<Contact>> {
@@ -85,11 +91,7 @@ impl MessageProvider for MockProvider {
         }])
     }
 
-    async fn send_message(
-        &self,
-        thread_id: &str,
-        body: &str,
-    ) -> Result<Message> {
+    async fn send_message(&self, thread_id: &str, body: &str) -> Result<Message> {
         Ok(Message {
             id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
@@ -116,7 +118,7 @@ impl MessageProvider for MockProvider {
 impl MockProvider {
     /// Creates a new mock provider.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

@@ -3,7 +3,7 @@ title = "gitleaks config"
 [extend]
 useDefault = true
 
-[[allowlist]]
+[allowlist]
 paths = [
     '''(^|/)Cargo\.lock$''',
     '''(^|/)\.github/.*\.yml$''',

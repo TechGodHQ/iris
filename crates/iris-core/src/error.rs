@@ -7,10 +7,7 @@ use thiserror::Error;
 pub enum IrisError {
     /// A provider returned an error.
     #[error("provider '{provider}' error: {message}")]
-    Provider {
-        provider: String,
-        message: String,
-    },
+    Provider { provider: String, message: String },
 
     /// A provider was not found or not configured.
     #[error("provider not found: {0}")]

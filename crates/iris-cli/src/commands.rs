@@ -63,11 +63,10 @@ pub async fn list_contacts(args: ListArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn list_providers() -> anyhow::Result<()> {
+pub fn list_providers() {
     let provider = get_provider();
     let meta = provider.metadata();
     println!("  {} — {}", meta.id, meta.name);
-    Ok(())
 }
 
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {

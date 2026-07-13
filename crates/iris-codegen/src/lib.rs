@@ -14,4 +14,5 @@
 // Placeholder — code generation logic will be implemented following
 // the first OpenSpec change that exercises this.
 
+/// Path to the API operations definition file (single source of truth).
 pub const API_DEFINITION_PATH: &str = "api/operations.yaml";

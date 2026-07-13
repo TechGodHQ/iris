@@ -3,15 +3,12 @@
 //! These will be code-generated from the core API definition in a future
 //! iteration. For now, they're hand-wired stubs.
 
-use std::sync::Arc;
-
 use axum::{
+    Router,
     extract::{Query, State},
     response::Json,
     routing::get,
-    Router,
 };
-use iris_core::MessageProvider;
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
@@ -40,9 +37,7 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
 }
 
-async fn list_providers(
-    State(state): State<AppState>,
-) -> Json<Vec<serde_json::Value>> {
+async fn list_providers(State(state): State<AppState>) -> Json<Vec<serde_json::Value>> {
     let providers: Vec<_> = state
         .providers
         .iter()
@@ -97,7 +92,3 @@ async fn list_messages(
     }
     Json(all_messages)
 }
-
-// Suppress unused import warning for Arc — used in AppState definition context.
-#[allow(unused_imports)]
-use std::sync::Arc as _UnusedArc;

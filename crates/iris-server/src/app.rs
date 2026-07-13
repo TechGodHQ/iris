@@ -15,7 +15,6 @@ pub struct AppState {
 }
 
 /// Creates the Axum application with all routes wired.
-#[must_use]
 pub fn create_app(providers: Vec<Arc<dyn MessageProvider>>) -> Router {
     let state = AppState { providers };
     routes::router(state)

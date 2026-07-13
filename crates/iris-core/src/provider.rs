@@ -73,9 +73,5 @@ pub trait MessageProvider: Send + Sync {
     async fn list_contacts(&self, limit: Option<u32>) -> Result<Vec<Contact>>;
 
     /// Send a message. Only available if the provider has `SendMessages` capability.
-    async fn send_message(
-        &self,
-        thread_id: &str,
-        body: &str,
-    ) -> Result<Message>;
+    async fn send_message(&self, thread_id: &str, body: &str) -> Result<Message>;
 }

@@ -10,7 +10,9 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "iris")]
 #[command(version, about = "LLM-first, source-agnostic messaging system")]
-#[command(long_about = "Iris normalizes messages from multiple sources (Telegram, SMS, Email, etc.) into a unified API.")]
+#[command(
+    long_about = "Iris normalizes messages from multiple sources (Telegram, SMS, Email, etc.) into a unified API."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -40,7 +42,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Threads(args) => commands::list_threads(args).await,
         Commands::Messages(args) => commands::list_messages(args).await,
         Commands::Contacts(args) => commands::list_contacts(args).await,
-        Commands::Providers => commands::list_providers().await,
+        Commands::Providers => {
+            commands::list_providers();
+            Ok(())
+        }
         Commands::Serve(args) => commands::serve(args).await,
     }
 }

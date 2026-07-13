@@ -7,5 +7,7 @@
 // This crate is a placeholder — MCP protocol implementation will follow
 // the core API definition stabilization.
 
+/// Constant identifying the MCP server name.
 pub const SERVER_NAME: &str = "iris";
+/// Constant identifying the MCP server version.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
