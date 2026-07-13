@@ -1,0 +1,23 @@
+[package]
+name = "iris-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Built-in message providers for Iris (Telegram, SMS, Email, etc.)"
+
+[lints]
+workspace = true
+
+[dependencies]
+iris-core = { path = "../iris-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

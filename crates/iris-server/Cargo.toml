@@ -1,0 +1,26 @@
+[package]
+name = "iris-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP server for Iris — REST API surface"
+
+[lints]
+workspace = true
+
+[dependencies]
+iris-core = { path = "../iris-core" }
+iris-providers = { path = "../iris-providers" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

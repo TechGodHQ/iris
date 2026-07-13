@@ -1,0 +1,36 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Rust (edition 2024), Cargo workspace, tokio async runtime
+  Module path: crates/iris-{core,providers,server,cli,mcp,codegen}
+  Architecture: ports & adapters (hexagonal) — iris-core has zero I/O deps
+  
+  What Iris does: Normalizes messages from multiple sources (Telegram, SMS,
+  WhatsApp, Email, Instagram, etc.) into a unified, source-agnostic API.
+  
+  Core operations: list messages, list threads, list contacts, send message.
+  These operations are exposed via CLI, HTTP (REST), and MCP surfaces.
+  
+  Design principles:
+    - Single source, many providers (prism metaphor, like creed)
+    - Source-agnostic: normalize everything into a superset message model
+    - LLM-first: designed for agent consumption, not just human UI
+    - Self-hostable: MIT licensed, no cloud dependencies
+    - Code generation: CLI/MCP/HTTP surfaces generated from a core API spec
+    - Extensible: adding a new provider should be trivial (implement MessageProvider trait)
+    - Idempotent: repeated queries return the same results
+
+rules:
+  proposal:
+    - Keep proposals under 500 words
+    - Always include a "Non-goals" section
+    - Reference specific provider sources (telegram, sms, email, etc.)
+  design:
+    - Include ASCII architecture diagrams
+    - Document every trait/interface before implementation
+    - Justify each external dependency
+    - Consider async/error handling implications
+  tasks:
+    - Break tasks into chunks of max 2 hours
+    - Each task must be independently testable
+    - Order tasks by dependency (core → providers → server → CLI/MCP → codegen)

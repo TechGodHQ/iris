@@ -1,0 +1,29 @@
+# Lefthook configuration for iris
+# https://github.com/evilmartians/lefthook
+
+pre-commit:
+  parallel: true
+  commands:
+    gitleaks:
+      tags: [security]
+      run: gitleaks protect --staged --verbose --config .gitleaks.toml
+
+    fmt:
+      tags: [lint]
+      run: |
+        if cargo fmt --check 2>/dev/null; then
+          true
+        else
+          echo "Run 'cargo fmt' to fix formatting"
+          exit 1
+        fi
+
+    test:
+      tags: [test]
+      run: cargo test --all-targets
+
+pre-push:
+  commands:
+    clippy:
+      tags: [lint]
+      run: cargo clippy --all-targets -- -D warnings
