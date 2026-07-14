@@ -167,7 +167,7 @@ impl MessageProvider for TelegramProvider {
         }
 
         let mut threads: Vec<_> = by_chat.into_values().collect();
-        threads.sort_by(|a, b| b.last_message_at.cmp(&a.last_message_at));
+        threads.sort_by_key(|t| std::cmp::Reverse(t.last_message_at));
         threads.truncate(limit.unwrap_or(50) as usize);
         Ok(threads)
     }
@@ -188,7 +188,7 @@ impl MessageProvider for TelegramProvider {
             .filter(|message| before.is_none_or(|cursor| message.timestamp < cursor))
             .collect();
 
-        messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        messages.sort_by_key(|m| m.timestamp);
         messages.truncate(limit.unwrap_or(50) as usize);
         Ok(messages)
     }
