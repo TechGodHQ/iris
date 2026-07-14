@@ -14,6 +14,7 @@ use std::{
 use iris_core::MessageProvider;
 use serde::Deserialize;
 
+use crate::email::EmailProvider;
 use crate::mock::MockProvider;
 use crate::telegram::TelegramProvider;
 
@@ -177,6 +178,9 @@ fn build_provider(provider: &ResolvedProviderConfig) -> anyhow::Result<Arc<dyn M
         "telegram" => Ok(Arc::new(TelegramProvider::from_credentials(
             &provider.credentials,
         )?)),
+        "email" => Ok(Arc::new(EmailProvider::from_credentials(
+            &provider.credentials,
+        )?)),
         other => anyhow::bail!("provider is configured but not available in this build: {other}"),
     }
 }
@@ -259,5 +263,27 @@ bot_token = "123:abc"
         let providers = providers_from_config(&config).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "telegram");
+    }
+
+    #[test]
+    fn builds_email_provider_from_credentials() {
+        let config = IrisConfig::from_toml(
+            r#"
+[providers.email]
+enabled = true
+
+[providers.email.credentials]
+imap_host = "imap.example.com"
+smtp_host = "smtp.example.com"
+username = "alice@example.com"
+password = "app-password"
+from = "alice@example.com"
+"#,
+        )
+        .expect("valid config");
+
+        let providers = providers_from_config(&config).expect("registry builds");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id(), "email");
     }
 }
