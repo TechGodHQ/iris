@@ -15,6 +15,7 @@ use iris_core::MessageProvider;
 use serde::Deserialize;
 
 use crate::mock::MockProvider;
+use crate::telegram::TelegramProvider;
 
 /// Environment variable used to point Iris at a config file.
 pub const CONFIG_PATH_ENV: &str = "IRIS_CONFIG";
@@ -173,6 +174,9 @@ pub fn providers_from_config(config: &IrisConfig) -> anyhow::Result<Vec<Arc<dyn 
 fn build_provider(provider: &ResolvedProviderConfig) -> anyhow::Result<Arc<dyn MessageProvider>> {
     match provider.id.as_str() {
         "mock" => Ok(Arc::new(MockProvider::new())),
+        "telegram" => Ok(Arc::new(TelegramProvider::from_credentials(
+            &provider.credentials,
+        )?)),
         other => anyhow::bail!("provider is configured but not available in this build: {other}"),
     }
 }
@@ -237,5 +241,23 @@ enabled = false
                 .to_string()
                 .contains("IRIS_TEST_SECRET_DOES_NOT_EXIST")
         );
+    }
+
+    #[test]
+    fn builds_telegram_provider_from_bot_token() {
+        let config = IrisConfig::from_toml(
+            r#"
+[providers.telegram]
+enabled = true
+
+[providers.telegram.credentials]
+bot_token = "123:abc"
+"#,
+        )
+        .expect("valid config");
+
+        let providers = providers_from_config(&config).expect("registry builds");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id(), "telegram");
     }
 }
