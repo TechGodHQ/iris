@@ -52,7 +52,19 @@ mode = "development"
 
 # Secrets can come from environment variables so credentials stay out of files.
 token = { env = "IRIS_MOCK_TOKEN" }
+
+[providers.telegram]
+enabled = true
+
+[providers.telegram.credentials]
+# Telegram Bot API token. `token` is also accepted as an alias.
+bot_token = { env = "TELEGRAM_BOT_TOKEN" }
 ```
+
+The Telegram provider uses the Bot API. It can list and normalize messages that
+are visible to the bot through `getUpdates`, group/private chats as Iris threads,
+Telegram users as Iris contacts, and outbound text messages through `sendMessage`.
+Use the Telegram chat id (`thread.source_id`) when sending a message.
 
 Provider declarations are keyed by provider id. Disabled providers are skipped:
 
