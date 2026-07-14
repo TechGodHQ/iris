@@ -59,6 +59,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Error handling
 thiserror = "2"
 anyhow = "1"
+toml = "0.8"
 
 # Testing
 pretty_assertions = "1"

@@ -4,4 +4,5 @@
 //! messaging source. Providers are independent — adding a new source is
 //! just adding a new module here.
 
+pub mod config;
 pub mod mock;

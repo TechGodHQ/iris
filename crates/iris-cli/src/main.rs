@@ -40,10 +40,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Generated(command) => commands::execute_generated(command).await,
-        Commands::Providers => {
-            commands::list_providers();
-            Ok(())
-        }
+        Commands::Providers => commands::list_providers(),
         Commands::Serve(args) => commands::serve(args).await,
     }
 }
