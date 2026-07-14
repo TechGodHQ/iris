@@ -14,6 +14,7 @@ iris-core = { path = "../iris-core" }
 iris-providers = { path = "../iris-providers" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }

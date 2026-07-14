@@ -1,9 +1,12 @@
 //! Iris CLI — command-line interface for the unified messaging system.
-//!
-//! Subcommands are auto-generated from the core API definition by
-//! iris-codegen in a future iteration. For now, hand-wired.
 
 mod commands;
+mod generated {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../generated/cli.rs"
+    ));
+}
 
 use clap::{Parser, Subcommand};
 
@@ -20,12 +23,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List threads across all providers.
-    Threads(commands::ListArgs),
-    /// List messages in a thread.
-    Messages(commands::MessagesArgs),
-    /// List contacts.
-    Contacts(commands::ListArgs),
+    /// Run a generated API operation.
+    #[command(flatten)]
+    Generated(generated::GeneratedCommand),
     /// List registered providers.
     Providers,
     /// Serve the HTTP API.
@@ -39,9 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Threads(args) => commands::list_threads(args).await,
-        Commands::Messages(args) => commands::list_messages(args).await,
-        Commands::Contacts(args) => commands::list_contacts(args).await,
+        Commands::Generated(command) => commands::execute_generated(command).await,
         Commands::Providers => {
             commands::list_providers();
             Ok(())

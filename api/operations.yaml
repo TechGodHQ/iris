@@ -1,0 +1,70 @@
+# Iris API operation definition — single source of truth for generated surfaces.
+operations:
+  - name: list_messages
+    description: List normalized messages in a thread.
+    method: GET
+    path: /messages/{thread_id}
+    read: true
+    output_type: Vec<Message>
+    parameters:
+      - name: thread_id
+        description: Thread ID to list messages from.
+        type: string
+        required: true
+        location: path
+      - name: limit
+        description: Maximum number of messages to return.
+        type: u32
+        required: false
+        location: query
+      - name: before
+        description: Return messages older than this timestamp cursor.
+        type: string
+        required: false
+        location: query
+  - name: list_threads
+    description: List conversation threads across providers.
+    method: GET
+    path: /threads
+    read: true
+    output_type: Vec<Thread>
+    parameters:
+      - name: limit
+        description: Maximum number of threads to return.
+        type: u32
+        required: false
+        location: query
+  - name: list_contacts
+    description: List contacts across providers.
+    method: GET
+    path: /contacts
+    read: true
+    output_type: Vec<Contact>
+    parameters:
+      - name: limit
+        description: Maximum number of contacts to return.
+        type: u32
+        required: false
+        location: query
+  - name: send_message
+    description: Send a message to a thread through the owning provider.
+    method: POST
+    path: /messages/{thread_id}
+    read: false
+    output_type: Message
+    parameters:
+      - name: thread_id
+        description: Thread ID to send the message to.
+        type: string
+        required: true
+        location: path
+      - name: body
+        description: Message body to send.
+        type: string
+        required: true
+        location: body
+      - name: provider
+        description: Provider ID to route the send through when ownership is ambiguous.
+        type: string
+        required: false
+        location: body
