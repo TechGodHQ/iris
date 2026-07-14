@@ -1,0 +1,86 @@
+{
+  "generated_from": "api/operations.yaml",
+  "tools": [
+    {
+      "description": "List normalized messages in a thread.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "before": {
+            "description": "Return messages older than this timestamp cursor.",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Maximum number of messages to return.",
+            "type": "integer"
+          },
+          "thread_id": {
+            "description": "Thread ID to list messages from.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id"
+        ],
+        "type": "object"
+      },
+      "name": "list_messages"
+    },
+    {
+      "description": "List conversation threads across providers.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "description": "Maximum number of threads to return.",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "list_threads"
+    },
+    {
+      "description": "List contacts across providers.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "description": "Maximum number of contacts to return.",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "list_contacts"
+    },
+    {
+      "description": "Send a message to a thread through the owning provider.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "Message body to send.",
+            "type": "string"
+          },
+          "provider": {
+            "description": "Provider ID to route the send through when ownership is ambiguous.",
+            "type": "string"
+          },
+          "thread_id": {
+            "description": "Thread ID to send the message to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "thread_id",
+          "body"
+        ],
+        "type": "object"
+      },
+      "name": "send_message"
+    }
+  ]
+}

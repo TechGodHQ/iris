@@ -26,6 +26,9 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
+      - name: Check generated surfaces
+        run: cargo run -p iris-codegen --bin iris-codegen -- check
+
   fmt:
     name: Format Check
     runs-on: ubuntu-latest
