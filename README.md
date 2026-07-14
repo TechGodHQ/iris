@@ -36,6 +36,36 @@ cargo run -- contacts
 cargo run -- serve
 ```
 
+## Configuration
+
+Iris reads provider configuration from TOML. Set `IRIS_CONFIG` to an explicit
+file, place `iris.toml` in the working directory, or use
+`~/.config/iris/config.toml`. The HTTP server also accepts `--config <path>`.
+
+```toml
+[providers.mock]
+enabled = true
+
+[providers.mock.credentials]
+# Inline values are accepted for local-only development.
+mode = "development"
+
+# Secrets can come from environment variables so credentials stay out of files.
+token = { env = "IRIS_MOCK_TOKEN" }
+```
+
+Provider declarations are keyed by provider id. Disabled providers are skipped:
+
+```toml
+[providers.mock]
+enabled = false
+```
+
+When no config file exists, Iris registers the built-in `mock` provider so local
+development keeps working. When a config file is present, only enabled providers
+listed there are registered. Unknown provider ids fail startup until the matching
+provider implementation is included in the build.
+
 ## Architecture
 
 ```
