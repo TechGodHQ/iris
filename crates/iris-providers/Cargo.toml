@@ -21,6 +21,10 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
+imap = "2.4"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-native-tls", "pool"] }
+mail-parser = "0.11"
+native-tls = "0.2"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
