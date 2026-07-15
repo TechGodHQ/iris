@@ -366,14 +366,13 @@ impl TermuxSmsRecord {
             .as_i64()
             .or_else(|| value.as_str()?.parse::<i64>().ok())
             .unwrap_or(0);
-        let seconds = if timestamp > 10_000_000_000 {
-            timestamp / 1000
+        if timestamp > 10_000_000_000 {
+            DateTime::<Utc>::from_timestamp_millis(timestamp).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
         } else {
-            timestamp
-        };
-        Utc.timestamp_opt(seconds, 0)
-            .single()
-            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+            Utc.timestamp_opt(timestamp, 0)
+                .single()
+                .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        }
     }
 
     fn is_outbound(&self) -> bool {
