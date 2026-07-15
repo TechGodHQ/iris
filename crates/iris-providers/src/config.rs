@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 use crate::email::EmailProvider;
 use crate::mock::MockProvider;
+use crate::sms::SmsProvider;
 use crate::telegram::TelegramProvider;
 
 /// Environment variable used to point Iris at a config file.
@@ -181,6 +182,9 @@ fn build_provider(provider: &ResolvedProviderConfig) -> anyhow::Result<Arc<dyn M
         "email" => Ok(Arc::new(EmailProvider::from_credentials(
             &provider.credentials,
         )?)),
+        "sms" => Ok(Arc::new(SmsProvider::from_credentials(
+            &provider.credentials,
+        )?)),
         other => anyhow::bail!("provider is configured but not available in this build: {other}"),
     }
 }
@@ -285,5 +289,24 @@ from = "alice@example.com"
         let providers = providers_from_config(&config).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "email");
+    }
+
+    #[test]
+    fn builds_sms_provider_from_ssh_host() {
+        let config = IrisConfig::from_toml(
+            r#"
+[providers.sms]
+enabled = true
+
+[providers.sms.credentials]
+ssh_host = "termux-phone"
+self_number = "+1 575 555 0199"
+"#,
+        )
+        .expect("valid config");
+
+        let providers = providers_from_config(&config).expect("registry builds");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id(), "sms");
     }
 }
