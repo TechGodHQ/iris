@@ -1,6 +1,15 @@
 //! Iris MCP server — exposes Iris operations as MCP tools.
 //!
 //! Tool definitions are generated from the core API definition by iris-codegen.
+//! The runtime speaks newline-delimited JSON-RPC over stdio, which is the
+//! transport agents expect for local MCP servers.
+
+use std::sync::Arc;
+
+use iris_core::{Contact, IrisError, Message, MessageProvider, Thread};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Constant identifying the MCP server name.
 pub const SERVER_NAME: &str = "iris";
@@ -14,13 +23,310 @@ pub const GENERATED_TOOLS_JSON: &str = include_str!(concat!(
 ));
 
 /// Return generated MCP tool definitions.
-pub fn generated_tools() -> serde_json::Result<serde_json::Value> {
+pub fn generated_tools() -> serde_json::Result<Value> {
     serde_json::from_str(GENERATED_TOOLS_JSON)
 }
+
+/// MCP server runtime backed by Iris message providers.
+#[derive(Clone)]
+pub struct McpServer {
+    providers: Vec<Arc<dyn MessageProvider>>,
+}
+
+impl McpServer {
+    /// Create an MCP server backed by the given providers.
+    #[must_use]
+    pub fn new(providers: Vec<Arc<dyn MessageProvider>>) -> Self {
+        Self { providers }
+    }
+
+    /// Handle a single JSON-RPC request value and return a JSON-RPC response.
+    pub async fn handle_jsonrpc(&self, request: Value) -> Value {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let Some(method) = request.get("method").and_then(Value::as_str) else {
+            return error_response(&id, -32600, "missing JSON-RPC method");
+        };
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+
+        match self.handle_method(method, params).await {
+            Ok(result) => success_response(&id, &result),
+            Err(error) => error_response(&id, -32000, &error.to_string()),
+        }
+    }
+
+    async fn handle_method(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        match method {
+            "initialize" => Ok(json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            })),
+            "notifications/initialized" => Ok(Value::Null),
+            "tools/list" => tools_list_result(),
+            "tools/call" => self.tools_call(params).await,
+            other => anyhow::bail!("unsupported MCP method: {other}"),
+        }
+    }
+
+    async fn tools_call(&self, params: Value) -> anyhow::Result<Value> {
+        let request: ToolCallRequest = serde_json::from_value(params)?;
+        let result = match request.name.as_str() {
+            "list_threads" => serde_json::to_value(self.list_threads(&request.arguments).await?)?,
+            "list_contacts" => serde_json::to_value(self.list_contacts(&request.arguments).await?)?,
+            "list_messages" => serde_json::to_value(self.list_messages(&request.arguments).await?)?,
+            "send_message" => serde_json::to_value(self.send_message(&request.arguments).await?)?,
+            other => anyhow::bail!("unknown Iris MCP tool: {other}"),
+        };
+
+        Ok(tool_result(&result, false))
+    }
+
+    async fn list_threads(&self, arguments: &Value) -> anyhow::Result<Vec<Thread>> {
+        let args: ListArgs = serde_json::from_value(arguments.clone())?;
+        let cursor = args
+            .cursor
+            .as_deref()
+            .map(parse_thread_cursor)
+            .transpose()?;
+        let mut threads = Vec::new();
+        for provider in &self.providers {
+            threads.extend(
+                provider
+                    .list_threads(if cursor.is_some() { None } else { args.limit })
+                    .await?,
+            );
+        }
+        threads.sort_by(|a, b| {
+            b.last_message_at
+                .cmp(&a.last_message_at)
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(cursor) = cursor {
+            threads = threads_after_cursor(threads, &cursor)?;
+        }
+        truncate_limit(&mut threads, args.limit);
+        Ok(threads)
+    }
+
+    async fn list_contacts(&self, arguments: &Value) -> anyhow::Result<Vec<Contact>> {
+        let args: ListArgs = serde_json::from_value(arguments.clone())?;
+        let mut contacts = Vec::new();
+        for provider in &self.providers {
+            contacts.extend(provider.list_contacts(args.limit).await?);
+        }
+        contacts.sort_by(|a, b| {
+            a.display_name
+                .cmp(&b.display_name)
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.source_id.cmp(&b.source_id))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(cursor) = args.cursor.as_deref() {
+            contacts = contacts_after_cursor(contacts, cursor)?;
+        }
+        truncate_limit(&mut contacts, args.limit);
+        Ok(contacts)
+    }
+
+    async fn list_messages(&self, arguments: &Value) -> anyhow::Result<Vec<Message>> {
+        let args: ListMessagesArgs = serde_json::from_value(arguments.clone())?;
+        let before = args
+            .before
+            .as_deref()
+            .map(chrono::DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|timestamp| timestamp.with_timezone(&chrono::Utc));
+        let provider = self.provider_for_thread(&args.thread_id).await?;
+        let mut messages = provider
+            .list_messages(&args.thread_id, before, args.limit)
+            .await?;
+        messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+        truncate_limit(&mut messages, args.limit);
+        Ok(messages)
+    }
+
+    async fn send_message(&self, arguments: &Value) -> anyhow::Result<Message> {
+        let args: SendMessageArgs = serde_json::from_value(arguments.clone())?;
+        let provider = match args.provider.as_deref() {
+            Some(provider_id) => self.provider_by_id(provider_id)?,
+            None => self.provider_for_thread(&args.thread_id).await?,
+        };
+        Ok(provider.send_message(&args.thread_id, &args.body).await?)
+    }
+
+    async fn provider_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> anyhow::Result<Arc<dyn MessageProvider>> {
+        for provider in &self.providers {
+            let threads = provider.list_threads(None).await?;
+            if threads
+                .iter()
+                .any(|thread| thread.id.to_string() == thread_id)
+            {
+                return Ok(Arc::clone(provider));
+            }
+        }
+        Err(IrisError::NotFound(format!("thread not found: {thread_id}")).into())
+    }
+
+    fn provider_by_id(&self, provider_id: &str) -> anyhow::Result<Arc<dyn MessageProvider>> {
+        self.providers
+            .iter()
+            .find(|provider| provider.id() == provider_id)
+            .map(Arc::clone)
+            .ok_or_else(|| IrisError::ProviderNotFound(provider_id.to_string()).into())
+    }
+}
+
+/// Run the server over newline-delimited JSON-RPC streams.
+pub async fn run_jsonrpc<R, W>(server: McpServer, reader: R, mut writer: W) -> anyhow::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = match serde_json::from_str::<Value>(&line) {
+            Ok(request) => server.handle_jsonrpc(request).await,
+            Err(error) => error_response(&Value::Null, -32700, &format!("parse error: {error}")),
+        };
+        writer
+            .write_all(serde_json::to_string(&response)?.as_bytes())
+            .await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+fn tools_list_result() -> anyhow::Result<Value> {
+    let tools = generated_tools()?;
+    Ok(json!({"tools": tools["tools"].clone()}))
+}
+
+fn tool_result(value: &Value, is_error: bool) -> Value {
+    json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&value).expect("JSON serialization cannot fail")}],
+        "isError": is_error,
+    })
+}
+
+fn success_response(id: &Value, result: &Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn error_response(id: &Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+fn truncate_limit<T>(items: &mut Vec<T>, limit: Option<u32>) {
+    if let Some(limit) = limit {
+        items.truncate(limit as usize);
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListArgs {
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadCursor {
+    timestamp: chrono::DateTime<chrono::Utc>,
+    source: Option<String>,
+    id: Option<uuid::Uuid>,
+}
+
+fn contacts_after_cursor(contacts: Vec<Contact>, cursor: &str) -> anyhow::Result<Vec<Contact>> {
+    let cursor = uuid::Uuid::parse_str(cursor)?;
+    let Some(index) = contacts.iter().position(|contact| contact.id == cursor) else {
+        anyhow::bail!("contact cursor not found: {cursor}");
+    };
+    Ok(contacts.into_iter().skip(index + 1).collect())
+}
+
+fn threads_after_cursor(
+    threads: Vec<Thread>,
+    cursor: &ThreadCursor,
+) -> anyhow::Result<Vec<Thread>> {
+    let Some(source) = cursor.source.as_deref() else {
+        return Ok(threads
+            .into_iter()
+            .filter(|thread| thread.last_message_at < cursor.timestamp)
+            .collect());
+    };
+    let id = cursor.id.expect("composite cursor includes thread id");
+    let Some(index) = threads.iter().position(|thread| {
+        thread.last_message_at == cursor.timestamp && thread.source == source && thread.id == id
+    }) else {
+        anyhow::bail!(
+            "thread cursor not found: {}|{}|{}",
+            cursor.timestamp.to_rfc3339(),
+            source,
+            id
+        );
+    };
+    Ok(threads.into_iter().skip(index + 1).collect())
+}
+
+fn parse_thread_cursor(cursor: &str) -> anyhow::Result<ThreadCursor> {
+    let parts: Vec<_> = cursor.split('|').collect();
+    match parts.as_slice() {
+        [timestamp] => Ok(ThreadCursor {
+            timestamp: chrono::DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&chrono::Utc),
+            source: None,
+            id: None,
+        }),
+        [timestamp, source, id] => Ok(ThreadCursor {
+            timestamp: chrono::DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&chrono::Utc),
+            source: Some((*source).to_string()),
+            id: Some(uuid::Uuid::parse_str(id)?),
+        }),
+        _ => anyhow::bail!("thread cursor must be RFC3339 or '<RFC3339>|<source>|<uuid>'"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ListMessagesArgs {
+    thread_id: String,
+    limit: Option<u32>,
+    before: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendMessageArgs {
+    thread_id: String,
+    body: String,
+    provider: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallRequest {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct _ProtocolMarker;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iris_providers::mock::MockProvider;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use tokio::io::BufReader;
+
+    fn server() -> McpServer {
+        McpServer::new(vec![Arc::new(MockProvider::new())])
+    }
 
     #[test]
     fn generated_tools_include_core_operations() {
@@ -33,6 +339,83 @@ mod tests {
             .collect();
 
         assert!(names.contains(&"list_messages"));
+        assert!(names.contains(&"list_threads"));
+        assert!(names.contains(&"list_contacts"));
         assert!(names.contains(&"send_message"));
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_mcp_server_info() {
+        let response = server()
+            .handle_jsonrpc(json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+            .await;
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["serverInfo"]["name"], SERVER_NAME);
+        assert_eq!(response["result"]["capabilities"]["tools"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn tools_list_returns_all_generated_tools() {
+        let response = server()
+            .handle_jsonrpc(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+            .await;
+        let names: Vec<_> = response["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name"))
+            .collect();
+
+        assert!(names.contains(&"list_messages"));
+        assert!(names.contains(&"list_threads"));
+        assert!(names.contains(&"list_contacts"));
+        assert!(names.contains(&"send_message"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_executes_against_mock_provider() {
+        let response = server()
+            .handle_jsonrpc(json!({
+                "jsonrpc":"2.0",
+                "id":3,
+                "method":"tools/call",
+                "params":{"name":"list_threads","arguments":{"limit":1}}
+            }))
+            .await;
+
+        assert_eq!(response["error"], Value::Null);
+        assert_eq!(response["result"]["isError"], false);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let threads: Vec<Thread> = serde_json::from_str(text).expect("thread JSON");
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].source, "mock");
+    }
+
+    #[tokio::test]
+    async fn run_jsonrpc_handles_line_delimited_requests() {
+        let input = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_contacts","arguments":{"limit":1}}}
+"#;
+        let mut output = Vec::new();
+
+        run_jsonrpc(server(), BufReader::new(&input[..]), &mut output)
+            .await
+            .expect("stdio run succeeds");
+
+        let lines: Vec<_> = std::str::from_utf8(&output)
+            .expect("utf8")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("response JSON"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0]["result"]["tools"].as_array().expect("tools").len(),
+            4
+        );
+        assert_eq!(lines[1]["result"]["isError"], false);
     }
 }

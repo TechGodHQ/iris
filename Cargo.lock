@@ -814,12 +814,17 @@ dependencies = [
 name = "iris-mcp"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
  "iris-core",
+ "iris-providers",
  "pretty_assertions",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
