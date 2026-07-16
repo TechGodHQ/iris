@@ -34,6 +34,11 @@ operations:
         type: u32
         required: false
         location: query
+      - name: cursor
+        description: Cursor; use RFC3339 timestamp or `<RFC3339>|<source>|<thread_uuid>` to avoid skipping timestamp ties.
+        type: string
+        required: false
+        location: query
   - name: list_contacts
     description: List contacts across providers.
     method: GET
@@ -44,6 +49,11 @@ operations:
       - name: limit
         description: Maximum number of contacts to return.
         type: u32
+        required: false
+        location: query
+      - name: cursor
+        description: Contact ID cursor; returns contacts after this ID in deterministic sort order.
+        type: string
         required: false
         location: query
   - name: send_message
