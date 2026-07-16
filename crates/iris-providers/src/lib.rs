@@ -7,4 +7,5 @@
 pub mod config;
 pub mod email;
 pub mod mock;
+pub mod sms;
 pub mod telegram;
