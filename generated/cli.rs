@@ -29,8 +29,8 @@ impl GeneratedCommand {
     pub fn parameters_json(&self) -> serde_json::Value {
         match self {
             Self::ListMessages(args) => serde_json::json!({"thread_id": args.thread_id.clone(), "limit": args.limit.clone(), "before": args.before.clone()}),
-            Self::ListThreads(args) => serde_json::json!({"limit": args.limit.clone()}),
-            Self::ListContacts(args) => serde_json::json!({"limit": args.limit.clone()}),
+            Self::ListThreads(args) => serde_json::json!({"limit": args.limit.clone(), "cursor": args.cursor.clone()}),
+            Self::ListContacts(args) => serde_json::json!({"limit": args.limit.clone(), "cursor": args.cursor.clone()}),
             Self::SendMessage(args) => serde_json::json!({"thread_id": args.thread_id.clone(), "body": args.body.clone(), "provider": args.provider.clone()}),
         }
     }
@@ -53,6 +53,9 @@ pub struct ListThreadsArgs {
     /// Maximum number of threads to return.
     #[arg(long)]
     pub limit: Option<u32>,
+    /// Cursor; use RFC3339 timestamp or `<RFC3339>|<source>|<thread_uuid>` to avoid skipping timestamp ties.
+    #[arg(long)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]
@@ -60,6 +63,9 @@ pub struct ListContactsArgs {
     /// Maximum number of contacts to return.
     #[arg(long)]
     pub limit: Option<u32>,
+    /// Contact ID cursor; returns contacts after this ID in deterministic sort order.
+    #[arg(long)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]

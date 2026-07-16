@@ -14,8 +14,9 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::get,
 };
-use iris_core::{Contact, Message, Thread};
+use iris_core::{Contact, IrisError, Message, MessageProvider, ProviderCapability, Thread};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::app::AppState;
 
@@ -23,6 +24,7 @@ use crate::app::AppState;
 pub struct ListQuery {
     pub limit: Option<u32>,
     pub before: Option<chrono::DateTime<chrono::Utc>>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +36,13 @@ pub struct SendMessageRequest {
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderResponse {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub capabilities: Vec<&'static str>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -49,16 +58,21 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
 }
 
-async fn list_providers(State(state): State<AppState>) -> Json<Vec<serde_json::Value>> {
+async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderResponse>> {
     let providers: Vec<_> = state
         .providers
         .iter()
         .map(|p| {
             let m = p.metadata();
-            serde_json::json!({
-                "id": m.id,
-                "name": m.name,
-            })
+            ProviderResponse {
+                id: m.id,
+                name: m.name,
+                capabilities: m
+                    .capabilities
+                    .iter()
+                    .map(|capability| capability_name(*capability))
+                    .collect(),
+            }
         })
         .collect();
     Json(providers)
@@ -103,12 +117,26 @@ async fn list_threads(
     input: generated::GeneratedOperationInput,
 ) -> Result<Json<Vec<Thread>>, (StatusCode, Json<ErrorResponse>)> {
     let q = parse_list_query(&input)?;
+    let cursor = parse_optional_timestamp_cursor(q.cursor.as_deref())?;
     let mut all_threads = Vec::new();
     for provider in &state.providers {
-        if let Ok(threads) = provider.list_threads(q.limit).await {
-            all_threads.extend(threads);
-        }
+        let threads = provider
+            .list_threads(if cursor.is_some() { None } else { q.limit })
+            .await
+            .map_err(|error| provider_error(provider.id(), &error))?;
+        cache_thread_owners(state, provider.id(), &threads);
+        all_threads.extend(threads);
     }
+    all_threads.sort_by(|a, b| {
+        b.last_message_at
+            .cmp(&a.last_message_at)
+            .then_with(|| a.source.cmp(&b.source))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    if let Some(cursor) = q.cursor {
+        all_threads = threads_after_cursor(all_threads, &cursor)?;
+    }
+    truncate_limit(&mut all_threads, q.limit);
     Ok(Json(all_threads))
 }
 
@@ -119,10 +147,23 @@ async fn list_contacts(
     let q = parse_list_query(&input)?;
     let mut all_contacts = Vec::new();
     for provider in &state.providers {
-        if let Ok(contacts) = provider.list_contacts(q.limit).await {
-            all_contacts.extend(contacts);
-        }
+        let contacts = provider
+            .list_contacts(None)
+            .await
+            .map_err(|error| provider_error(provider.id(), &error))?;
+        all_contacts.extend(contacts);
     }
+    all_contacts.sort_by(|a, b| {
+        a.display_name
+            .cmp(&b.display_name)
+            .then_with(|| a.source.cmp(&b.source))
+            .then_with(|| a.source_id.cmp(&b.source_id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    if let Some(cursor) = q.cursor {
+        all_contacts = contacts_after_cursor(all_contacts, &cursor)?;
+    }
+    truncate_limit(&mut all_contacts, q.limit);
     Ok(Json(all_contacts))
 }
 
@@ -132,38 +173,219 @@ async fn list_messages(
 ) -> Result<Json<Vec<Message>>, (StatusCode, Json<ErrorResponse>)> {
     let thread_id = required_path(&input, "thread_id")?;
     let q = parse_list_query(&input)?;
-    let mut all_messages = Vec::new();
-    for provider in &state.providers {
-        if let Ok(messages) = provider.list_messages(&thread_id, q.before, q.limit).await {
-            all_messages.extend(messages);
-        }
-    }
-    Ok(Json(all_messages))
+    let provider = provider_for_thread(state, &thread_id).await?;
+    let mut messages = provider
+        .list_messages(&thread_id, q.before, q.limit)
+        .await
+        .map_err(|error| provider_error(provider.id(), &error))?;
+    messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+    truncate_limit(&mut messages, q.limit);
+    Ok(Json(messages))
 }
 
 async fn send_message(
     state: &AppState,
     input: generated::GeneratedOperationInput,
-) -> Result<Json<Option<Message>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<Message>, (StatusCode, Json<ErrorResponse>)> {
     let thread_id = required_path(&input, "thread_id")?;
     let request: SendMessageRequest = serde_json::from_value(input.body).map_err(bad_request)?;
-    let providers: Vec<_> = request.provider.as_deref().map_or_else(
-        || state.providers.iter().collect(),
-        |provider_id| {
-            state
-                .providers
-                .iter()
-                .filter(|provider| provider.id() == provider_id)
-                .collect()
-        },
-    );
+    let provider = match request.provider.as_deref() {
+        Some(provider_id) => {
+            let provider = provider_by_id(state, provider_id)?;
+            let owner = provider_for_thread(state, &thread_id).await?;
+            if provider.id() != owner.id() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("provider '{provider_id}' does not own thread {thread_id}"),
+                    }),
+                ));
+            }
+            provider
+        }
+        None => provider_for_thread(state, &thread_id).await?,
+    };
+    let message = provider
+        .send_message(&thread_id, &request.body)
+        .await
+        .map_err(|error| provider_error(provider.id(), &error))?;
+    Ok(Json(message))
+}
 
-    for provider in providers {
-        if let Ok(message) = provider.send_message(&thread_id, &request.body).await {
-            return Ok(Json(Some(message)));
+async fn provider_for_thread(
+    state: &AppState,
+    thread_id: &str,
+) -> Result<Arc<dyn MessageProvider>, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(provider_id) = cached_thread_owner(state, thread_id)
+        && let Ok(provider) = provider_by_id(state, &provider_id)
+    {
+        return Ok(provider);
+    }
+    for provider in &state.providers {
+        let threads = provider
+            .list_threads(None)
+            .await
+            .map_err(|error| provider_error(provider.id(), &error))?;
+        cache_thread_owners(state, provider.id(), &threads);
+        if threads
+            .iter()
+            .any(|thread| thread.id.to_string() == thread_id)
+        {
+            return Ok(Arc::clone(provider));
         }
     }
-    Ok(Json(None))
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: format!("thread not found: {thread_id}"),
+        }),
+    ))
+}
+
+fn cache_thread_owners(state: &AppState, provider_id: &str, threads: &[Thread]) {
+    if let Ok(mut owners) = state.thread_owners.write() {
+        for thread in threads {
+            owners.insert(thread.id.to_string(), provider_id.to_string());
+        }
+    }
+}
+
+fn cached_thread_owner(state: &AppState, thread_id: &str) -> Option<String> {
+    state
+        .thread_owners
+        .read()
+        .ok()
+        .and_then(|owners| owners.get(thread_id).cloned())
+}
+
+fn provider_by_id(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<Arc<dyn MessageProvider>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .providers
+        .iter()
+        .find(|provider| provider.id() == provider_id)
+        .map(Arc::clone)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("provider not found: {provider_id}"),
+                }),
+            )
+        })
+}
+
+fn truncate_limit<T>(items: &mut Vec<T>, limit: Option<u32>) {
+    if let Some(limit) = limit {
+        items.truncate(limit as usize);
+    }
+}
+
+fn parse_optional_timestamp_cursor(
+    cursor: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, (StatusCode, Json<ErrorResponse>)> {
+    cursor
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+                .map_err(bad_request)
+        })
+        .transpose()
+}
+
+fn contacts_after_cursor(
+    contacts: Vec<Contact>,
+    cursor: &str,
+) -> Result<Vec<Contact>, (StatusCode, Json<ErrorResponse>)> {
+    let cursor = uuid::Uuid::parse_str(cursor).map_err(bad_request)?;
+    let Some(index) = contacts.iter().position(|contact| contact.id == cursor) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("contact cursor not found: {cursor}"),
+            }),
+        ));
+    };
+    Ok(contacts.into_iter().skip(index + 1).collect())
+}
+
+fn threads_after_cursor(
+    threads: Vec<Thread>,
+    cursor: &str,
+) -> Result<Vec<Thread>, (StatusCode, Json<ErrorResponse>)> {
+    if let Some((timestamp, source, id)) = parse_thread_cursor(cursor)? {
+        let Some(index) = threads.iter().position(|thread| {
+            thread.last_message_at == timestamp && thread.source == source && thread.id == id
+        }) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("thread cursor not found: {cursor}"),
+                }),
+            ));
+        };
+        return Ok(threads.into_iter().skip(index + 1).collect());
+    }
+
+    let timestamp = chrono::DateTime::parse_from_rfc3339(cursor)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(bad_request)?;
+    Ok(threads
+        .into_iter()
+        .filter(|thread| thread.last_message_at < timestamp)
+        .collect())
+}
+
+type ThreadCursor = (chrono::DateTime<chrono::Utc>, String, uuid::Uuid);
+
+fn parse_thread_cursor(
+    cursor: &str,
+) -> Result<Option<ThreadCursor>, (StatusCode, Json<ErrorResponse>)> {
+    let parts: Vec<_> = cursor.split('|').collect();
+    if parts.len() == 1 {
+        return Ok(None);
+    }
+    if parts.len() != 3 {
+        return Err(bad_request(
+            "thread cursor must be RFC3339 or '<RFC3339>|<source>|<uuid>'",
+        ));
+    }
+    let timestamp = chrono::DateTime::parse_from_rfc3339(parts[0])
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(bad_request)?;
+    let id = uuid::Uuid::parse_str(parts[2]).map_err(bad_request)?;
+    Ok(Some((timestamp, parts[1].to_string(), id)))
+}
+
+fn provider_error(provider_id: &str, error: &IrisError) -> (StatusCode, Json<ErrorResponse>) {
+    let status = match error {
+        IrisError::ProviderNotFound(_) | IrisError::NotFound(_) => StatusCode::NOT_FOUND,
+        IrisError::UnsupportedCapability { .. } => StatusCode::BAD_REQUEST,
+        IrisError::Provider { .. }
+        | IrisError::Config(_)
+        | IrisError::Transport(_)
+        | IrisError::Serialization(_) => StatusCode::BAD_GATEWAY,
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: format!("provider '{provider_id}' failed: {error}"),
+        }),
+    )
+}
+
+const fn capability_name(capability: ProviderCapability) -> &'static str {
+    match capability {
+        ProviderCapability::ListMessages => "list_messages",
+        ProviderCapability::SendMessages => "send_messages",
+        ProviderCapability::ListThreads => "list_threads",
+        ProviderCapability::ListContacts => "list_contacts",
+        ProviderCapability::ReceiveRealtime => "receive_realtime",
+        ProviderCapability::MarkRead => "mark_read",
+        ProviderCapability::DeleteMessages => "delete_messages",
+    }
 }
 
 fn parse_list_query(
@@ -183,7 +405,12 @@ fn parse_list_query(
                 .map_err(bad_request)
         })
         .transpose()?;
-    Ok(ListQuery { limit, before })
+    let cursor = input.query.get("cursor").cloned();
+    Ok(ListQuery {
+        limit,
+        before,
+        cursor,
+    })
 }
 
 fn required_path(
@@ -212,6 +439,214 @@ fn bad_request(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse
 #[cfg(test)]
 mod tests {
     use super::generated::GENERATED_ROUTES;
+    use super::*;
+    use async_trait::async_trait;
+    use chrono::{TimeZone, Utc};
+    use iris_core::{IrisError, MessageKind, ProviderMetadata};
+    use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
+
+    struct FakeProvider {
+        metadata: ProviderMetadata,
+        threads: Vec<Thread>,
+        contacts: Vec<Contact>,
+        messages: Vec<Message>,
+        fail_operation: Option<&'static str>,
+    }
+
+    impl FakeProvider {
+        fn new(id: &'static str, name: &'static str) -> Self {
+            Self {
+                metadata: ProviderMetadata {
+                    id,
+                    name,
+                    capabilities: &[
+                        ProviderCapability::ListThreads,
+                        ProviderCapability::ListMessages,
+                        ProviderCapability::ListContacts,
+                        ProviderCapability::SendMessages,
+                    ],
+                },
+                threads: Vec::new(),
+                contacts: Vec::new(),
+                messages: Vec::new(),
+                fail_operation: None,
+            }
+        }
+
+        fn with_threads(mut self, threads: Vec<Thread>) -> Self {
+            self.threads = threads;
+            self
+        }
+
+        fn with_contacts(mut self, contacts: Vec<Contact>) -> Self {
+            self.contacts = contacts;
+            self
+        }
+
+        fn with_messages(mut self, messages: Vec<Message>) -> Self {
+            self.messages = messages;
+            self
+        }
+
+        fn failing(mut self, operation: &'static str) -> Self {
+            self.fail_operation = Some(operation);
+            self
+        }
+
+        fn maybe_fail(&self, operation: &'static str) -> iris_core::Result<()> {
+            if self.fail_operation == Some(operation) {
+                return Err(IrisError::Provider {
+                    provider: self.id().to_string(),
+                    message: format!("{operation} failed"),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl MessageProvider for FakeProvider {
+        fn metadata(&self) -> &ProviderMetadata {
+            &self.metadata
+        }
+
+        async fn list_threads(&self, limit: Option<u32>) -> iris_core::Result<Vec<Thread>> {
+            self.maybe_fail("list_threads")?;
+            let mut threads = self.threads.clone();
+            if let Some(limit) = limit {
+                threads.truncate(limit as usize);
+            }
+            Ok(threads)
+        }
+
+        async fn list_messages(
+            &self,
+            thread_id: &str,
+            before: Option<chrono::DateTime<Utc>>,
+            limit: Option<u32>,
+        ) -> iris_core::Result<Vec<Message>> {
+            self.maybe_fail("list_messages")?;
+            let thread_uuid = Uuid::parse_str(thread_id).map_err(|error| IrisError::Provider {
+                provider: self.id().to_string(),
+                message: error.to_string(),
+            })?;
+            let mut messages: Vec<_> = self
+                .messages
+                .iter()
+                .filter(|message| message.thread_id == thread_uuid)
+                .filter(|message| before.is_none_or(|before| message.timestamp < before))
+                .cloned()
+                .collect();
+            if let Some(limit) = limit {
+                messages.truncate(limit as usize);
+            }
+            Ok(messages)
+        }
+
+        async fn list_contacts(&self, limit: Option<u32>) -> iris_core::Result<Vec<Contact>> {
+            self.maybe_fail("list_contacts")?;
+            let mut contacts = self.contacts.clone();
+            if let Some(limit) = limit {
+                contacts.truncate(limit as usize);
+            }
+            Ok(contacts)
+        }
+
+        async fn send_message(&self, thread_id: &str, body: &str) -> iris_core::Result<Message> {
+            self.maybe_fail("send_message")?;
+            let thread_id = Uuid::parse_str(thread_id).map_err(|error| IrisError::Provider {
+                provider: self.id().to_string(),
+                message: error.to_string(),
+            })?;
+            Ok(Message {
+                id: Uuid::new_v4(),
+                thread_id,
+                source: self.id().to_string(),
+                source_id: "sent-1".to_string(),
+                sender: contact(self.id(), "me", "Me"),
+                kind: MessageKind::Text,
+                body: body.to_string(),
+                attachments: Vec::new(),
+                timestamp: Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap(),
+                is_outbound: true,
+                metadata: serde_json::Value::Null,
+            })
+        }
+    }
+
+    fn state(providers: Vec<FakeProvider>) -> AppState {
+        AppState {
+            providers: providers
+                .into_iter()
+                .map(|provider| Arc::new(provider) as Arc<dyn MessageProvider>)
+                .collect(),
+            thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    fn input(query: &[(&str, &str)]) -> generated::GeneratedOperationInput {
+        generated::GeneratedOperationInput {
+            path: BTreeMap::new(),
+            query: query
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            body: serde_json::Value::Null,
+        }
+    }
+
+    fn input_with_thread(
+        thread_id: Uuid,
+        query: &[(&str, &str)],
+    ) -> generated::GeneratedOperationInput {
+        let mut input = input(query);
+        input
+            .path
+            .insert("thread_id".to_string(), thread_id.to_string());
+        input
+    }
+
+    fn thread(id: Uuid, source: &str, day: u32) -> Thread {
+        Thread {
+            id,
+            source: source.to_string(),
+            source_id: format!("{source}-{id}"),
+            title: Some(source.to_string()),
+            participants: Vec::new(),
+            last_message_at: Utc.with_ymd_and_hms(2026, 7, day, 12, 0, 0).unwrap(),
+            unread_count: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn contact(source: &str, source_id: &str, name: &str) -> Contact {
+        Contact {
+            id: Uuid::new_v4(),
+            source: source.to_string(),
+            source_id: source_id.to_string(),
+            display_name: Some(name.to_string()),
+            avatar_url: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn message(thread_id: Uuid, source: &str, day: u32, body: &str) -> Message {
+        Message {
+            id: Uuid::new_v4(),
+            thread_id,
+            source: source.to_string(),
+            source_id: format!("{source}-{day}"),
+            sender: contact(source, "sender", "Sender"),
+            kind: MessageKind::Text,
+            body: body.to_string(),
+            attachments: Vec::new(),
+            timestamp: Utc.with_ymd_and_hms(2026, 7, day, 12, 0, 0).unwrap(),
+            is_outbound: false,
+            metadata: serde_json::Value::Null,
+        }
+    }
 
     #[test]
     fn generated_routes_include_send_message() {
@@ -228,7 +663,106 @@ mod tests {
     fn generated_router_constructs_without_path_syntax_panic() {
         let app_state = crate::app::AppState {
             providers: Vec::new(),
+            thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         };
         let _router = super::router(app_state);
+    }
+
+    #[tokio::test]
+    async fn list_threads_merges_sorts_and_applies_global_limit() {
+        let oldest = Uuid::new_v4();
+        let newest = Uuid::new_v4();
+        let middle = Uuid::new_v4();
+        let state = state(vec![
+            FakeProvider::new("telegram", "Telegram").with_threads(vec![
+                thread(oldest, "telegram", 10),
+                thread(newest, "telegram", 16),
+            ]),
+            FakeProvider::new("email", "Email").with_threads(vec![thread(middle, "email", 12)]),
+        ]);
+
+        let Json(threads) = list_threads(&state, input(&[("limit", "2")]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            threads.iter().map(|thread| thread.id).collect::<Vec<_>>(),
+            vec![newest, middle]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_messages_routes_to_owning_provider() {
+        let telegram_thread = Uuid::new_v4();
+        let email_thread = Uuid::new_v4();
+        let state = state(vec![
+            FakeProvider::new("telegram", "Telegram")
+                .with_threads(vec![thread(telegram_thread, "telegram", 15)])
+                .with_messages(vec![message(
+                    telegram_thread,
+                    "telegram",
+                    15,
+                    "wrong provider",
+                )]),
+            FakeProvider::new("email", "Email")
+                .with_threads(vec![thread(email_thread, "email", 16)])
+                .with_messages(vec![message(email_thread, "email", 16, "right provider")]),
+        ]);
+
+        let Json(messages) = list_messages(&state, input_with_thread(email_thread, &[]))
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].source, "email");
+        assert_eq!(messages[0].body, "right provider");
+    }
+
+    #[tokio::test]
+    async fn list_contacts_merges_sorts_and_applies_global_limit() {
+        let state = state(vec![
+            FakeProvider::new("telegram", "Telegram")
+                .with_contacts(vec![contact("telegram", "2", "Zed")]),
+            FakeProvider::new("email", "Email").with_contacts(vec![
+                contact("email", "1", "Ada"),
+                contact("email", "3", "Mina"),
+            ]),
+        ]);
+
+        let Json(contacts) = list_contacts(&state, input(&[("limit", "2")]))
+            .await
+            .unwrap();
+
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].display_name.as_deref(), Some("Ada"));
+        assert_eq!(contacts[1].display_name.as_deref(), Some("Mina"));
+    }
+
+    #[tokio::test]
+    async fn provider_failures_return_bad_gateway() {
+        let state = state(vec![
+            FakeProvider::new("email", "Email").failing("list_contacts"),
+        ]);
+
+        let (status, Json(error)) = list_contacts(&state, input(&[])).await.unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(error.error.contains("provider 'email' failed"));
+    }
+
+    #[tokio::test]
+    async fn send_message_without_provider_routes_by_thread_owner() {
+        let thread_id = Uuid::new_v4();
+        let state = state(vec![
+            FakeProvider::new("telegram", "Telegram"),
+            FakeProvider::new("email", "Email").with_threads(vec![thread(thread_id, "email", 16)]),
+        ]);
+        let mut input = input_with_thread(thread_id, &[]);
+        input.body = serde_json::json!({"body":"hello"});
+
+        let Json(message) = send_message(&state, input).await.unwrap();
+
+        assert_eq!(message.source, "email");
+        assert_eq!(message.body, "hello");
     }
 }

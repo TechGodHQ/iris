@@ -31,6 +31,10 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "cursor": {
+            "description": "Cursor; use RFC3339 timestamp or `<RFC3339>|<source>|<thread_uuid>` to avoid skipping timestamp ties.",
+            "type": "string"
+          },
           "limit": {
             "description": "Maximum number of threads to return.",
             "type": "integer"
@@ -46,6 +50,10 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "cursor": {
+            "description": "Contact ID cursor; returns contacts after this ID in deterministic sort order.",
+            "type": "string"
+          },
           "limit": {
             "description": "Maximum number of contacts to return.",
             "type": "integer"
