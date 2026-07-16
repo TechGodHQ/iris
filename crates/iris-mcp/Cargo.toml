@@ -11,10 +11,15 @@ workspace = true
 
 [dependencies]
 iris-core = { path = "../iris-core" }
+iris-providers = { path = "../iris-providers" }
+anyhow = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
