@@ -150,6 +150,8 @@ impl EmailProvider {
         subject: &str,
         body: &str,
         thread_id: Uuid,
+        in_reply_to: Option<&str>,
+        references: &[String],
     ) -> Result<Message> {
         let from: Mailbox = self
             .from
@@ -158,10 +160,19 @@ impl EmailProvider {
         let to: Mailbox = recipient
             .parse()
             .map_err(|error| IrisError::Config(format!("invalid email recipient: {error}")))?;
-        let email = SmtpMessage::builder()
-            .from(from)
-            .to(to)
-            .subject(subject)
+        let mut builder = SmtpMessage::builder().from(from).to(to).subject(subject);
+        if let Some(message_id) = in_reply_to {
+            builder = builder.in_reply_to(format_msgid(message_id));
+        }
+        if !references.is_empty() {
+            let joined = references
+                .iter()
+                .map(|r| format_msgid(r))
+                .collect::<Vec<_>>()
+                .join(" ");
+            builder = builder.references(joined);
+        }
+        let email = builder
             .body(body.to_owned())
             .map_err(|error| IrisError::Serialization(error.to_string()))?;
         let credentials = Credentials::new(self.username.clone(), self.password.clone());
@@ -290,6 +301,8 @@ impl MessageProvider for EmailProvider {
                     "Iris message",
                     body,
                     uuid_for(format!("thread:{}", parsed.email).as_bytes()),
+                    None,
+                    &[],
                 )
                 .await;
         }
@@ -301,6 +314,8 @@ impl MessageProvider for EmailProvider {
                     &reply_context.reply_subject(),
                     body,
                     reply_context.thread_id,
+                    reply_context.message_id.as_deref(),
+                    &reply_context.references,
                 )
                 .await;
         }
@@ -339,6 +354,8 @@ impl EmailProvider {
             recipient,
             subject: latest.subject.clone(),
             thread_id: latest.thread_id(),
+            message_id: Some(latest.source_id.clone()),
+            references: build_reply_references(latest),
         }))
     }
 }
@@ -348,6 +365,8 @@ struct EmailReplyContext {
     recipient: String,
     subject: Option<String>,
     thread_id: Uuid,
+    message_id: Option<String>,
+    references: Vec<String>,
 }
 
 impl EmailReplyContext {
@@ -722,6 +741,42 @@ fn uuid_for(input: &[u8]) -> Uuid {
     Uuid::new_v5(&UUID_NAMESPACE, input)
 }
 
+/// Build the `References` header for a reply per RFC 5322 §3.6.4.
+///
+/// The reply's References should list the original message's references chain
+/// (if any) followed by the original message's own Message-ID. This preserves
+/// the full ancestry so mail clients can thread the conversation correctly.
+fn build_reply_references(original: &EmailEnvelope) -> Vec<String> {
+    let msg_id = strip_brackets(&original.source_id);
+    let mut refs: Vec<String> = original
+        .references
+        .iter()
+        .map(|r| strip_brackets(r).to_owned())
+        .collect();
+    if !refs.iter().any(|existing| existing == msg_id) {
+        refs.push(msg_id.to_owned());
+    }
+    refs
+}
+
+/// Strip surrounding angle brackets from a message ID, if present.
+fn strip_brackets(id: &str) -> &str {
+    let id = id.trim();
+    if id.starts_with('<') && id.ends_with('>') && id.len() >= 2 {
+        &id[1..id.len() - 1]
+    } else {
+        id
+    }
+}
+
+/// Wrap a message ID in RFC 5322 angle brackets (`<msg-id>`), if not already
+/// bracketed. The `In-Reply-To` and `References` headers require bracketed
+/// msg-ids per RFC 5322 §3.6.4.
+fn format_msgid(id: &str) -> String {
+    let stripped = strip_brackets(id);
+    format!("<{stripped}>")
+}
+
 fn dedupe_contacts(contacts: &mut Vec<Contact>) {
     let mut seen = BTreeSet::new();
     contacts.retain(|contact| seen.insert(contact.source_id.to_lowercase()));
@@ -765,5 +820,116 @@ mod tests {
     fn validates_required_credentials() {
         let error = EmailProvider::from_credentials(&BTreeMap::new()).expect_err("missing config");
         assert!(error.to_string().contains("imap_host"));
+    }
+
+    #[test]
+    fn reply_references_include_original_message_id() {
+        // Original message with no References chain — reply should still
+        // reference the original Message-ID.
+        let original = parse_email(
+            b"Message-ID: <orig@example.com>\nFrom: a@example.com\nTo: b@example.com\n\nbody",
+        );
+        let refs = build_reply_references(&original);
+        assert_eq!(refs, vec!["orig@example.com"]);
+    }
+
+    #[test]
+    fn reply_references_extend_existing_chain() {
+        // Original message already has a References chain — reply should
+        // preserve the chain and append the original Message-ID.
+        let original = parse_email(
+            b"Message-ID: <child@example.com>\nReferences: <root@example.com> <parent@example.com>\nFrom: a@example.com\nTo: b@example.com\n\nbody",
+        );
+        let refs = build_reply_references(&original);
+        assert_eq!(
+            refs,
+            vec![
+                "root@example.com",
+                "parent@example.com",
+                "child@example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn reply_references_deduplicate_message_id() {
+        // If the original Message-ID is already in its References chain,
+        // it should not be duplicated.
+        let original = parse_email(
+            b"Message-ID: <dup@example.com>\nReferences: <root@example.com> <dup@example.com>\nFrom: a@example.com\nTo: b@example.com\n\nbody",
+        );
+        let refs = build_reply_references(&original);
+        assert_eq!(refs, vec!["root@example.com", "dup@example.com"]);
+    }
+
+    #[test]
+    fn reply_context_captures_message_id_and_references() {
+        let original = parse_email(
+            b"Message-ID: <target@example.com>\nReferences: <root@example.com>\nFrom: bob@example.com\nTo: alice@example.com\n\nreply me",
+        );
+        let ctx = EmailReplyContext {
+            recipient: original.from[0].address.clone(),
+            subject: original.subject.clone(),
+            thread_id: original.thread_id(),
+            message_id: Some(original.source_id.clone()),
+            references: build_reply_references(&original),
+        };
+        assert_eq!(ctx.message_id.as_deref(), Some("target@example.com"));
+        assert_eq!(
+            ctx.references,
+            vec!["root@example.com", "target@example.com"]
+        );
+    }
+
+    #[test]
+    fn format_msgid_wraps_and_normalizes() {
+        assert_eq!(format_msgid("orig@example.com"), "<orig@example.com>");
+        assert_eq!(
+            format_msgid("<already@example.com>"),
+            "<already@example.com>"
+        );
+    }
+
+    #[test]
+    fn smtp_emission_produces_valid_threading_headers() {
+        // Verify that the exact builder calls used by send_email produce
+        // RFC 5322-compliant headers in the serialized SMTP message.
+        let refs = [
+            "root@example.com".to_string(),
+            "parent@example.com".to_string(),
+            "child@example.com".to_string(),
+        ];
+        let in_reply_to = "child@example.com";
+
+        let mut builder = SmtpMessage::builder()
+            .from("sender@example.com".parse().unwrap())
+            .to("recipient@example.com".parse().unwrap())
+            .subject("Re: test");
+        builder = builder.in_reply_to(format_msgid(in_reply_to));
+        let joined = refs
+            .iter()
+            .map(|r| format_msgid(r))
+            .collect::<Vec<_>>()
+            .join(" ");
+        builder = builder.references(joined);
+        let email = builder.body("reply body".to_string()).unwrap();
+
+        let buf = email.formatted();
+        let text = String::from_utf8_lossy(&buf);
+        let header_line = |prefix: &str| -> String {
+            text.lines()
+                .find(|line| line.starts_with(prefix))
+                .map(std::string::ToString::to_string)
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            header_line("In-Reply-To:"),
+            "In-Reply-To: <child@example.com>"
+        );
+        assert_eq!(
+            header_line("References:"),
+            "References: <root@example.com> <parent@example.com> <child@example.com>"
+        );
     }
 }
