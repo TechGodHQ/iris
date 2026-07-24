@@ -30,6 +30,9 @@ const METADATA: ProviderMetadata = ProviderMetadata {
 };
 const UUID_NAMESPACE: Uuid = Uuid::from_u128(0x6e6c_4e12_1a7d_4a3c_8b53_8914_42f3_0002);
 
+const DEFAULT_PAGE_SIZE: u32 = 50;
+const DEFAULT_MAX_MESSAGES: u32 = 500;
+
 /// Email provider using IMAP for reads and SMTP for outbound messages.
 #[derive(Debug, Clone)]
 pub struct EmailProvider {
@@ -41,6 +44,8 @@ pub struct EmailProvider {
     password: String,
     mailbox: String,
     from: String,
+    page_size: u32,
+    max_messages: u32,
 }
 
 impl EmailProvider {
@@ -56,6 +61,8 @@ impl EmailProvider {
             password: config.password,
             mailbox: config.mailbox,
             from: config.from,
+            page_size: config.page_size,
+            max_messages: config.max_messages,
         })
     }
 
@@ -76,17 +83,19 @@ impl EmailProvider {
                 .get("from")
                 .cloned()
                 .unwrap_or_else(|| credentials["username"].clone()),
+            page_size: optional_u32(credentials, "page_size", DEFAULT_PAGE_SIZE)?,
+            max_messages: optional_u32(credentials, "max_messages", DEFAULT_MAX_MESSAGES)?,
         })
     }
 
-    async fn fetch_messages(&self, limit: Option<u32>) -> Result<Vec<EmailEnvelope>> {
+    async fn fetch_messages(&self, options: FetchOptions) -> Result<FetchResult> {
         let config = self.clone();
-        tokio::task::spawn_blocking(move || config.fetch_messages_blocking(limit))
+        tokio::task::spawn_blocking(move || config.fetch_messages_blocking(&options))
             .await
             .map_err(|error| IrisError::Transport(error.to_string()))?
     }
 
-    fn fetch_messages_blocking(&self, limit: Option<u32>) -> Result<Vec<EmailEnvelope>> {
+    fn fetch_messages_blocking(&self, options: &FetchOptions) -> Result<FetchResult> {
         let tls = TlsConnector::builder()
             .build()
             .map_err(|error| IrisError::Transport(error.to_string()))?;
@@ -99,12 +108,13 @@ impl EmailProvider {
         let mut session = client
             .login(&self.username, &self.password)
             .map_err(|(error, _)| IrisError::Transport(error.to_string()))?;
-        session
+        let mailbox = session
             .select(&self.mailbox)
             .map_err(|error| IrisError::Provider {
                 provider: PROVIDER_ID.into(),
                 message: error.to_string(),
             })?;
+        let uid_validity = mailbox.uid_validity;
 
         let uids = session
             .uid_search("ALL")
@@ -113,35 +123,51 @@ impl EmailProvider {
                 message: error.to_string(),
             })?;
         let mut uids: Vec<_> = uids.into_iter().collect();
-        uids.sort_unstable();
-        let limit = limit.unwrap_or(50) as usize;
-        if uids.len() > limit {
-            uids = uids.split_off(uids.len() - limit);
-        }
+        uids = select_uids(uids, options, self.max_messages);
+
         if uids.is_empty() {
             let _ = session.logout();
-            return Ok(Vec::new());
+            return Ok(FetchResult {
+                messages: Vec::new(),
+                uid_validity,
+                last_uid: None,
+            });
         }
 
-        let sequence = uids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let fetches =
-            session
-                .uid_fetch(sequence, "RFC822")
-                .map_err(|error| IrisError::Provider {
-                    provider: PROVIDER_ID.into(),
-                    message: error.to_string(),
-                })?;
-        let messages = fetches
-            .iter()
-            .filter_map(|fetch| fetch.body())
-            .map(parse_email)
-            .collect::<Vec<_>>();
+        // The highest UID in the selected set — callers can persist this
+        // as a sync cursor and pass it as `since_uid` on the next call.
+        let last_uid = *uids.last().unwrap();
+
+        // Fetch in pages to avoid sending one massive request that could
+        // overwhelm the server or consume excessive memory.
+        let page_size = self.page_size as usize;
+        let mut messages = Vec::with_capacity(uids.len());
+        for chunk in uids.chunks(page_size) {
+            let sequence = chunk
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let fetches =
+                session
+                    .uid_fetch(sequence, "RFC822")
+                    .map_err(|error| IrisError::Provider {
+                        provider: PROVIDER_ID.into(),
+                        message: error.to_string(),
+                    })?;
+            for fetch in &fetches {
+                if let Some(body) = fetch.body() {
+                    messages.push(parse_email(body));
+                }
+            }
+        }
+
         let _ = session.logout();
-        Ok(messages)
+        Ok(FetchResult {
+            messages,
+            uid_validity,
+            last_uid: Some(last_uid),
+        })
     }
 
     async fn send_email(
@@ -217,6 +243,29 @@ pub struct EmailProviderConfig {
     pub mailbox: String,
     /// Sender address used for SMTP.
     pub from: String,
+    /// Number of messages to fetch per IMAP request (default 50).
+    pub page_size: u32,
+    /// Maximum number of messages to fetch in total, even when no limit is
+    /// requested by the caller (default 500). Protects against loading an
+    /// entire mailbox in one operation.
+    pub max_messages: u32,
+}
+
+impl Default for EmailProviderConfig {
+    fn default() -> Self {
+        Self {
+            imap_host: String::new(),
+            imap_port: 993,
+            smtp_host: String::new(),
+            smtp_port: 587,
+            username: String::new(),
+            password: String::new(),
+            mailbox: "INBOX".into(),
+            from: String::new(),
+            page_size: DEFAULT_PAGE_SIZE,
+            max_messages: DEFAULT_MAX_MESSAGES,
+        }
+    }
 }
 
 impl EmailProviderConfig {
@@ -233,8 +282,70 @@ impl EmailProviderConfig {
                 return Err(IrisError::Config(format!("email {name} is required")));
             }
         }
+        if self.page_size == 0 {
+            return Err(IrisError::Config(
+                "email page_size must be at least 1".into(),
+            ));
+        }
+        if self.max_messages == 0 {
+            return Err(IrisError::Config(
+                "email max_messages must be at least 1".into(),
+            ));
+        }
         Ok(())
     }
+}
+
+/// Controls which UIDs [`EmailProvider::fetch_messages`] selects.
+///
+/// At most one of `since_uid` or `limit` should be `Some`. If both are `None`,
+/// the provider returns the most recent messages up to its configured safety
+/// cap (`max_messages`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FetchOptions {
+    /// If set, only fetch messages whose UID is greater than this value
+    /// (incremental sync cursor). The result is ordered oldest-first.
+    pub since_uid: Option<u32>,
+    /// Maximum number of messages to return, applied after the UID filter.
+    pub limit: Option<u32>,
+}
+
+/// The result of a fetch, including mailbox metadata needed for incremental sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FetchResult {
+    /// Parsed email envelopes, ordered oldest-first.
+    pub messages: Vec<EmailEnvelope>,
+    /// The UIDVALIDITY of the mailbox at the time of the fetch. If this
+    /// changes between syncs, all cached UIDs are invalidated.
+    pub uid_validity: Option<u32>,
+    /// The highest UID in the fetched set. Callers can persist this as a
+    /// sync cursor and pass it as `FetchOptions::since_uid` on the next call
+    /// to retrieve only messages that arrived since.
+    pub last_uid: Option<u32>,
+}
+
+/// Select a UID set based on fetch options.
+///
+/// - `since_uid` filters to UIDs strictly greater than the cursor.
+/// - `limit` caps the result to the most recent `limit` UIDs.
+/// - `max_messages` is an absolute safety cap.
+fn select_uids(mut uids: Vec<u32>, options: &FetchOptions, max_messages: u32) -> Vec<u32> {
+    uids.sort_unstable();
+    uids.dedup();
+
+    if let Some(since) = options.since_uid {
+        uids.retain(|uid| *uid > since);
+    }
+
+    let max = options
+        .limit
+        .map_or(max_messages, |limit| limit.min(max_messages)) as usize;
+
+    if uids.len() > max {
+        uids = uids.split_off(uids.len() - max);
+    }
+
+    uids
 }
 
 #[async_trait]
@@ -244,8 +355,14 @@ impl MessageProvider for EmailProvider {
     }
 
     async fn list_threads(&self, limit: Option<u32>) -> Result<Vec<Thread>> {
+        let result = self
+            .fetch_messages(FetchOptions {
+                limit,
+                ..Default::default()
+            })
+            .await?;
         let mut by_thread = BTreeMap::<String, Thread>::new();
-        for email in self.fetch_messages(limit).await? {
+        for email in result.messages {
             let thread = email.to_thread();
             by_thread
                 .entry(email.thread_key())
@@ -270,9 +387,18 @@ impl MessageProvider for EmailProvider {
         before: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> Result<Vec<Message>> {
-        let mut messages: Vec<_> = self
-            .fetch_messages(None)
-            .await?
+        // Fetch a bounded recent window for thread filtering. Unlike
+        // list_threads/list_contacts which can use the caller's limit directly,
+        // list_messages needs to search through messages to find thread matches,
+        // so we fetch up to max_messages and filter locally.
+        let result = self
+            .fetch_messages(FetchOptions {
+                limit: Some(self.max_messages),
+                ..Default::default()
+            })
+            .await?;
+        let mut messages: Vec<_> = result
+            .messages
             .into_iter()
             .filter(|email| email.matches_thread(thread_id))
             .map(|email| email.to_message_from(&self.configured_from_address()))
@@ -284,8 +410,14 @@ impl MessageProvider for EmailProvider {
     }
 
     async fn list_contacts(&self, limit: Option<u32>) -> Result<Vec<Contact>> {
+        let result = self
+            .fetch_messages(FetchOptions {
+                limit,
+                ..Default::default()
+            })
+            .await?;
         let mut contacts = Vec::new();
-        for email in self.fetch_messages(limit).await? {
+        for email in result.messages {
             contacts.extend(email.contacts());
         }
         dedupe_contacts(&mut contacts);
@@ -328,9 +460,14 @@ impl MessageProvider for EmailProvider {
 
 impl EmailProvider {
     async fn reply_context(&self, thread_id: &str) -> Result<Option<EmailReplyContext>> {
-        let mut messages: Vec<_> = self
-            .fetch_messages(None)
-            .await?
+        let result = self
+            .fetch_messages(FetchOptions {
+                limit: Some(self.max_messages),
+                ..Default::default()
+            })
+            .await?;
+        let mut messages: Vec<_> = result
+            .messages
             .into_iter()
             .filter(|email| email.matches_thread(thread_id))
             .collect();
@@ -737,6 +874,14 @@ fn optional_port(credentials: &BTreeMap<String, String>, key: &str, default: u16
     })
 }
 
+fn optional_u32(credentials: &BTreeMap<String, String>, key: &str, default: u32) -> Result<u32> {
+    credentials.get(key).map_or(Ok(default), |value| {
+        value.parse().map_err(|error| {
+            IrisError::Config(format!("email credentials.{key} is invalid: {error}"))
+        })
+    })
+}
+
 fn uuid_for(input: &[u8]) -> Uuid {
     Uuid::new_v5(&UUID_NAMESPACE, input)
 }
@@ -930,6 +1075,162 @@ mod tests {
         assert_eq!(
             header_line("References:"),
             "References: <root@example.com> <parent@example.com> <child@example.com>"
+        );
+    }
+
+    #[test]
+    fn select_uids_truncates_to_limit_keeping_most_recent() {
+        let uids = vec![5, 2, 8, 1, 3];
+        let opts = FetchOptions {
+            limit: Some(3),
+            ..Default::default()
+        };
+        let selected = select_uids(uids, &opts, 500);
+        assert_eq!(selected, vec![3, 5, 8]);
+    }
+
+    #[test]
+    fn select_uids_caps_at_max_messages_when_no_limit() {
+        let uids = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let opts = FetchOptions::default();
+        let selected = select_uids(uids, &opts, 5);
+        assert_eq!(selected, vec![6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn select_uids_limit_does_not_exceed_max_messages() {
+        let uids = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let opts = FetchOptions {
+            limit: Some(100),
+            ..Default::default()
+        };
+        let selected = select_uids(uids, &opts, 5);
+        assert_eq!(selected, vec![6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn select_uids_since_uid_filters_for_incremental_sync() {
+        let uids = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let opts = FetchOptions {
+            since_uid: Some(4),
+            ..Default::default()
+        };
+        let selected = select_uids(uids, &opts, 500);
+        assert_eq!(selected, vec![5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn select_uids_since_uid_with_limit() {
+        let uids = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let opts = FetchOptions {
+            since_uid: Some(4),
+            limit: Some(2),
+        };
+        let selected = select_uids(uids, &opts, 500);
+        assert_eq!(selected, vec![9, 10]);
+    }
+
+    #[test]
+    fn select_uids_deduplicates() {
+        let uids = vec![1, 1, 2, 2, 3];
+        let opts = FetchOptions::default();
+        let selected = select_uids(uids, &opts, 500);
+        assert_eq!(selected, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn select_uids_empty_input() {
+        let opts = FetchOptions {
+            limit: Some(10),
+            ..Default::default()
+        };
+        let selected = select_uids(Vec::new(), &opts, 500);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn email_config_defaults() {
+        let config = EmailProviderConfig::default();
+        assert_eq!(config.imap_port, 993);
+        assert_eq!(config.smtp_port, 587);
+        assert_eq!(config.mailbox, "INBOX");
+        assert_eq!(config.page_size, DEFAULT_PAGE_SIZE);
+        assert_eq!(config.max_messages, DEFAULT_MAX_MESSAGES);
+    }
+
+    #[test]
+    fn from_credentials_reads_pagination_settings() {
+        let mut creds = BTreeMap::new();
+        creds.insert("imap_host".into(), "imap.example.com".into());
+        creds.insert("smtp_host".into(), "smtp.example.com".into());
+        creds.insert("username".into(), "alice@example.com".into());
+        creds.insert("password".into(), "secret".into());
+        creds.insert("from".into(), "alice@example.com".into());
+        creds.insert("page_size".into(), "25".into());
+        creds.insert("max_messages".into(), "100".into());
+
+        let provider = EmailProvider::from_credentials(&creds).expect("valid credentials");
+        assert_eq!(provider.page_size, 25);
+        assert_eq!(provider.max_messages, 100);
+    }
+
+    #[test]
+    fn from_credentials_uses_defaults_when_pagination_unset() {
+        let mut creds = BTreeMap::new();
+        creds.insert("imap_host".into(), "imap.example.com".into());
+        creds.insert("smtp_host".into(), "smtp.example.com".into());
+        creds.insert("username".into(), "alice@example.com".into());
+        creds.insert("password".into(), "secret".into());
+        creds.insert("from".into(), "alice@example.com".into());
+
+        let provider = EmailProvider::from_credentials(&creds).expect("valid credentials");
+        assert_eq!(provider.page_size, DEFAULT_PAGE_SIZE);
+        assert_eq!(provider.max_messages, DEFAULT_MAX_MESSAGES);
+    }
+
+    #[test]
+    fn from_credentials_rejects_invalid_page_size() {
+        let mut creds = BTreeMap::new();
+        creds.insert("imap_host".into(), "imap.example.com".into());
+        creds.insert("smtp_host".into(), "smtp.example.com".into());
+        creds.insert("username".into(), "alice@example.com".into());
+        creds.insert("password".into(), "secret".into());
+        creds.insert("from".into(), "alice@example.com".into());
+        creds.insert("page_size".into(), "not-a-number".into());
+
+        let error = EmailProvider::from_credentials(&creds).expect_err("invalid page_size");
+        assert!(error.to_string().contains("page_size"));
+    }
+
+    #[test]
+    fn from_credentials_rejects_zero_page_size() {
+        let mut creds = BTreeMap::new();
+        creds.insert("imap_host".into(), "imap.example.com".into());
+        creds.insert("smtp_host".into(), "smtp.example.com".into());
+        creds.insert("username".into(), "alice@example.com".into());
+        creds.insert("password".into(), "secret".into());
+        creds.insert("from".into(), "alice@example.com".into());
+        creds.insert("page_size".into(), "0".into());
+
+        let error = EmailProvider::from_credentials(&creds).expect_err("zero page_size");
+        assert!(error.to_string().contains("page_size must be at least 1"));
+    }
+
+    #[test]
+    fn from_credentials_rejects_zero_max_messages() {
+        let mut creds = BTreeMap::new();
+        creds.insert("imap_host".into(), "imap.example.com".into());
+        creds.insert("smtp_host".into(), "smtp.example.com".into());
+        creds.insert("username".into(), "alice@example.com".into());
+        creds.insert("password".into(), "secret".into());
+        creds.insert("from".into(), "alice@example.com".into());
+        creds.insert("max_messages".into(), "0".into());
+
+        let error = EmailProvider::from_credentials(&creds).expect_err("zero max_messages");
+        assert!(
+            error
+                .to_string()
+                .contains("max_messages must be at least 1")
         );
     }
 }
