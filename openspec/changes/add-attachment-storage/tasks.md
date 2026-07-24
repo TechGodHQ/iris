@@ -2,14 +2,14 @@
 
 ## PR 1: Core model + storage crate + retrieval endpoint
 
-- [ ] T1: Add `id: Uuid` field to `Attachment` struct in iris-core/src/model.rs
-- [ ] T2: Define `AttachmentStore` trait, `AttachmentContent`, and `AttachmentRef` types in iris-core
-- [ ] T3: Create `iris-storage` crate with `LocalFsStore` implementation (store, get, delete)
-- [ ] T4: Wire `AttachmentStore` into `AppState` with `IRIS_ATTACHMENT_DIR` config
-- [ ] T5: Add `GET /v1/attachments/{id}/content` HTTP route to iris-server (content-type, content-disposition, 404)
-- [ ] T6: Update all existing tests to include `id` field on `Attachment` fixtures
-- [ ] T7: Add integration test for store → retrieve round-trip through HTTP API
-- [ ] T8: Update workspace Cargo.toml and verify full build/test/clippy/fmt/codegen gate
+- [x] T1: Add `id: Uuid` field to `Attachment` struct in iris-core/src/model.rs
+- [x] T2: Define `AttachmentStore` trait, `AttachmentContent`, and `AttachmentRef` types in iris-core
+- [x] T3: Create `iris-storage` crate with `LocalFsStore` implementation (store, get, delete)
+- [x] T4: Wire `AttachmentStore` into `AppState` with `IRIS_ATTACHMENT_DIR` config
+- [x] T5: Add `GET /v1/attachments/{id}/content` HTTP route to iris-server (content-type, content-disposition, 404)
+- [x] T6: Update all existing tests to include `id` field on `Attachment` fixtures
+- [x] T7: Add integration test for store → retrieve round-trip through HTTP API
+- [x] T8: Update workspace Cargo.toml and verify full build/test/clippy/fmt/codegen gate
 
 ## PR 2: Email provider integration
 

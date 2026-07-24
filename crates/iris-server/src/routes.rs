@@ -9,8 +9,8 @@ mod generated {
 
 use axum::{
     Router,
-    extract::State,
-    http::StatusCode,
+    extract::{Path, State},
+    http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
     routing::get,
 };
@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/providers", get(list_providers))
+        .route("/v1/attachments/{id}/content", get(get_attachment_content))
         .merge(generated::generated_router())
         .with_state(state)
 }
@@ -76,6 +77,71 @@ async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderRespo
         })
         .collect();
     Json(providers)
+}
+
+/// Serve attachment content by ID.
+///
+/// Returns raw bytes with appropriate Content-Type and Content-Disposition headers.
+/// Returns 404 if the attachment does not exist.
+pub(crate) async fn get_attachment_content(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(uuid) => uuid,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid attachment ID: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match state.attachments.get(&uuid).await {
+        Ok(content) => {
+            let mut response = (
+                [(header::CONTENT_TYPE, content.mime_type.clone())],
+                content.bytes,
+            )
+                .into_response();
+
+            if let Some(filename) = content.filename {
+                // Sanitize: strip control chars (CR/LF/etc.) to prevent header
+                // injection, then escape remaining double quotes per RFC 6266.
+                let sanitized: String = filename
+                    .chars()
+                    .filter(|c| !c.is_ascii_control() && *c != '"')
+                    .collect();
+                if !sanitized.is_empty() {
+                    let disposition = format!("attachment; filename=\"{sanitized}\"");
+                    if let Ok(value) = disposition.parse() {
+                        response
+                            .headers_mut()
+                            .insert(header::CONTENT_DISPOSITION, value);
+                    }
+                }
+            }
+
+            response
+        }
+        Err(IrisError::NotFound(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("attachment not found: {id}"),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("failed to retrieve attachment: {error}"),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 pub(crate) async fn execute_generated_operation(
@@ -367,6 +433,7 @@ fn provider_error(provider_id: &str, error: &IrisError) -> (StatusCode, Json<Err
         | IrisError::Config(_)
         | IrisError::Transport(_)
         | IrisError::Serialization(_) => StatusCode::BAD_GATEWAY,
+        IrisError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (
         status,
@@ -442,10 +509,28 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
-    use iris_core::{IrisError, MessageKind, ProviderMetadata};
+    use iris_core::{
+        AttachmentContent, AttachmentRef, AttachmentStore, IrisError, MessageKind, ProviderMetadata,
+    };
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    /// A no-op attachment store for tests that don't exercise attachment logic.
+    struct NullStore;
+
+    #[async_trait]
+    impl AttachmentStore for NullStore {
+        async fn store(&self, _content: AttachmentContent) -> iris_core::Result<AttachmentRef> {
+            Err(IrisError::Storage("null store".into()))
+        }
+        async fn get(&self, id: &Uuid) -> iris_core::Result<AttachmentContent> {
+            Err(IrisError::NotFound(format!("attachment: {id}")))
+        }
+        async fn delete(&self, _id: &Uuid) -> iris_core::Result<()> {
+            Ok(())
+        }
+    }
 
     struct FakeProvider {
         metadata: ProviderMetadata,
@@ -583,6 +668,7 @@ mod tests {
                 .map(|provider| Arc::new(provider) as Arc<dyn MessageProvider>)
                 .collect(),
             thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            attachments: Arc::new(NullStore),
         }
     }
 
@@ -664,6 +750,7 @@ mod tests {
         let app_state = crate::app::AppState {
             providers: Vec::new(),
             thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            attachments: Arc::new(NullStore),
         };
         let _router = super::router(app_state);
     }
@@ -764,5 +851,161 @@ mod tests {
 
         assert_eq!(message.source, "email");
         assert_eq!(message.body, "hello");
+    }
+
+    #[tokio::test]
+    async fn attachment_store_retrieve_round_trip_through_http() {
+        // Use a real LocalFsStore backed by a temp directory so that
+        // storing through the trait and retrieving through the HTTP handler
+        // exercises the full path.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(iris_storage::LocalFsStore::new(tmp.path()));
+
+        // Store content.
+        let reference = store
+            .store(AttachmentContent {
+                mime_type: "image/png".to_string(),
+                filename: Some("photo.png".to_string()),
+                bytes: vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A],
+            })
+            .await
+            .unwrap();
+
+        // Build AppState with the real store and no providers.
+        let app_state = AppState {
+            providers: Vec::new(),
+            thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            attachments: store,
+        };
+
+        // Retrieve via the HTTP handler.
+        let response = get_attachment_content(
+            axum::extract::State(app_state),
+            axum::extract::Path(reference.id.to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.contains("photo.png"));
+    }
+
+    #[tokio::test]
+    async fn attachment_retrieve_nonexistent_returns_404() {
+        let app_state = AppState {
+            providers: Vec::new(),
+            thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            attachments: Arc::new(NullStore),
+        };
+
+        let random_id = Uuid::new_v4();
+        let response = get_attachment_content(
+            axum::extract::State(app_state),
+            axum::extract::Path(random_id.to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn attachment_retrieve_invalid_id_returns_400() {
+        let app_state = AppState {
+            providers: Vec::new(),
+            thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            attachments: Arc::new(NullStore),
+        };
+
+        let response = get_attachment_content(
+            axum::extract::State(app_state),
+            axum::extract::Path("not-a-uuid".to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn attachment_without_filename_omits_disposition_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(iris_storage::LocalFsStore::new(tmp.path()));
+
+        let reference = store
+            .store(AttachmentContent {
+                mime_type: "text/plain".to_string(),
+                filename: None,
+                bytes: b"hello".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        let app_state = AppState {
+            providers: Vec::new(),
+            thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            attachments: store,
+        };
+
+        let response = get_attachment_content(
+            axum::extract::State(app_state),
+            axum::extract::Path(reference.id.to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_filename_with_control_chars_is_sanitized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(iris_storage::LocalFsStore::new(tmp.path()));
+
+        // Filename with CR/LF injection attempt and quotes.
+        let reference = store
+            .store(AttachmentContent {
+                mime_type: "text/plain".to_string(),
+                filename: Some("evil\r\nfile\".txt".to_string()),
+                bytes: b"data".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        let app_state = AppState {
+            providers: Vec::new(),
+            thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            attachments: store,
+        };
+
+        let response = get_attachment_content(
+            axum::extract::State(app_state),
+            axum::extract::Path(reference.id.to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposition = response.headers().get(header::CONTENT_DISPOSITION);
+        assert!(
+            disposition.is_some(),
+            "disposition header should be present"
+        );
+        let value = disposition.unwrap().to_str().unwrap();
+        // CR/LF must not appear in the header value (no injection).
+        assert!(!value.contains('\r') && !value.contains('\n'));
+        assert!(value.contains("evil"));
+        assert!(value.contains("file"));
     }
 }

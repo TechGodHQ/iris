@@ -7,7 +7,9 @@
 pub mod error;
 pub mod model;
 pub mod provider;
+pub mod storage;
 
 pub use error::{IrisError, Result};
-pub use model::{Contact, Message, MessageKind, Thread};
+pub use model::{Attachment, Contact, Message, MessageKind, Thread};
 pub use provider::{MessageProvider, ProviderCapability, ProviderMetadata};
+pub use storage::{AttachmentContent, AttachmentRef, AttachmentStore};

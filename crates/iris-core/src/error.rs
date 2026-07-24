@@ -35,6 +35,10 @@ pub enum IrisError {
     /// Serialization or deserialization error.
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    /// Storage error (file I/O, disk full, etc.).
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 /// Convenience Result alias.

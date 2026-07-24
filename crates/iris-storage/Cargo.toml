@@ -1,0 +1,24 @@
+[package]
+name = "iris-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local filesystem attachment storage backend for Iris"
+
+[lints]
+workspace = true
+
+[dependencies]
+iris-core = { path = "../iris-core" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3"

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/iris-core",
+    "crates/iris-storage",
     "crates/iris-providers",
     "crates/iris-server",
     "crates/iris-cli",
