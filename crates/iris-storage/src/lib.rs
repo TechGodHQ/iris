@@ -28,6 +28,7 @@ use uuid::Uuid;
 /// Stores attachments as raw bytes with sidecar JSON metadata files.
 /// Content is sharded across subdirectories using the first 2 hex chars
 /// of each attachment UUID.
+#[derive(Debug)]
 pub struct LocalFsStore {
     root: PathBuf,
 }

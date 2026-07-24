@@ -1,13 +1,14 @@
 //! Email provider backed by IMAP for reads and SMTP for sends.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use iris_core::model::Attachment;
 use iris_core::{
-    Contact, IrisError, Message, MessageKind, MessageProvider, ProviderCapability,
-    ProviderMetadata, Result, Thread,
+    AttachmentContent, AttachmentStore, Contact, IrisError, Message, MessageKind, MessageProvider,
+    ProviderCapability, ProviderMetadata, Result, Thread,
 };
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
@@ -46,11 +47,15 @@ pub struct EmailProvider {
     from: String,
     page_size: u32,
     max_messages: u32,
+    /// Attachment storage backend. Inbound attachment bytes are eagerly
+    /// stored here during normalization so callers receive stable Iris URLs
+    /// instead of transient provider-specific pseudo-URLs.
+    attachments: Arc<dyn AttachmentStore>,
 }
 
 impl EmailProvider {
     /// Build an email provider from explicit connection settings.
-    pub fn new(config: EmailProviderConfig) -> Result<Self> {
+    pub fn new(config: EmailProviderConfig, attachments: Arc<dyn AttachmentStore>) -> Result<Self> {
         config.validate()?;
         Ok(Self {
             imap_host: config.imap_host,
@@ -63,36 +68,50 @@ impl EmailProvider {
             from: config.from,
             page_size: config.page_size,
             max_messages: config.max_messages,
+            attachments,
         })
     }
 
     /// Build from resolved provider credentials.
-    pub fn from_credentials(credentials: &BTreeMap<String, String>) -> Result<Self> {
-        Self::new(EmailProviderConfig {
-            imap_host: required(credentials, "imap_host")?,
-            imap_port: optional_port(credentials, "imap_port", 993)?,
-            smtp_host: required(credentials, "smtp_host")?,
-            smtp_port: optional_port(credentials, "smtp_port", 587)?,
-            username: required(credentials, "username")?,
-            password: required(credentials, "password")?,
-            mailbox: credentials
-                .get("mailbox")
-                .cloned()
-                .unwrap_or_else(|| "INBOX".into()),
-            from: credentials
-                .get("from")
-                .cloned()
-                .unwrap_or_else(|| credentials["username"].clone()),
-            page_size: optional_u32(credentials, "page_size", DEFAULT_PAGE_SIZE)?,
-            max_messages: optional_u32(credentials, "max_messages", DEFAULT_MAX_MESSAGES)?,
-        })
+    pub fn from_credentials(
+        credentials: &BTreeMap<String, String>,
+        attachments: Arc<dyn AttachmentStore>,
+    ) -> Result<Self> {
+        Self::new(
+            EmailProviderConfig {
+                imap_host: required(credentials, "imap_host")?,
+                imap_port: optional_port(credentials, "imap_port", 993)?,
+                smtp_host: required(credentials, "smtp_host")?,
+                smtp_port: optional_port(credentials, "smtp_port", 587)?,
+                username: required(credentials, "username")?,
+                password: required(credentials, "password")?,
+                mailbox: credentials
+                    .get("mailbox")
+                    .cloned()
+                    .unwrap_or_else(|| "INBOX".into()),
+                from: credentials
+                    .get("from")
+                    .cloned()
+                    .unwrap_or_else(|| credentials["username"].clone()),
+                page_size: optional_u32(credentials, "page_size", DEFAULT_PAGE_SIZE)?,
+                max_messages: optional_u32(credentials, "max_messages", DEFAULT_MAX_MESSAGES)?,
+            },
+            attachments,
+        )
     }
 
     async fn fetch_messages(&self, options: FetchOptions) -> Result<FetchResult> {
         let config = self.clone();
-        tokio::task::spawn_blocking(move || config.fetch_messages_blocking(&options))
-            .await
-            .map_err(|error| IrisError::Transport(error.to_string()))?
+        let mut result =
+            tokio::task::spawn_blocking(move || config.fetch_messages_blocking(&options))
+                .await
+                .map_err(|error| IrisError::Transport(error.to_string()))??;
+        // The blocking IMAP session has closed; persist attachment bytes via
+        // the async store and rewrite pseudo-URLs to stable Iris URLs.
+        for email in &mut result.messages {
+            email.store_attachments(&self.attachments).await?;
+        }
+        Ok(result)
     }
 
     fn fetch_messages_blocking(&self, options: &FetchOptions) -> Result<FetchResult> {
@@ -531,6 +550,10 @@ struct EmailEnvelope {
     date: DateTime<Utc>,
     body: String,
     attachments: Vec<Attachment>,
+    /// Raw attachment payloads extracted during MIME parsing, kept alongside
+    /// `attachments` so the async fetch layer can store them after the
+    /// blocking IMAP session has closed. Indices align with `attachments`.
+    raw_attachments: Vec<ParsedAttachment>,
     references: Vec<String>,
     in_reply_to: Option<String>,
 }
@@ -625,6 +648,29 @@ impl EmailEnvelope {
             EmailAddress::to_contact,
         )
     }
+
+    /// Persist each raw attachment through the store and rewrite the matching
+    /// [`Attachment`] entries in place with the assigned Iris ID and URL.
+    ///
+    /// Called from the async fetch layer after the blocking IMAP session has
+    /// closed. `self.attachments` and `self.raw_attachments` are index-aligned.
+    async fn store_attachments(&mut self, store: &Arc<dyn AttachmentStore>) -> Result<()> {
+        for (attachment, parsed) in self.attachments.iter_mut().zip(self.raw_attachments.iter()) {
+            let reference = store
+                .store(AttachmentContent {
+                    mime_type: parsed.mime_type.clone(),
+                    filename: parsed.filename.clone(),
+                    bytes: parsed.bytes.clone(),
+                })
+                .await?;
+            attachment.id = reference.id;
+            attachment.url = reference.url;
+            if attachment.size.is_none() {
+                attachment.size = Some(reference.size);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,8 +706,20 @@ fn parse_email(raw: &[u8]) -> EmailEnvelope {
     let source_id = parsed
         .message_id()
         .map_or_else(|| format!("uuid-v5:{}", uuid_for(raw)), ToOwned::to_owned);
+    let parsed_attachments: Vec<ParsedAttachment> = parsed
+        .attachments()
+        .enumerate()
+        .map(|(index, part)| parse_attachment_part(&source_id, index, part))
+        .collect();
+    // Build placeholder Attachment entries (with pseudo-URLs) so that
+    // pre-storage consumers still see the right shape. The async fetch layer
+    // overwrites id/url after storing the bytes.
+    let attachments = parsed_attachments
+        .iter()
+        .map(|parsed| parsed.as_pending_attachment(&source_id))
+        .collect();
     EmailEnvelope {
-        source_id: source_id.clone(),
+        source_id,
         subject: parsed.subject().map(ToOwned::to_owned),
         from: parsed.from().map(addresses).unwrap_or_default(),
         to: parsed.to().map(addresses).unwrap_or_default(),
@@ -675,11 +733,8 @@ fn parse_email(raw: &[u8]) -> EmailEnvelope {
             .or_else(|| parsed.body_html(0))
             .map(std::borrow::Cow::into_owned)
             .unwrap_or_default(),
-        attachments: parsed
-            .attachments()
-            .enumerate()
-            .map(|(index, part)| attachment_from_part(&source_id, index, part))
-            .collect(),
+        attachments,
+        raw_attachments: parsed_attachments,
         references: header_text_values(parsed.references()),
         in_reply_to: header_text_values(parsed.in_reply_to()).into_iter().next(),
     }
@@ -708,6 +763,7 @@ fn parse_lossy_email(raw: &[u8]) -> EmailEnvelope {
             .map_or_else(Utc::now, |date| date.with_timezone(&Utc)),
         body: body.trim().to_owned(),
         attachments: Vec::new(),
+        raw_attachments: Vec::new(),
         references: first_header(&headers, "references")
             .map(|value| value.split_whitespace().map(ToOwned::to_owned).collect())
             .unwrap_or_default(),
@@ -735,11 +791,40 @@ fn header_text_values(value: &HeaderValue<'_>) -> Vec<String> {
     }
 }
 
-fn attachment_from_part(
-    source_id: &str,
+/// A MIME attachment extracted during parsing, carrying the raw bytes so the
+/// async fetch layer can persist them via [`AttachmentStore`] after the
+/// blocking IMAP session has closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedAttachment {
+    /// Index within the parent email's attachment list.
+    index: usize,
+    /// MIME type of the attachment.
+    mime_type: String,
+    /// Original filename, if known.
+    filename: Option<String>,
+    /// Raw attachment bytes.
+    bytes: Vec<u8>,
+}
+
+impl ParsedAttachment {
+    /// Build a placeholder [`Attachment`] with a provider-specific pseudo-URL.
+    /// The async fetch layer overwrites `id` and `url` after storing the bytes.
+    fn as_pending_attachment(&self, source_id: &str) -> Attachment {
+        Attachment {
+            id: Uuid::new_v4(),
+            mime_type: self.mime_type.clone(),
+            url: format!("email:message:{source_id}:attachment:{}", self.index),
+            filename: self.filename.clone(),
+            size: Some(self.bytes.len() as u64),
+        }
+    }
+}
+
+fn parse_attachment_part(
+    _source_id: &str,
     index: usize,
     part: &mail_parser::MessagePart<'_>,
-) -> Attachment {
+) -> ParsedAttachment {
     let filename = part.attachment_name().map(ToOwned::to_owned);
     let mime_type = part.content_type().map_or_else(
         || "application/octet-stream".into(),
@@ -750,17 +835,17 @@ fn attachment_from_part(
             )
         },
     );
-    Attachment {
-        id: Uuid::new_v4(),
+    let bytes = match &part.body {
+        PartType::Binary(bytes) | PartType::InlineBinary(bytes) => bytes.to_vec(),
+        PartType::Text(text) | PartType::Html(text) => text.as_bytes().to_vec(),
+        PartType::Message(message) => message.raw_message().to_vec(),
+        PartType::Multipart(_) => Vec::new(),
+    };
+    ParsedAttachment {
+        index,
         mime_type,
-        url: format!("email:message:{source_id}:attachment:{index}"),
         filename,
-        size: Some(match &part.body {
-            PartType::Binary(bytes) | PartType::InlineBinary(bytes) => bytes.len() as u64,
-            PartType::Text(text) | PartType::Html(text) => text.len() as u64,
-            PartType::Message(message) => message.raw_message().len() as u64,
-            PartType::Multipart(_) => 0,
-        }),
+        bytes,
     }
 }
 
@@ -931,8 +1016,67 @@ fn dedupe_contacts(contacts: &mut Vec<Contact>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use iris_core::AttachmentRef;
+    use std::sync::Mutex;
 
     const SAMPLE: &[u8] = b"Message-ID: <root@example.com>\r\nSubject: Status\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nCc: Carol <carol@example.com>\r\nDate: Tue, 14 Jul 2026 12:00:00 +0000\r\nContent-Type: multipart/mixed; boundary=demo\r\n\r\n--demo\r\nContent-Type: text/plain\r\n\r\nHello from email\r\n--demo\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=notes.txt\r\n\r\nsecret notes\r\n--demo--\r\n";
+
+    /// In-memory attachment store for tests. Captures every stored payload so
+    /// tests can assert that email normalization eagerly persisted bytes and
+    /// rewrote pseudo-URLs into Iris URLs.
+    #[derive(Default, Debug)]
+    struct InMemoryStore {
+        entries: Mutex<Vec<(Uuid, AttachmentContent)>>,
+    }
+
+    #[async_trait]
+    impl AttachmentStore for InMemoryStore {
+        async fn store(&self, content: AttachmentContent) -> Result<AttachmentRef> {
+            let id = Uuid::new_v4();
+            let size = content.bytes.len() as u64;
+            let mime_type = content.mime_type.clone();
+            let filename = content.filename.clone();
+            self.entries.lock().unwrap().push((id, content));
+            Ok(AttachmentRef {
+                id,
+                url: format!("iris://attachment/{id}"),
+                mime_type,
+                filename,
+                size,
+            })
+        }
+        async fn get(&self, id: &Uuid) -> Result<AttachmentContent> {
+            self.entries
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(stored_id, _)| stored_id == id)
+                .map(|(_, content)| content.clone())
+                .ok_or_else(|| IrisError::NotFound(format!("attachment: {id}")))
+        }
+        async fn delete(&self, id: &Uuid) -> Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .retain(|(stored_id, _)| stored_id != id);
+            Ok(())
+        }
+    }
+
+    fn test_store() -> Arc<dyn AttachmentStore> {
+        Arc::new(InMemoryStore::default())
+    }
+
+    fn valid_creds() -> BTreeMap<String, String> {
+        let mut creds = BTreeMap::new();
+        creds.insert("imap_host".into(), "imap.example.com".into());
+        creds.insert("smtp_host".into(), "smtp.example.com".into());
+        creds.insert("username".into(), "alice@example.com".into());
+        creds.insert("password".into(), "secret".into());
+        creds.insert("from".into(), "alice@example.com".into());
+        creds
+    }
 
     #[test]
     fn parses_message_contacts_and_attachments() {
@@ -952,6 +1096,56 @@ mod tests {
         assert!(message.body.contains("Hello from email"));
     }
 
+    #[tokio::test]
+    async fn store_attachments_persists_bytes_and_rewrites_urls() {
+        // T12: A multipart MIME fixture with real attachment bytes.
+        // After store_attachments runs, the Attachment should carry an Iris
+        // URL and the InMemoryStore should hold the raw bytes.
+        let mut email = parse_email(SAMPLE);
+        let store = test_store();
+
+        // Before storage, the URL is a provider pseudo-URL.
+        assert!(!email.attachments.is_empty());
+        assert!(email.attachments[0].url.starts_with("email:message:"));
+
+        email
+            .store_attachments(&store)
+            .await
+            .expect("storage succeeds");
+
+        // After storage, the URL is rewritten to iris://attachment/{uuid}.
+        assert_eq!(email.attachments.len(), 1);
+        let attachment = &email.attachments[0];
+        assert!(
+            attachment.url.starts_with("iris://attachment/"),
+            "URL should be an Iris URL, got: {}",
+            attachment.url
+        );
+        assert_eq!(attachment.filename.as_deref(), Some("notes.txt"));
+        assert_eq!(attachment.mime_type, "text/plain");
+
+        // The raw bytes should be retrievable from the store.
+        let content = store
+            .get(&attachment.id)
+            .await
+            .expect("stored attachment should be retrievable");
+        assert_eq!(content.bytes, b"secret notes");
+        assert_eq!(content.mime_type, "text/plain");
+        assert_eq!(content.filename.as_deref(), Some("notes.txt"));
+    }
+
+    #[tokio::test]
+    async fn store_attachments_handles_email_with_no_attachments() {
+        let raw = b"Message-ID: <bare@example.com>\nFrom: a@example.com\nTo: b@example.com\n\nno attachments here";
+        let mut email = parse_email(raw);
+        let store = test_store();
+        email
+            .store_attachments(&store)
+            .await
+            .expect("no-op succeeds");
+        assert!(email.attachments.is_empty());
+    }
+
     #[test]
     fn references_define_stable_threads() {
         let email = parse_email(
@@ -964,7 +1158,8 @@ mod tests {
 
     #[test]
     fn validates_required_credentials() {
-        let error = EmailProvider::from_credentials(&BTreeMap::new()).expect_err("missing config");
+        let error = EmailProvider::from_credentials(&BTreeMap::new(), test_store())
+            .expect_err("missing config");
         assert!(error.to_string().contains("imap_host"));
     }
 
@@ -1161,73 +1356,52 @@ mod tests {
 
     #[test]
     fn from_credentials_reads_pagination_settings() {
-        let mut creds = BTreeMap::new();
-        creds.insert("imap_host".into(), "imap.example.com".into());
-        creds.insert("smtp_host".into(), "smtp.example.com".into());
-        creds.insert("username".into(), "alice@example.com".into());
-        creds.insert("password".into(), "secret".into());
-        creds.insert("from".into(), "alice@example.com".into());
+        let mut creds = valid_creds();
         creds.insert("page_size".into(), "25".into());
         creds.insert("max_messages".into(), "100".into());
 
-        let provider = EmailProvider::from_credentials(&creds).expect("valid credentials");
+        let provider =
+            EmailProvider::from_credentials(&creds, test_store()).expect("valid credentials");
         assert_eq!(provider.page_size, 25);
         assert_eq!(provider.max_messages, 100);
     }
 
     #[test]
     fn from_credentials_uses_defaults_when_pagination_unset() {
-        let mut creds = BTreeMap::new();
-        creds.insert("imap_host".into(), "imap.example.com".into());
-        creds.insert("smtp_host".into(), "smtp.example.com".into());
-        creds.insert("username".into(), "alice@example.com".into());
-        creds.insert("password".into(), "secret".into());
-        creds.insert("from".into(), "alice@example.com".into());
-
-        let provider = EmailProvider::from_credentials(&creds).expect("valid credentials");
+        let creds = valid_creds();
+        let provider =
+            EmailProvider::from_credentials(&creds, test_store()).expect("valid credentials");
         assert_eq!(provider.page_size, DEFAULT_PAGE_SIZE);
         assert_eq!(provider.max_messages, DEFAULT_MAX_MESSAGES);
     }
 
     #[test]
     fn from_credentials_rejects_invalid_page_size() {
-        let mut creds = BTreeMap::new();
-        creds.insert("imap_host".into(), "imap.example.com".into());
-        creds.insert("smtp_host".into(), "smtp.example.com".into());
-        creds.insert("username".into(), "alice@example.com".into());
-        creds.insert("password".into(), "secret".into());
-        creds.insert("from".into(), "alice@example.com".into());
+        let mut creds = valid_creds();
         creds.insert("page_size".into(), "not-a-number".into());
 
-        let error = EmailProvider::from_credentials(&creds).expect_err("invalid page_size");
+        let error =
+            EmailProvider::from_credentials(&creds, test_store()).expect_err("invalid page_size");
         assert!(error.to_string().contains("page_size"));
     }
 
     #[test]
     fn from_credentials_rejects_zero_page_size() {
-        let mut creds = BTreeMap::new();
-        creds.insert("imap_host".into(), "imap.example.com".into());
-        creds.insert("smtp_host".into(), "smtp.example.com".into());
-        creds.insert("username".into(), "alice@example.com".into());
-        creds.insert("password".into(), "secret".into());
-        creds.insert("from".into(), "alice@example.com".into());
+        let mut creds = valid_creds();
         creds.insert("page_size".into(), "0".into());
 
-        let error = EmailProvider::from_credentials(&creds).expect_err("zero page_size");
+        let error =
+            EmailProvider::from_credentials(&creds, test_store()).expect_err("zero page_size");
         assert!(error.to_string().contains("page_size must be at least 1"));
     }
 
     #[test]
     fn from_credentials_rejects_zero_max_messages() {
-        let mut creds = BTreeMap::new();
-        creds.insert("imap_host".into(), "imap.example.com".into());
-        creds.insert("smtp_host".into(), "smtp.example.com".into());
-        creds.insert("username".into(), "alice@example.com".into());
-        creds.insert("password".into(), "secret".into());
-        creds.insert("from".into(), "alice@example.com".into());
+        let mut creds = valid_creds();
         creds.insert("max_messages".into(), "0".into());
 
-        let error = EmailProvider::from_credentials(&creds).expect_err("zero max_messages");
+        let error =
+            EmailProvider::from_credentials(&creds, test_store()).expect_err("zero max_messages");
         assert!(
             error
                 .to_string()

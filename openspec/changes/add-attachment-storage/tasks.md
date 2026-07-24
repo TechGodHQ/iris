@@ -13,11 +13,11 @@
 
 ## PR 2: Email provider integration
 
-- [ ] T9: Pass `Arc<dyn AttachmentStore>` to `EmailProvider` at construction
-- [ ] T10: Extract attachment bytes during MIME parsing, store via attachment store
-- [ ] T11: Replace pseudo-URLs (`email:message:...`) with Iris URLs (`iris://attachment/{uuid}`)
-- [ ] T12: Add test with multipart MIME fixture containing real attachment bytes
-- [ ] T13: Verify email provider tests pass with eager storage
+- [x] T9: Pass `Arc<dyn AttachmentStore>` to `EmailProvider` at construction
+- [x] T10: Extract attachment bytes during MIME parsing, store via attachment store
+- [x] T11: Replace pseudo-URLs (`email:message:...`) with Iris URLs (`iris://attachment/{uuid}`)
+- [x] T12: Add test with multipart MIME fixture containing real attachment bytes
+- [x] T13: Verify email provider tests pass with eager storage
 
 ## PR 3: Telegram provider integration
 

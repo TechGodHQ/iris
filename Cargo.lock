@@ -839,8 +839,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "dirs",
  "iris-core",
  "iris-providers",
+ "iris-storage",
  "pretty_assertions",
  "serde",
  "serde_json",

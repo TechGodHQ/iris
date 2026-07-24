@@ -517,6 +517,7 @@ mod tests {
     use uuid::Uuid;
 
     /// A no-op attachment store for tests that don't exercise attachment logic.
+    #[derive(Debug)]
     struct NullStore;
 
     #[async_trait]
