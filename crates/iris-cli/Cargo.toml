@@ -17,6 +17,7 @@ workspace = true
 iris-core = { path = "../iris-core" }
 iris-providers = { path = "../iris-providers" }
 iris-server = { path = "../iris-server" }
+iris-storage = { path = "../iris-storage" }
 axum = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -26,3 +27,4 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+dirs = "6"

@@ -130,7 +130,19 @@ pub fn list_providers() -> anyhow::Result<()> {
 
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let providers = get_providers_from_path(args.config.as_deref())?;
-    let app = iris_server::create_app(providers);
+
+    let attachment_dir = std::env::var("IRIS_ATTACHMENT_DIR").unwrap_or_else(|_| {
+        let mut path =
+            dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("./.iris"));
+        path.push("iris");
+        path.push("attachments");
+        path.to_string_lossy().into_owned()
+    });
+    let store = std::sync::Arc::new(iris_storage::LocalFsStore::new(std::path::PathBuf::from(
+        attachment_dir,
+    )));
+
+    let app = iris_server::create_app(providers, store);
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
     tracing::info!("Iris server listening on {}", args.addr);

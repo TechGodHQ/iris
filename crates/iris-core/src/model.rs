@@ -87,9 +87,14 @@ pub struct Message {
 /// A file or media attachment on a message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Attachment {
+    /// Stable Iris attachment ID (assigned by Iris when stored, not by the provider).
+    pub id: Uuid,
     /// MIME type of the attachment.
     pub mime_type: String,
     /// URL to retrieve the attachment content.
+    ///
+    /// For stored attachments this is `iris://attachment/{uuid}`.
+    /// For legacy/pre-storage attachments this may be a provider-specific pseudo-URL.
     pub url: String,
     /// Filename, if known.
     pub filename: Option<String>,

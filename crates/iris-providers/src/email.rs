@@ -751,6 +751,7 @@ fn attachment_from_part(
         },
     );
     Attachment {
+        id: Uuid::new_v4(),
         mime_type,
         url: format!("email:message:{source_id}:attachment:{index}"),
         filename,

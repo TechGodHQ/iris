@@ -445,6 +445,7 @@ impl TelegramMessage {
         let mut attachments = Vec::new();
         if let Some(photo) = self.photo.as_ref().and_then(|sizes| sizes.last()) {
             attachments.push(iris_core::model::Attachment {
+                id: uuid::Uuid::new_v4(),
                 mime_type: "image/jpeg".into(),
                 url: format!("telegram:file_id:{}", photo.file_id),
                 filename: None,
@@ -462,6 +463,7 @@ impl TelegramMessage {
         .flatten()
         {
             attachments.push(iris_core::model::Attachment {
+                id: uuid::Uuid::new_v4(),
                 mime_type: payload
                     .mime_type
                     .clone()
