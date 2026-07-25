@@ -17,17 +17,23 @@ pub struct ServeArgs {
     pub addr: String,
 }
 
-fn get_providers() -> anyhow::Result<Vec<std::sync::Arc<dyn MessageProvider>>> {
-    providers_from_default_config()
+fn get_providers(
+    store: &std::sync::Arc<dyn iris_core::AttachmentStore>,
+) -> anyhow::Result<Vec<std::sync::Arc<dyn MessageProvider>>> {
+    providers_from_default_config(store)
 }
 
 fn get_providers_from_path(
     config_path: Option<&std::path::Path>,
+    store: &std::sync::Arc<dyn iris_core::AttachmentStore>,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn MessageProvider>>> {
-    config_path.map_or_else(providers_from_default_config, |path| {
-        let config = IrisConfig::from_path(path)?;
-        providers_from_config(&config)
-    })
+    match config_path {
+        None => providers_from_default_config(store),
+        Some(path) => {
+            let config = IrisConfig::from_path(path)?;
+            providers_from_config(&config, store)
+        }
+    }
 }
 
 /// Execute a generated API operation command.
@@ -50,9 +56,24 @@ async fn execute_generated_operation(
     }
 }
 
+/// Create the attachment store from `IRIS_ATTACHMENT_DIR` (or the default
+/// platform-local data directory).
+fn attachment_store() -> std::sync::Arc<dyn iris_core::AttachmentStore> {
+    let attachment_dir = std::env::var("IRIS_ATTACHMENT_DIR").unwrap_or_else(|_| {
+        let mut path =
+            dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("./.iris"));
+        path.push("iris");
+        path.push("attachments");
+        path.to_string_lossy().into_owned()
+    });
+    std::sync::Arc::new(iris_storage::LocalFsStore::new(std::path::PathBuf::from(
+        attachment_dir,
+    )))
+}
+
 async fn list_threads(args: generated::ListThreadsArgs) -> anyhow::Result<()> {
     let mut threads = Vec::new();
-    for provider in get_providers()? {
+    for provider in get_providers(&attachment_store())? {
         threads.extend(provider.list_threads(args.limit).await?);
     }
     if let Some(limit) = args.limit {
@@ -69,7 +90,7 @@ async fn list_messages(args: generated::ListMessagesArgs) -> anyhow::Result<()> 
         .transpose()?
         .map(|timestamp| timestamp.with_timezone(&chrono::Utc));
     let mut messages = Vec::new();
-    for provider in get_providers()? {
+    for provider in get_providers(&attachment_store())? {
         messages.extend(
             provider
                 .list_messages(&args.thread_id, before, args.limit)
@@ -84,7 +105,7 @@ async fn list_messages(args: generated::ListMessagesArgs) -> anyhow::Result<()> 
 
 async fn list_contacts(args: generated::ListContactsArgs) -> anyhow::Result<()> {
     let mut contacts = Vec::new();
-    for provider in get_providers()? {
+    for provider in get_providers(&attachment_store())? {
         contacts.extend(provider.list_contacts(args.limit).await?);
     }
     if let Some(limit) = args.limit {
@@ -94,7 +115,7 @@ async fn list_contacts(args: generated::ListContactsArgs) -> anyhow::Result<()> 
 }
 
 async fn send_message(args: generated::SendMessageArgs) -> anyhow::Result<()> {
-    let providers = get_providers()?;
+    let providers = get_providers(&attachment_store())?;
     let matching_providers: Vec<_> = args.provider.as_deref().map_or_else(
         || providers.iter().collect(),
         |provider_id| {
@@ -121,7 +142,7 @@ async fn send_message(args: generated::SendMessageArgs) -> anyhow::Result<()> {
 }
 
 pub fn list_providers() -> anyhow::Result<()> {
-    for provider in get_providers()? {
+    for provider in get_providers(&attachment_store())? {
         let meta = provider.metadata();
         println!("  {} — {}", meta.id, meta.name);
     }
@@ -129,19 +150,8 @@ pub fn list_providers() -> anyhow::Result<()> {
 }
 
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    let providers = get_providers_from_path(args.config.as_deref())?;
-
-    let attachment_dir = std::env::var("IRIS_ATTACHMENT_DIR").unwrap_or_else(|_| {
-        let mut path =
-            dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("./.iris"));
-        path.push("iris");
-        path.push("attachments");
-        path.to_string_lossy().into_owned()
-    });
-    let store = std::sync::Arc::new(iris_storage::LocalFsStore::new(std::path::PathBuf::from(
-        attachment_dir,
-    )));
-
+    let store = attachment_store();
+    let providers = get_providers_from_path(args.config.as_deref(), &store)?;
     let app = iris_server::create_app(providers, store);
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;

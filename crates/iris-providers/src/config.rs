@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use iris_core::MessageProvider;
+use iris_core::{AttachmentStore, MessageProvider};
 use serde::Deserialize;
 
 use crate::email::EmailProvider;
@@ -146,14 +146,16 @@ impl SecretValue {
 }
 
 /// Build providers from the default config path.
-pub fn providers_from_default_config() -> anyhow::Result<Vec<Arc<dyn MessageProvider>>> {
+pub fn providers_from_default_config(
+    attachments: &Arc<dyn AttachmentStore>,
+) -> anyhow::Result<Vec<Arc<dyn MessageProvider>>> {
     if let Ok(path) = env::var(CONFIG_PATH_ENV) {
-        return providers_from_config(&IrisConfig::from_path(path)?);
+        return providers_from_config(&IrisConfig::from_path(path)?, attachments);
     }
 
     for path in default_config_paths() {
         if path.exists() {
-            return providers_from_config(&IrisConfig::from_path(path)?);
+            return providers_from_config(&IrisConfig::from_path(path)?, attachments);
         }
     }
 
@@ -165,15 +167,21 @@ pub fn providers_from_default_config() -> anyhow::Result<Vec<Arc<dyn MessageProv
 /// Only enabled known provider declarations are registered. An empty explicit
 /// config returns an empty provider list; development fallback providers are
 /// added only by [`providers_from_default_config`] when no config file exists.
-pub fn providers_from_config(config: &IrisConfig) -> anyhow::Result<Vec<Arc<dyn MessageProvider>>> {
+pub fn providers_from_config(
+    config: &IrisConfig,
+    attachments: &Arc<dyn AttachmentStore>,
+) -> anyhow::Result<Vec<Arc<dyn MessageProvider>>> {
     config
         .resolved_enabled_providers()?
         .into_iter()
-        .map(|provider| build_provider(&provider))
+        .map(|provider| build_provider(&provider, attachments))
         .collect()
 }
 
-fn build_provider(provider: &ResolvedProviderConfig) -> anyhow::Result<Arc<dyn MessageProvider>> {
+fn build_provider(
+    provider: &ResolvedProviderConfig,
+    attachments: &Arc<dyn AttachmentStore>,
+) -> anyhow::Result<Arc<dyn MessageProvider>> {
     match provider.id.as_str() {
         "mock" => Ok(Arc::new(MockProvider::new())),
         "telegram" => Ok(Arc::new(TelegramProvider::from_credentials(
@@ -181,6 +189,7 @@ fn build_provider(provider: &ResolvedProviderConfig) -> anyhow::Result<Arc<dyn M
         )?)),
         "email" => Ok(Arc::new(EmailProvider::from_credentials(
             &provider.credentials,
+            attachments.clone(),
         )?)),
         "sms" => Ok(Arc::new(SmsProvider::from_credentials(
             &provider.credentials,
@@ -192,6 +201,30 @@ fn build_provider(provider: &ResolvedProviderConfig) -> anyhow::Result<Arc<dyn M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use iris_core::{AttachmentContent, AttachmentRef, IrisError};
+
+    /// No-op attachment store for config tests — these tests only verify
+    /// provider construction, not attachment persistence.
+    #[derive(Debug)]
+    struct NullStore;
+
+    #[async_trait]
+    impl AttachmentStore for NullStore {
+        async fn store(&self, _content: AttachmentContent) -> iris_core::Result<AttachmentRef> {
+            unreachable!("config tests never store attachments")
+        }
+        async fn get(&self, _id: &uuid::Uuid) -> iris_core::Result<AttachmentContent> {
+            Err(IrisError::NotFound("null store".into()))
+        }
+        async fn delete(&self, _id: &uuid::Uuid) -> iris_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_store() -> Arc<dyn AttachmentStore> {
+        Arc::new(NullStore)
+    }
 
     #[test]
     fn parses_enabled_provider_with_env_secret() {
@@ -226,13 +259,14 @@ enabled = false
         )
         .expect("valid config");
 
-        let providers = providers_from_config(&config).expect("registry builds");
+        let providers = providers_from_config(&config, &test_store()).expect("registry builds");
         assert!(providers.is_empty());
     }
 
     #[test]
     fn empty_explicit_config_registers_no_providers() {
-        let providers = providers_from_config(&IrisConfig::default()).expect("registry builds");
+        let providers =
+            providers_from_config(&IrisConfig::default(), &test_store()).expect("registry builds");
         assert!(providers.is_empty());
     }
 
@@ -264,7 +298,7 @@ bot_token = "123:abc"
         )
         .expect("valid config");
 
-        let providers = providers_from_config(&config).expect("registry builds");
+        let providers = providers_from_config(&config, &test_store()).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "telegram");
     }
@@ -286,7 +320,7 @@ from = "alice@example.com"
         )
         .expect("valid config");
 
-        let providers = providers_from_config(&config).expect("registry builds");
+        let providers = providers_from_config(&config, &test_store()).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "email");
     }
@@ -305,7 +339,7 @@ self_number = "+1 575 555 0199"
         )
         .expect("valid config");
 
-        let providers = providers_from_config(&config).expect("registry builds");
+        let providers = providers_from_config(&config, &test_store()).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "sms");
     }

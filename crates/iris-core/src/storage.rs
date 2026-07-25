@@ -41,7 +41,7 @@ pub struct AttachmentRef {
 /// returning stable, resolvable references. The trait is async because
 /// all storage backends involve I/O.
 #[async_trait]
-pub trait AttachmentStore: Send + Sync {
+pub trait AttachmentStore: std::fmt::Debug + Send + Sync {
     /// Store attachment content, returning a reference with assigned ID and URL.
     ///
     /// The implementation generates the UUID and constructs the Iris URL.
