@@ -28,3 +28,4 @@ native-tls = "0.2"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+wiremock = { workspace = true }

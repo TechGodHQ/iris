@@ -21,11 +21,11 @@
 
 ## PR 3: Telegram provider integration
 
-- [ ] T14: Pass `Arc<dyn AttachmentStore>` to `TelegramProvider` at construction
-- [ ] T15: Download file via Telegram Bot API `getFile` during normalization, store locally
-- [ ] T16: Replace temporary Telegram URLs with stable Iris URLs
-- [ ] T17: Add test with mocked Telegram API file download response
-- [ ] T18: Verify telegram provider tests pass with eager storage
+- [x] T14: Pass `Arc<dyn AttachmentStore>` to `TelegramProvider` at construction
+- [x] T15: Download file via Telegram Bot API `getFile` during normalization, store locally
+- [x] T16: Replace temporary Telegram URLs with stable Iris URLs
+- [x] T17: Add test with mocked Telegram API file download response
+- [x] T18: Verify telegram provider tests pass with eager storage
 
 ## Follow-up (deferred, not in this change)
 

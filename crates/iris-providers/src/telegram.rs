@@ -5,12 +5,14 @@
 //! to provide an account-wide Telegram archive.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use iris_core::model::Attachment;
 use iris_core::{
-    Contact, IrisError, Message, MessageKind, MessageProvider, ProviderCapability,
-    ProviderMetadata, Result, Thread,
+    AttachmentContent, AttachmentStore, Contact, IrisError, Message, MessageKind, MessageProvider,
+    ProviderCapability, ProviderMetadata, Result, Thread,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,18 +38,26 @@ pub struct TelegramProvider {
     client: reqwest::Client,
     base_url: String,
     bot_token: String,
+    /// Attachment storage backend. Inbound file bytes are eagerly downloaded
+    /// and stored here during normalization so callers receive stable Iris URLs
+    /// instead of transient Telegram `file_id` references that expire after ~1h.
+    attachments: Arc<dyn AttachmentStore>,
 }
 
 impl TelegramProvider {
     /// Create a Telegram provider using the public Bot API endpoint.
-    pub fn new(bot_token: impl Into<String>) -> Result<Self> {
-        Self::with_base_url(bot_token, "https://api.telegram.org")
+    pub fn new(
+        bot_token: impl Into<String>,
+        attachments: Arc<dyn AttachmentStore>,
+    ) -> Result<Self> {
+        Self::with_base_url(bot_token, "https://api.telegram.org", attachments)
     }
 
     /// Create a Telegram provider with a custom base URL for tests or proxies.
     pub fn with_base_url(
         bot_token: impl Into<String>,
         base_url: impl Into<String>,
+        attachments: Arc<dyn AttachmentStore>,
     ) -> Result<Self> {
         let bot_token = bot_token.into();
         if bot_token.trim().is_empty() {
@@ -58,18 +68,22 @@ impl TelegramProvider {
             client: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             bot_token,
+            attachments,
         })
     }
 
     /// Build from resolved provider credentials.
-    pub fn from_credentials(credentials: &BTreeMap<String, String>) -> Result<Self> {
+    pub fn from_credentials(
+        credentials: &BTreeMap<String, String>,
+        attachments: Arc<dyn AttachmentStore>,
+    ) -> Result<Self> {
         let token = credentials
             .get("bot_token")
             .or_else(|| credentials.get("token"))
             .ok_or_else(|| {
                 IrisError::Config("telegram credentials.bot_token is required".into())
             })?;
-        Self::new(token.clone())
+        Self::new(token.clone(), attachments)
     }
 
     /// Poll Telegram updates once, suitable for callers that want to drive
@@ -140,6 +154,123 @@ impl TelegramProvider {
     fn method_url(&self, method: &str) -> String {
         format!("{}/bot{}/{}", self.base_url, self.bot_token, method)
     }
+
+    /// Build the file download URL for a Telegram file path.
+    ///
+    /// Telegram files are downloaded via a different path than the Bot API
+    /// methods: `{base_url}/file/bot{token}/{file_path}`.
+    fn file_download_url(&self, file_path: &str) -> String {
+        format!("{}/file/bot{}/{}", self.base_url, self.bot_token, file_path)
+    }
+
+    /// Download a file from Telegram and store it via the attachment store.
+    ///
+    /// Two-step process per the Telegram Bot API docs:
+    /// 1. Call `getFile` to obtain the `file_path`.
+    /// 2. HTTP GET the file bytes from the download URL.
+    ///
+    /// Returns the stored `Attachment` with a stable Iris URL.
+    async fn download_and_store_attachment(
+        &self,
+        file_id: &str,
+        mime_type: &str,
+        filename: Option<&str>,
+    ) -> Result<Attachment> {
+        // Step 1: getFile
+        let response = self
+            .client
+            .get(self.method_url("getFile"))
+            .query(&[("file_id", file_id)])
+            .send()
+            .await
+            .map_err(|error| IrisError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(IrisError::Transport(format!(
+                "telegram getFile returned HTTP {}",
+                response.status()
+            )));
+        }
+        let envelope: TelegramResponse<TelegramFile> = response
+            .json()
+            .await
+            .map_err(|error| IrisError::Serialization(error.to_string()))?;
+        let file = envelope.into_result()?;
+
+        // Step 2: download bytes
+        let response = self
+            .client
+            .get(self.file_download_url(&file.file_path))
+            .send()
+            .await
+            .map_err(|error| IrisError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(IrisError::Transport(format!(
+                "telegram file download returned HTTP {} for path {}",
+                response.status(),
+                file.file_path
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| IrisError::Transport(error.to_string()))?;
+
+        let size = bytes.len() as u64;
+        let reference = self
+            .attachments
+            .store(AttachmentContent {
+                mime_type: mime_type.to_owned(),
+                filename: filename.map(ToOwned::to_owned),
+                bytes: bytes.to_vec(),
+            })
+            .await?;
+
+        Ok(Attachment {
+            id: reference.id,
+            mime_type: reference.mime_type,
+            url: reference.url,
+            filename: reference.filename,
+            size: Some(size),
+        })
+    }
+
+    /// Eagerly download and store all attachments for a batch of messages,
+    /// rewriting temporary `telegram:file_id:` URLs in place.
+    ///
+    /// If an individual download fails (e.g. file expired), the attachment
+    /// keeps its original pseudo-URL so the message is still visible to
+    /// consumers — one expired file should not block the whole listing.
+    async fn store_message_attachments(&self, messages: &mut [Message]) {
+        for message in messages.iter_mut() {
+            for attachment in &mut message.attachments {
+                // Only process pseudo-URLs that haven't been stored yet.
+                if !attachment.url.starts_with("telegram:file_id:") {
+                    continue;
+                }
+                let Some(file_id) = attachment.url.strip_prefix("telegram:file_id:") else {
+                    continue;
+                };
+                // Attempt download; on failure log and leave the pseudo-URL.
+                match self
+                    .download_and_store_attachment(
+                        file_id,
+                        &attachment.mime_type,
+                        attachment.filename.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(stored) => *attachment = stored,
+                    Err(error) => {
+                        tracing::warn!(
+                            file_id = file_id,
+                            error = %error,
+                            "failed to download telegram attachment; leaving pseudo-URL in place"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -187,6 +318,10 @@ impl MessageProvider for TelegramProvider {
             .map(|message| message.to_message())
             .filter(|message| before.is_none_or(|cursor| message.timestamp < cursor))
             .collect();
+
+        // Eagerly download and store attachment bytes, rewriting pseudo-URLs
+        // to stable Iris URLs. Failures are per-attachment, not fatal.
+        self.store_message_attachments(&mut messages).await;
 
         messages.sort_by_key(|m| m.timestamp);
         messages.truncate(limit.unwrap_or(50) as usize);
@@ -326,6 +461,17 @@ struct TelegramPhotoSize {
     file_unique_id: String,
     width: u32,
     height: u32,
+    file_size: Option<u64>,
+}
+
+/// Response from the Telegram `getFile` API method.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(clippy::struct_field_names)]
+struct TelegramFile {
+    file_id: String,
+    file_unique_id: Option<String>,
+    /// Path used to construct the download URL.
+    file_path: String,
     file_size: Option<u64>,
 }
 
@@ -571,6 +717,54 @@ fn unix_timestamp(timestamp: i64) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iris_core::AttachmentRef;
+    use std::sync::Mutex;
+
+    /// In-memory attachment store for tests — captures every stored payload
+    /// so tests can assert that telegram normalization eagerly persisted bytes
+    /// and rewrote pseudo-URLs into Iris URLs.
+    #[derive(Default, Debug)]
+    struct InMemoryStore {
+        entries: Mutex<Vec<(Uuid, AttachmentContent)>>,
+    }
+
+    #[async_trait]
+    impl AttachmentStore for InMemoryStore {
+        async fn store(&self, content: AttachmentContent) -> Result<AttachmentRef> {
+            let id = Uuid::new_v4();
+            let size = content.bytes.len() as u64;
+            let mime_type = content.mime_type.clone();
+            let filename = content.filename.clone();
+            self.entries.lock().unwrap().push((id, content));
+            Ok(AttachmentRef {
+                id,
+                url: format!("iris://attachment/{id}"),
+                mime_type,
+                filename,
+                size,
+            })
+        }
+        async fn get(&self, id: &Uuid) -> Result<AttachmentContent> {
+            self.entries
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(stored_id, _)| stored_id == id)
+                .map(|(_, content)| content.clone())
+                .ok_or_else(|| IrisError::NotFound(format!("attachment: {id}")))
+        }
+        async fn delete(&self, id: &Uuid) -> Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .retain(|(stored_id, _)| stored_id != id);
+            Ok(())
+        }
+    }
+
+    fn test_store() -> Arc<dyn AttachmentStore> {
+        Arc::new(InMemoryStore::default())
+    }
 
     fn sample_text_message() -> TelegramMessage {
         serde_json::from_value(json!({
@@ -636,10 +830,352 @@ mod tests {
     #[test]
     fn validates_credentials() {
         let empty = BTreeMap::new();
-        assert!(TelegramProvider::from_credentials(&empty).is_err());
+        assert!(TelegramProvider::from_credentials(&empty, test_store()).is_err());
 
         let mut credentials = BTreeMap::new();
         credentials.insert("bot_token".into(), "123:abc".into());
-        assert!(TelegramProvider::from_credentials(&credentials).is_ok());
+        assert!(TelegramProvider::from_credentials(&credentials, test_store()).is_ok());
+    }
+
+    #[test]
+    fn photo_attachment_uses_pseudo_url_before_storage() {
+        // Before store_message_attachments runs, attachments carry
+        // telegram:file_id: pseudo-URLs.
+        let photo: TelegramMessage = serde_json::from_value(json!({
+            "message_id": 50,
+            "date": 1_700_000_010,
+            "chat": {"id": 1, "type": "private", "first_name": "Ada"},
+            "photo": [
+                {"file_id": "small", "file_unique_id": "u1", "width": 10, "height": 10},
+                {"file_id": "large", "file_unique_id": "u2", "width": 100, "height": 100}
+            ]
+        }))
+        .expect("photo parses");
+        let message = photo.to_message();
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].url, "telegram:file_id:large");
+        assert_eq!(message.attachments[0].mime_type, "image/jpeg");
+    }
+
+    #[test]
+    fn document_attachment_uses_pseudo_url_before_storage() {
+        let doc: TelegramMessage = serde_json::from_value(json!({
+            "message_id": 51,
+            "date": 1_700_000_020,
+            "chat": {"id": 1, "type": "private", "first_name": "Ada"},
+            "document": {
+                "file_id": "doc123",
+                "file_unique_id": "du",
+                "mime_type": "application/pdf",
+                "file_name": "report.pdf",
+                "file_size": 4096
+            }
+        }))
+        .expect("document parses");
+        let message = doc.to_message();
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].url, "telegram:file_id:doc123");
+        assert_eq!(message.attachments[0].mime_type, "application/pdf");
+        assert_eq!(
+            message.attachments[0].filename.as_deref(),
+            Some("report.pdf")
+        );
+    }
+
+    #[test]
+    fn voice_attachment_uses_pseudo_url_before_storage() {
+        let voice: TelegramMessage = serde_json::from_value(json!({
+            "message_id": 52,
+            "date": 1_700_000_030,
+            "chat": {"id": 1, "type": "private", "first_name": "Ada"},
+            "voice": {
+                "file_id": "voice456",
+                "file_unique_id": "vu",
+                "mime_type": "audio/ogg",
+                "duration": 5
+            }
+        }))
+        .expect("voice parses");
+        let message = voice.to_message();
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].url, "telegram:file_id:voice456");
+        assert_eq!(message.attachments[0].mime_type, "audio/ogg");
+    }
+
+    #[test]
+    fn file_download_url_construction() {
+        let store = test_store();
+        let provider =
+            TelegramProvider::with_base_url("123:abc", "https://api.telegram.org", store)
+                .expect("provider builds");
+        assert_eq!(
+            provider.file_download_url("photos/file_1.jpg"),
+            "https://api.telegram.org/file/bot123:abc/photos/file_1.jpg"
+        );
+    }
+
+    #[test]
+    fn telegram_file_deserializes() {
+        let file: TelegramFile = serde_json::from_value(json!({
+            "file_id": "ABC123",
+            "file_unique_id": "unique123",
+            "file_path": "documents/file_1.pdf",
+            "file_size": 4096
+        }))
+        .expect("file parses");
+        assert_eq!(file.file_id, "ABC123");
+        assert_eq!(file.file_path, "documents/file_1.pdf");
+        assert_eq!(file.file_size, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn store_message_attachments_leaves_iris_urls_untouched() {
+        // If an attachment already has an Iris URL (e.g. stored by a prior
+        // pass), store_message_attachments should not try to re-download it.
+        let store: Arc<InMemoryStore> = Arc::new(InMemoryStore::default());
+        let provider = TelegramProvider::with_base_url(
+            "123:abc",
+            "https://api.telegram.invalid",
+            store.clone(),
+        )
+        .expect("provider builds");
+
+        let iris_id = Uuid::new_v4();
+        let mut messages = vec![Message {
+            id: Uuid::new_v4(),
+            thread_id: Uuid::new_v4(),
+            source: PROVIDER_ID.into(),
+            source_id: "99".into(),
+            sender: sample_text_message().to_message().sender,
+            kind: MessageKind::Image,
+            body: String::new(),
+            attachments: vec![Attachment {
+                id: iris_id,
+                mime_type: "image/jpeg".into(),
+                url: format!("iris://attachment/{iris_id}"),
+                filename: None,
+                size: Some(100),
+            }],
+            timestamp: unix_timestamp(1_700_000_000),
+            is_outbound: false,
+            metadata: json!({}),
+        }];
+
+        provider.store_message_attachments(&mut messages).await;
+
+        // URL should be unchanged — no download attempted.
+        assert_eq!(
+            messages[0].attachments[0].url,
+            format!("iris://attachment/{iris_id}")
+        );
+
+        // Store should have zero entries (nothing was stored).
+        assert!(
+            store.entries.lock().unwrap().is_empty(),
+            "no downloads should have occurred for already-stored attachments"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_message_attachments_downloads_and_stores_photo() {
+        // T17: Mock the Telegram Bot API getFile + file download endpoints,
+        // then verify that store_message_attachments downloads the bytes,
+        // stores them, and rewrites the pseudo-URL to an Iris URL.
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let store: Arc<InMemoryStore> = Arc::new(InMemoryStore::default());
+        let provider = TelegramProvider::with_base_url("123:abc", server.uri(), store.clone())
+            .expect("provider builds");
+
+        // Mock the getFile response
+        let file_path = "photos/file_123.jpg";
+        Mock::given(method("GET"))
+            .and(path("/bot123:abc/getFile"))
+            .and(query_param("file_id", "photo_file_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": {
+                    "file_id": "photo_file_id",
+                    "file_unique_id": "uniq",
+                    "file_path": file_path,
+                    "file_size": 11
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        // Mock the file download endpoint
+        let image_bytes = b"hello image";
+        Mock::given(method("GET"))
+            .and(path(format!("/file/bot123:abc/{file_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(image_bytes.to_vec()))
+            .mount(&server)
+            .await;
+
+        // Build a message with a pseudo-URL attachment
+        let photo: TelegramMessage = serde_json::from_value(json!({
+            "message_id": 70,
+            "date": 1_700_000_050,
+            "chat": {"id": 1, "type": "private", "first_name": "Ada"},
+            "photo": [{"file_id": "photo_file_id", "file_unique_id": "u", "width": 1, "height": 1}]
+        }))
+        .expect("photo parses");
+
+        let mut messages = vec![photo.to_message()];
+        assert_eq!(
+            messages[0].attachments[0].url,
+            "telegram:file_id:photo_file_id"
+        );
+
+        // Run the eager storage pass
+        provider.store_message_attachments(&mut messages).await;
+
+        // The pseudo-URL should be replaced with an Iris URL
+        let attachment = &messages[0].attachments[0];
+        assert!(
+            attachment.url.starts_with("iris://attachment/"),
+            "URL should be an Iris URL, got: {}",
+            attachment.url
+        );
+        assert_eq!(attachment.mime_type, "image/jpeg");
+        assert_eq!(attachment.size, Some(11));
+
+        // The store should hold the downloaded bytes
+        let stored_bytes = {
+            let entries = store.entries.lock().unwrap();
+            assert_eq!(entries.len(), 1);
+            entries[0].1.bytes.clone()
+        };
+        assert_eq!(stored_bytes, image_bytes);
+
+        // Verify mime type via a separate lock scope
+        let stored_mime = store.entries.lock().unwrap()[0].1.mime_type.clone();
+        assert_eq!(stored_mime, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn store_message_attachments_downloads_and_stores_document() {
+        // Verify document attachments (with mime_type + filename) are
+        // correctly downloaded and stored.
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let store: Arc<InMemoryStore> = Arc::new(InMemoryStore::default());
+        let provider = TelegramProvider::with_base_url("123:abc", server.uri(), store.clone())
+            .expect("provider builds");
+
+        let file_path = "documents/file_456.pdf";
+        Mock::given(method("GET"))
+            .and(path("/bot123:abc/getFile"))
+            .and(query_param("file_id", "doc_file_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": {
+                    "file_id": "doc_file_id",
+                    "file_unique_id": "uniq2",
+                    "file_path": file_path
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let pdf_bytes = b"%PDF-1.4 fake pdf content";
+        Mock::given(method("GET"))
+            .and(path(format!("/file/bot123:abc/{file_path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(pdf_bytes.to_vec()))
+            .mount(&server)
+            .await;
+
+        let doc: TelegramMessage = serde_json::from_value(json!({
+            "message_id": 71,
+            "date": 1_700_000_060,
+            "chat": {"id": 1, "type": "private", "first_name": "Ada"},
+            "document": {
+                "file_id": "doc_file_id",
+                "file_unique_id": "du",
+                "mime_type": "application/pdf",
+                "file_name": "report.pdf"
+            }
+        }))
+        .expect("document parses");
+
+        let mut messages = vec![doc.to_message()];
+        assert_eq!(
+            messages[0].attachments[0].url,
+            "telegram:file_id:doc_file_id"
+        );
+
+        provider.store_message_attachments(&mut messages).await;
+
+        let attachment = &messages[0].attachments[0];
+        assert!(attachment.url.starts_with("iris://attachment/"));
+        assert_eq!(attachment.mime_type, "application/pdf");
+        assert_eq!(attachment.filename.as_deref(), Some("report.pdf"));
+        assert_eq!(attachment.size, Some(pdf_bytes.len() as u64));
+
+        let stored = {
+            let entries = store.entries.lock().unwrap();
+            assert_eq!(entries.len(), 1);
+            entries[0].1.clone()
+        };
+        assert_eq!(stored.bytes, pdf_bytes);
+        assert_eq!(stored.mime_type, "application/pdf");
+        assert_eq!(stored.filename.as_deref(), Some("report.pdf"));
+    }
+
+    #[tokio::test]
+    async fn store_message_attachments_leaves_failed_downloads_in_place() {
+        // When the download fails (getFile returns an error), the pseudo-URL
+        // should remain so the message is still visible to consumers.
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let store: Arc<InMemoryStore> = Arc::new(InMemoryStore::default());
+        let provider = TelegramProvider::with_base_url("123:abc", server.uri(), store.clone())
+            .expect("provider builds");
+
+        // Mock getFile to return an error
+        Mock::given(method("GET"))
+            .and(path("/bot123:abc/getFile"))
+            .and(query_param("file_id", "expired_file"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "description": "file is too old"
+            })))
+            .mount(&server)
+            .await;
+
+        let photo: TelegramMessage = serde_json::from_value(json!({
+            "message_id": 60,
+            "date": 1_700_000_040,
+            "chat": {"id": 1, "type": "private", "first_name": "Ada"},
+            "photo": [{"file_id": "expired_file", "file_unique_id": "u", "width": 1, "height": 1}]
+        }))
+        .expect("photo parses");
+
+        let mut messages = vec![photo.to_message()];
+        assert_eq!(
+            messages[0].attachments[0].url,
+            "telegram:file_id:expired_file"
+        );
+
+        // store_message_attachments swallows the error and leaves the pseudo-URL.
+        provider.store_message_attachments(&mut messages).await;
+
+        // The pseudo-URL should still be there.
+        assert_eq!(
+            messages[0].attachments[0].url,
+            "telegram:file_id:expired_file"
+        );
+
+        // Store should have zero entries.
+        assert!(
+            store.entries.lock().unwrap().is_empty(),
+            "nothing should have been stored when download failed"
+        );
     }
 }
