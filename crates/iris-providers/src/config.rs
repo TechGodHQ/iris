@@ -186,6 +186,7 @@ fn build_provider(
         "mock" => Ok(Arc::new(MockProvider::new())),
         "telegram" => Ok(Arc::new(TelegramProvider::from_credentials(
             &provider.credentials,
+            attachments.clone(),
         )?)),
         "email" => Ok(Arc::new(EmailProvider::from_credentials(
             &provider.credentials,
