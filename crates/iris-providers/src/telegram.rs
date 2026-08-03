@@ -184,6 +184,12 @@ impl TelegramProvider {
             .send()
             .await
             .map_err(|error| IrisError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(IrisError::Transport(format!(
+                "telegram getFile returned HTTP {}",
+                response.status()
+            )));
+        }
         let envelope: TelegramResponse<TelegramFile> = response
             .json()
             .await
@@ -191,12 +197,20 @@ impl TelegramProvider {
         let file = envelope.into_result()?;
 
         // Step 2: download bytes
-        let bytes = self
+        let response = self
             .client
             .get(self.file_download_url(&file.file_path))
             .send()
             .await
-            .map_err(|error| IrisError::Transport(error.to_string()))?
+            .map_err(|error| IrisError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(IrisError::Transport(format!(
+                "telegram file download returned HTTP {} for path {}",
+                response.status(),
+                file.file_path
+            )));
+        }
+        let bytes = response
             .bytes()
             .await
             .map_err(|error| IrisError::Transport(error.to_string()))?;
@@ -236,8 +250,8 @@ impl TelegramProvider {
                 let Some(file_id) = attachment.url.strip_prefix("telegram:file_id:") else {
                     continue;
                 };
-                // Attempt download; on failure leave the pseudo-URL in place.
-                if let Ok(stored) = self
+                // Attempt download; on failure log and leave the pseudo-URL.
+                match self
                     .download_and_store_attachment(
                         file_id,
                         &attachment.mime_type,
@@ -245,7 +259,14 @@ impl TelegramProvider {
                     )
                     .await
                 {
-                    *attachment = stored;
+                    Ok(stored) => *attachment = stored,
+                    Err(error) => {
+                        tracing::warn!(
+                            file_id = file_id,
+                            error = %error,
+                            "failed to download telegram attachment; leaving pseudo-URL in place"
+                        );
+                    }
                 }
             }
         }
