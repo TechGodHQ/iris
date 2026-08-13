@@ -1,0 +1,24 @@
+[package]
+name = "iris-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local filesystem hash-chained audit log for Iris"
+
+[lints]
+workspace = true
+
+[dependencies]
+iris-core = { path = "../iris-core" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3"
