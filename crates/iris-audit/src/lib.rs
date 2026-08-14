@@ -1,11 +1,13 @@
 //! Local filesystem implementation of Iris's tamper-evident audit trail.
 
 use std::{
+    fs::OpenOptions,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use async_trait::async_trait;
+use fs2::FileExt;
 use iris_core::{AuditEntry, AuditEvent, AuditFilter, AuditLog, IrisError, Result};
 use sha2::{Digest, Sha256};
 use tokio::{fs, sync::Mutex};
@@ -58,12 +60,36 @@ impl LocalFsAuditLog {
         ordered.extend(unordered);
         Ok(ordered)
     }
+
+    /// Acquire an advisory OS-level lock shared by every process using this
+    /// audit root. The lock covers tail lookup and entry creation so separate
+    /// CLI, MCP, and server processes cannot fork the hash chain.
+    async fn acquire_write_lock(&self) -> Result<std::fs::File> {
+        fs::create_dir_all(&self.root)
+            .await
+            .map_err(storage_error)?;
+        let path = self.root.join(".iris-audit.lock");
+        tokio::task::spawn_blocking(move || {
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .map_err(storage_error)?;
+            file.lock_exclusive().map_err(storage_error)?;
+            Ok(file)
+        })
+        .await
+        .map_err(|error| IrisError::Storage(error.to_string()))?
+    }
 }
 
 #[async_trait]
 impl AuditLog for LocalFsAuditLog {
     async fn record(&self, event: AuditEvent) -> Result<AuditEntry> {
         let _guard = self.write_lock.lock().await;
+        let _file_lock = self.acquire_write_lock().await?;
         let previous = self
             .entries()
             .await?
@@ -213,5 +239,20 @@ mod tests {
             .replace("telegram", "forged__");
         tokio::fs::write(path, text).await.unwrap();
         assert!(!log.verify_chain().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn serializes_writes_from_independent_log_instances() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = LocalFsAuditLog::new(temp.path());
+        let second = LocalFsAuditLog::new(temp.path());
+        let (first_entry, second_entry) = tokio::join!(
+            first.record(event(AuditAction::Normalize, "one")),
+            second.record(event(AuditAction::Send, "two")),
+        );
+        first_entry.unwrap();
+        second_entry.unwrap();
+        assert!(first.verify_chain().await.unwrap());
+        assert_eq!(first.query(&AuditFilter::default()).await.unwrap().len(), 2);
     }
 }

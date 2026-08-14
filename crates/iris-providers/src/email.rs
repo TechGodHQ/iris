@@ -140,6 +140,19 @@ impl EmailProvider {
         // the async store and rewrite pseudo-URLs to stable Iris URLs.
         for email in &mut result.messages {
             email.store_attachments(&self.attachments).await?;
+            for attachment in &email.attachments {
+                self.record(
+                    AuditAction::FetchAttachment,
+                    Some(email.source_id.clone()),
+                    json!({
+                        "operation": "fetch_attachment",
+                        "mime_type": attachment.mime_type,
+                        "filename": attachment.filename,
+                        "size": attachment.size,
+                    }),
+                )
+                .await;
+            }
         }
         Ok(result)
     }

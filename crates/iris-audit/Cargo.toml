@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 iris-core = { path = "../iris-core" }
 async-trait = { workspace = true }
+fs2 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
