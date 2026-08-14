@@ -272,6 +272,7 @@ impl TelegramProvider {
     /// consumers — one expired file should not block the whole listing.
     async fn store_message_attachments(&self, messages: &mut [Message]) {
         for message in messages.iter_mut() {
+            let message_source_id = message.source_id.clone();
             for attachment in &mut message.attachments {
                 // Only process pseudo-URLs that haven't been stored yet.
                 if !attachment.url.starts_with("telegram:file_id:") {
@@ -289,7 +290,20 @@ impl TelegramProvider {
                     )
                     .await
                 {
-                    Ok(stored) => *attachment = stored,
+                    Ok(stored) => {
+                        self.record(
+                            AuditAction::FetchAttachment,
+                            Some(message_source_id.clone()),
+                            json!({
+                                "operation": "fetch_attachment",
+                                "mime_type": stored.mime_type,
+                                "filename": stored.filename,
+                                "size": stored.size,
+                            }),
+                        )
+                        .await;
+                        *attachment = stored;
+                    }
                     Err(error) => {
                         tracing::warn!(
                             file_id = file_id,
@@ -361,6 +375,12 @@ impl MessageProvider for TelegramProvider {
 
         messages.sort_by_key(|m| m.timestamp);
         messages.truncate(limit.unwrap_or(50) as usize);
+        self.record(
+            AuditAction::Normalize,
+            Some(thread_id.to_owned()),
+            json!({ "operation": "list_messages", "count": messages.len() }),
+        )
+        .await;
         Ok(messages)
     }
 
@@ -381,6 +401,12 @@ impl MessageProvider for TelegramProvider {
         }
         dedupe_contacts(&mut contacts);
         contacts.truncate(limit.unwrap_or(50) as usize);
+        self.record(
+            AuditAction::Normalize,
+            None,
+            json!({ "operation": "list_contacts", "count": contacts.len() }),
+        )
+        .await;
         Ok(contacts)
     }
 
@@ -397,7 +423,14 @@ impl MessageProvider for TelegramProvider {
             .json()
             .await
             .map_err(|error| IrisError::Serialization(error.to_string()))?;
-        Ok(envelope.into_result()?.to_message())
+        let message = envelope.into_result()?.to_message();
+        self.record(
+            AuditAction::Send,
+            Some(thread_id.to_owned()),
+            json!({ "operation": "send_message", "message_id": message.source_id }),
+        )
+        .await;
+        Ok(message)
     }
 }
 
