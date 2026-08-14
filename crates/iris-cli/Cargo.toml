@@ -29,3 +29,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"

@@ -37,7 +37,7 @@ struct AuditQuery {
     since: Option<chrono::DateTime<chrono::Utc>>,
     until: Option<chrono::DateTime<chrono::Utc>>,
     source_id: Option<String>,
-    limit: Option<usize>,
+    limit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,6 +307,15 @@ async fn audit_query(
     {
         return Err(bad_request("since must be before or equal to until"));
     }
+    let limit = filter
+        .limit
+        .map(|limit| {
+            limit
+                .parse::<u32>()
+                .map(|limit| limit as usize)
+                .map_err(bad_request)
+        })
+        .transpose()?;
     let entries = state
         .audit
         .query(&AuditFilter {
@@ -314,7 +323,7 @@ async fn audit_query(
             action: filter.action,
             since: filter.since,
             until: filter.until,
-            limit: filter.limit,
+            limit,
             source_id: filter.source_id,
         })
         .await
@@ -554,7 +563,8 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use iris_core::{
-        AttachmentContent, AttachmentRef, AttachmentStore, IrisError, MessageKind, ProviderMetadata,
+        AttachmentContent, AttachmentRef, AttachmentStore, AuditAction, AuditEvent, AuditLog,
+        IrisError, MessageKind, ProviderMetadata,
     };
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
@@ -874,6 +884,54 @@ mod tests {
         assert_eq!(contacts.len(), 2);
         assert_eq!(contacts[0].display_name.as_deref(), Some("Ada"));
         assert_eq!(contacts[1].display_name.as_deref(), Some("Mina"));
+    }
+
+    #[tokio::test]
+    async fn audit_query_returns_filtered_entries_through_the_http_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let audit: Arc<dyn AuditLog> = Arc::new(iris_audit::LocalFsAuditLog::new(temp.path()));
+        audit
+            .record(AuditEvent {
+                action: AuditAction::Normalize,
+                provider: "email".into(),
+                source_id: Some("inbox-1".into()),
+                timestamp: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let expected = audit
+            .record(AuditEvent {
+                action: AuditAction::Send,
+                provider: "telegram".into(),
+                source_id: Some("outgoing-1".into()),
+                timestamp: Utc.with_ymd_and_hms(2026, 8, 14, 12, 1, 0).unwrap(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let mut state = state(Vec::new());
+        state.audit = audit;
+
+        let Json(entries) = audit_query(
+            &state,
+            input(&[("provider", "telegram"), ("action", "send"), ("limit", "1")]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries, vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn audit_query_rejects_limit_outside_the_generated_u32_contract() {
+        let state = state(Vec::new());
+
+        let (status, _) = audit_query(&state, input(&[("limit", "4294967296")]))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

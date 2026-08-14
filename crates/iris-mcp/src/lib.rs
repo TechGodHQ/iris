@@ -355,6 +355,8 @@ struct _ProtocolMarker;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
+    use iris_core::{AuditAction, AuditEvent, AuditLog};
     use iris_providers::mock::MockProvider;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -434,6 +436,41 @@ mod tests {
         let threads: Vec<Thread> = serde_json::from_str(text).expect("thread JSON");
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].source, "mock");
+    }
+
+    #[tokio::test]
+    async fn tools_call_queries_audit_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let audit: Arc<dyn AuditLog> = Arc::new(iris_audit::LocalFsAuditLog::new(temp.path()));
+        let expected = audit
+            .record(AuditEvent {
+                action: AuditAction::Send,
+                provider: "telegram".into(),
+                source_id: Some("outgoing-1".into()),
+                timestamp: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        let server = McpServer::new(vec![Arc::new(MockProvider::new())], audit);
+
+        let response = server
+            .handle_jsonrpc(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "audit_query",
+                    "arguments": {"action": "send", "provider": "telegram"}
+                }
+            }))
+            .await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let entries: Vec<AuditEntry> =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(entries, vec![expected]);
     }
 
     #[tokio::test]

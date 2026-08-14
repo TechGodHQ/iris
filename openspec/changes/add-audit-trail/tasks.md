@@ -18,4 +18,4 @@
 
 - [x] T9: Add `audit_query` to `api/operations.yaml` and regenerate generated artifacts.
 - [x] T10: Wire filtered audit queries into HTTP, MCP, and CLI runtimes.
-- [ ] T11: Add HTTP/MCP/CLI query tests.
+- [x] T11: Add HTTP/MCP/CLI query tests.

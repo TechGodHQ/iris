@@ -155,6 +155,13 @@ async fn send_message(args: generated::SendMessageArgs) -> anyhow::Result<()> {
 }
 
 async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
+    print_json(&query_audit_entries(&audit_log(), args).await?)
+}
+
+async fn query_audit_entries(
+    audit: &std::sync::Arc<dyn AuditLog>,
+    args: generated::AuditQueryArgs,
+) -> anyhow::Result<Vec<iris_core::AuditEntry>> {
     let action = args
         .action
         .map(|action| serde_json::from_value::<AuditAction>(serde_json::Value::String(action)))
@@ -174,7 +181,7 @@ async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
     if since.is_some_and(|since| until.is_some_and(|until| since > until)) {
         anyhow::bail!("since must be before or equal to until");
     }
-    let entries = audit_log()
+    audit
         .query(&AuditFilter {
             provider: args.provider,
             action,
@@ -183,8 +190,8 @@ async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
             limit: args.limit.map(|limit| limit as usize),
             source_id: args.source_id,
         })
-        .await?;
-    print_json(&entries)
+        .await
+        .map_err(Into::into)
 }
 
 pub fn list_providers() -> anyhow::Result<()> {
@@ -211,4 +218,54 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     println!("{json}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use iris_core::{AuditAction, AuditEvent};
+
+    #[tokio::test]
+    async fn audit_query_returns_filtered_entries_from_the_cli_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let audit: std::sync::Arc<dyn AuditLog> =
+            std::sync::Arc::new(iris_audit::LocalFsAuditLog::new(temp.path()));
+        audit
+            .record(AuditEvent {
+                action: AuditAction::Normalize,
+                provider: "telegram".into(),
+                source_id: Some("incoming-1".into()),
+                timestamp: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let expected = audit
+            .record(AuditEvent {
+                action: AuditAction::Send,
+                provider: "telegram".into(),
+                source_id: Some("outgoing-1".into()),
+                timestamp: Utc.with_ymd_and_hms(2026, 8, 14, 12, 1, 0).unwrap(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+
+        let entries = query_audit_entries(
+            &audit,
+            generated::AuditQueryArgs {
+                provider: Some("telegram".into()),
+                action: Some("send".into()),
+                since: None,
+                until: None,
+                source_id: None,
+                limit: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries, vec![expected]);
+    }
 }
