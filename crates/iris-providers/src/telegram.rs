@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use iris_core::model::Attachment;
 use iris_core::{
-    AttachmentContent, AttachmentStore, Contact, IrisError, Message, MessageKind, MessageProvider,
-    ProviderCapability, ProviderMetadata, Result, Thread,
+    AttachmentContent, AttachmentStore, AuditAction, AuditEvent, AuditLog, Contact, IrisError,
+    Message, MessageKind, MessageProvider, ProviderCapability, ProviderMetadata, Result, Thread,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +42,7 @@ pub struct TelegramProvider {
     /// and stored here during normalization so callers receive stable Iris URLs
     /// instead of transient Telegram `file_id` references that expire after ~1h.
     attachments: Arc<dyn AttachmentStore>,
+    audit: Option<Arc<dyn AuditLog>>,
 }
 
 impl TelegramProvider {
@@ -69,7 +70,36 @@ impl TelegramProvider {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             bot_token,
             attachments,
+            audit: None,
         })
+    }
+
+    /// Attach an audit sink for non-secret operation metadata.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    async fn record(
+        &self,
+        action: AuditAction,
+        source_id: Option<String>,
+        metadata: serde_json::Value,
+    ) {
+        if let Some(audit) = &self.audit
+            && let Err(error) = audit
+                .record(AuditEvent {
+                    action,
+                    provider: PROVIDER_ID.into(),
+                    source_id,
+                    timestamp: Utc::now(),
+                    metadata,
+                })
+                .await
+        {
+            tracing::warn!(%error, "failed to record telegram provider audit event");
+        }
     }
 
     /// Build from resolved provider credentials.
@@ -300,6 +330,12 @@ impl MessageProvider for TelegramProvider {
         let mut threads: Vec<_> = by_chat.into_values().collect();
         threads.sort_by_key(|t| std::cmp::Reverse(t.last_message_at));
         threads.truncate(limit.unwrap_or(50) as usize);
+        self.record(
+            AuditAction::Normalize,
+            None,
+            json!({ "operation": "list_threads", "count": threads.len() }),
+        )
+        .await;
         Ok(threads)
     }
 
