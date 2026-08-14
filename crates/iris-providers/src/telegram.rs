@@ -86,9 +86,9 @@ impl TelegramProvider {
         action: AuditAction,
         source_id: Option<String>,
         metadata: serde_json::Value,
-    ) {
-        if let Some(audit) = &self.audit
-            && let Err(error) = audit
+    ) -> Result<()> {
+        if let Some(audit) = &self.audit {
+            audit
                 .record(AuditEvent {
                     action,
                     provider: PROVIDER_ID.into(),
@@ -96,10 +96,9 @@ impl TelegramProvider {
                     timestamp: Utc::now(),
                     metadata,
                 })
-                .await
-        {
-            tracing::warn!(%error, "failed to record telegram provider audit event");
+                .await?;
         }
+        Ok(())
     }
 
     /// Build from resolved provider credentials.
@@ -270,7 +269,7 @@ impl TelegramProvider {
     /// If an individual download fails (e.g. file expired), the attachment
     /// keeps its original pseudo-URL so the message is still visible to
     /// consumers — one expired file should not block the whole listing.
-    async fn store_message_attachments(&self, messages: &mut [Message]) {
+    async fn store_message_attachments(&self, messages: &mut [Message]) -> Result<()> {
         for message in messages.iter_mut() {
             let message_source_id = message.source_id.clone();
             for attachment in &mut message.attachments {
@@ -301,7 +300,7 @@ impl TelegramProvider {
                                 "size": stored.size,
                             }),
                         )
-                        .await;
+                        .await?;
                         *attachment = stored;
                     }
                     Err(error) => {
@@ -314,6 +313,7 @@ impl TelegramProvider {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -349,7 +349,7 @@ impl MessageProvider for TelegramProvider {
             None,
             json!({ "operation": "list_threads", "count": threads.len() }),
         )
-        .await;
+        .await?;
         Ok(threads)
     }
 
@@ -371,7 +371,7 @@ impl MessageProvider for TelegramProvider {
 
         // Eagerly download and store attachment bytes, rewriting pseudo-URLs
         // to stable Iris URLs. Failures are per-attachment, not fatal.
-        self.store_message_attachments(&mut messages).await;
+        self.store_message_attachments(&mut messages).await?;
 
         messages.sort_by_key(|m| m.timestamp);
         messages.truncate(limit.unwrap_or(50) as usize);
@@ -380,7 +380,7 @@ impl MessageProvider for TelegramProvider {
             Some(thread_id.to_owned()),
             json!({ "operation": "list_messages", "count": messages.len() }),
         )
-        .await;
+        .await?;
         Ok(messages)
     }
 
@@ -406,7 +406,7 @@ impl MessageProvider for TelegramProvider {
             None,
             json!({ "operation": "list_contacts", "count": contacts.len() }),
         )
-        .await;
+        .await?;
         Ok(contacts)
     }
 
@@ -429,7 +429,7 @@ impl MessageProvider for TelegramProvider {
             Some(thread_id.to_owned()),
             json!({ "operation": "send_message", "message_id": message.source_id }),
         )
-        .await;
+        .await?;
         Ok(message)
     }
 }
@@ -1030,7 +1030,10 @@ mod tests {
             metadata: json!({}),
         }];
 
-        provider.store_message_attachments(&mut messages).await;
+        provider
+            .store_message_attachments(&mut messages)
+            .await
+            .expect("attachment storage succeeds");
 
         // URL should be unchanged — no download attempted.
         assert_eq!(
@@ -1099,7 +1102,10 @@ mod tests {
         );
 
         // Run the eager storage pass
-        provider.store_message_attachments(&mut messages).await;
+        provider
+            .store_message_attachments(&mut messages)
+            .await
+            .expect("attachment storage succeeds");
 
         // The pseudo-URL should be replaced with an Iris URL
         let attachment = &messages[0].attachments[0];
@@ -1177,7 +1183,10 @@ mod tests {
             "telegram:file_id:doc_file_id"
         );
 
-        provider.store_message_attachments(&mut messages).await;
+        provider
+            .store_message_attachments(&mut messages)
+            .await
+            .expect("attachment storage succeeds");
 
         let attachment = &messages[0].attachments[0];
         assert!(attachment.url.starts_with("iris://attachment/"));
@@ -1233,7 +1242,10 @@ mod tests {
         );
 
         // store_message_attachments swallows the error and leaves the pseudo-URL.
-        provider.store_message_attachments(&mut messages).await;
+        provider
+            .store_message_attachments(&mut messages)
+            .await
+            .expect("attachment storage succeeds");
 
         // The pseudo-URL should still be there.
         assert_eq!(

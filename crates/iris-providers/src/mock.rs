@@ -48,9 +48,9 @@ impl MockProvider {
         action: AuditAction,
         source_id: Option<String>,
         metadata: serde_json::Value,
-    ) {
-        if let Some(audit) = &self.audit
-            && let Err(error) = audit
+    ) -> Result<()> {
+        if let Some(audit) = &self.audit {
+            audit
                 .record(AuditEvent {
                     action,
                     provider: METADATA.id.to_owned(),
@@ -58,10 +58,9 @@ impl MockProvider {
                     timestamp: Utc::now(),
                     metadata,
                 })
-                .await
-        {
-            tracing::warn!(%error, "failed to record mock provider audit event");
+                .await?;
         }
+        Ok(())
     }
 }
 
@@ -91,7 +90,7 @@ impl MessageProvider for MockProvider {
             None,
             json!({ "operation": "list_threads", "count": threads.len() }),
         )
-        .await;
+        .await?;
         Ok(threads)
     }
 
@@ -130,7 +129,7 @@ impl MessageProvider for MockProvider {
             Some(thread_id.to_owned()),
             json!({ "operation": "list_messages", "count": messages.len() }),
         )
-        .await;
+        .await?;
         Ok(messages)
     }
 
@@ -148,7 +147,7 @@ impl MessageProvider for MockProvider {
             None,
             json!({ "operation": "list_contacts", "count": contacts.len() }),
         )
-        .await;
+        .await?;
         Ok(contacts)
     }
 
@@ -178,7 +177,7 @@ impl MessageProvider for MockProvider {
             Some(thread_id.to_owned()),
             json!({ "operation": "send_message", "message_id": message.source_id }),
         )
-        .await;
+        .await?;
         Ok(message)
     }
 }

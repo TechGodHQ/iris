@@ -2,6 +2,7 @@
 
 use std::{
     fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -30,7 +31,7 @@ impl LocalFsAuditLog {
         }
     }
 
-    async fn entries(&self) -> Result<Vec<AuditEntry>> {
+    async fn read_entries(&self) -> Result<Vec<AuditEntry>> {
         let mut paths = Vec::new();
         collect_jsonl_paths(&self.root, &mut paths).await?;
         let mut unordered: Vec<AuditEntry> = Vec::new();
@@ -59,6 +60,14 @@ impl LocalFsAuditLog {
         // Preserve malformed/orphaned entries so `verify_chain` can reject them.
         ordered.extend(unordered);
         Ok(ordered)
+    }
+
+    /// Read a stable snapshot while excluding concurrent writers from every
+    /// process sharing this audit root.
+    async fn entries(&self) -> Result<Vec<AuditEntry>> {
+        let _guard = self.write_lock.lock().await;
+        let _file_lock = self.acquire_write_lock().await?;
+        self.read_entries().await
     }
 
     /// Acquire an advisory OS-level lock shared by every process using this
@@ -91,7 +100,7 @@ impl AuditLog for LocalFsAuditLog {
         let _guard = self.write_lock.lock().await;
         let _file_lock = self.acquire_write_lock().await?;
         let previous = self
-            .entries()
+            .read_entries()
             .await?
             .last()
             .map(|entry| entry.self_hash.clone());
@@ -105,11 +114,10 @@ impl AuditLog for LocalFsAuditLog {
         let date = entry.event.timestamp.format("%Y-%m-%d").to_string();
         let dir = self.root.join(&date);
         fs::create_dir_all(&dir).await.map_err(storage_error)?;
-        let path = dir.join(format!("{}.jsonl", entry.id));
         let mut line =
             serde_json::to_string(&entry).map_err(|e| IrisError::Serialization(e.to_string()))?;
         line.push('\n');
-        fs::write(path, line).await.map_err(storage_error)?;
+        write_entry_atomically(dir, entry.id, line).await?;
         Ok(entry)
     }
 
@@ -144,6 +152,32 @@ impl AuditLog for LocalFsAuditLog {
         }
         Ok(true)
     }
+}
+
+/// Publish a complete entry only after its bytes reach stable storage. Readers
+/// enumerate only `.jsonl` files, so they cannot observe the temporary file.
+async fn write_entry_atomically(dir: PathBuf, id: uuid::Uuid, line: String) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let final_path = dir.join(format!("{id}.jsonl"));
+        let temp_path = dir.join(format!(".{id}.tmp"));
+        let result = (|| -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(line.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temp_path, &final_path)?;
+            OpenOptions::new().read(true).open(&dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result.map_err(storage_error)
+    })
+    .await
+    .map_err(|error| IrisError::Storage(error.to_string()))?
 }
 
 fn entry_hash(entry: &AuditEntry) -> Result<String> {
