@@ -1,7 +1,7 @@
 //! CLI subcommands.
 
 use clap::Args;
-use iris_core::MessageProvider;
+use iris_core::{AuditAction, AuditFilter, AuditLog, MessageProvider};
 use iris_providers::config::{IrisConfig, providers_from_config, providers_from_default_config};
 
 use crate::generated;
@@ -20,18 +20,19 @@ pub struct ServeArgs {
 fn get_providers(
     store: &std::sync::Arc<dyn iris_core::AttachmentStore>,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn MessageProvider>>> {
-    providers_from_default_config(store)
+    providers_from_default_config(store, &audit_log())
 }
 
 fn get_providers_from_path(
     config_path: Option<&std::path::Path>,
     store: &std::sync::Arc<dyn iris_core::AttachmentStore>,
+    audit: &std::sync::Arc<dyn AuditLog>,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn MessageProvider>>> {
     match config_path {
-        None => providers_from_default_config(store),
+        None => providers_from_default_config(store, audit),
         Some(path) => {
             let config = IrisConfig::from_path(path)?;
-            providers_from_config(&config, store)
+            providers_from_config(&config, store, audit)
         }
     }
 }
@@ -50,6 +51,7 @@ async fn execute_generated_operation(
         "list_threads" => list_threads(serde_json::from_value(parameters)?).await,
         "list_contacts" => list_contacts(serde_json::from_value(parameters)?).await,
         "send_message" => send_message(serde_json::from_value(parameters)?).await,
+        "audit_query" => audit_query(serde_json::from_value(parameters)?).await,
         other => {
             anyhow::bail!("generated operation is not implemented by the CLI runtime: {other}")
         }
@@ -69,6 +71,17 @@ fn attachment_store() -> std::sync::Arc<dyn iris_core::AttachmentStore> {
     std::sync::Arc::new(iris_storage::LocalFsStore::new(std::path::PathBuf::from(
         attachment_dir,
     )))
+}
+
+fn audit_log() -> std::sync::Arc<dyn AuditLog> {
+    let audit_dir = std::env::var("IRIS_AUDIT_DIR").unwrap_or_else(|_| {
+        let mut path =
+            dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("./.iris"));
+        path.push("iris");
+        path.push("audit");
+        path.to_string_lossy().into_owned()
+    });
+    std::sync::Arc::new(iris_audit::LocalFsAuditLog::new(audit_dir))
 }
 
 async fn list_threads(args: generated::ListThreadsArgs) -> anyhow::Result<()> {
@@ -141,6 +154,39 @@ async fn send_message(args: generated::SendMessageArgs) -> anyhow::Result<()> {
     anyhow::bail!("no provider accepted send_message")
 }
 
+async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
+    let action = args
+        .action
+        .map(|action| serde_json::from_value::<AuditAction>(serde_json::Value::String(action)))
+        .transpose()?;
+    let since = args
+        .since
+        .as_deref()
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()?
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc));
+    let until = args
+        .until
+        .as_deref()
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()?
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc));
+    if since.is_some_and(|since| until.is_some_and(|until| since > until)) {
+        anyhow::bail!("since must be before or equal to until");
+    }
+    let entries = audit_log()
+        .query(&AuditFilter {
+            provider: args.provider,
+            action,
+            since,
+            until,
+            limit: args.limit.map(|limit| limit as usize),
+            source_id: args.source_id,
+        })
+        .await?;
+    print_json(&entries)
+}
+
 pub fn list_providers() -> anyhow::Result<()> {
     for provider in get_providers(&attachment_store())? {
         let meta = provider.metadata();
@@ -151,8 +197,9 @@ pub fn list_providers() -> anyhow::Result<()> {
 
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let store = attachment_store();
-    let providers = get_providers_from_path(args.config.as_deref(), &store)?;
-    let app = iris_server::create_app(providers, store);
+    let audit = audit_log();
+    let providers = get_providers_from_path(args.config.as_deref(), &store, &audit);
+    let app = iris_server::create_app(providers?, store, audit);
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
     tracing::info!("Iris server listening on {}", args.addr);

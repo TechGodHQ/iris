@@ -14,6 +14,8 @@ pub enum GeneratedCommand {
     ListContacts(ListContactsArgs),
     /// Send a message to a thread through the owning provider.
     SendMessage(SendMessageArgs),
+    /// Query tamper-evident provider audit events.
+    AuditQuery(AuditQueryArgs),
 }
 
 impl GeneratedCommand {
@@ -23,6 +25,7 @@ impl GeneratedCommand {
             Self::ListThreads(_) => "list_threads",
             Self::ListContacts(_) => "list_contacts",
             Self::SendMessage(_) => "send_message",
+            Self::AuditQuery(_) => "audit_query",
         }
     }
 
@@ -32,6 +35,7 @@ impl GeneratedCommand {
             Self::ListThreads(args) => serde_json::json!({"limit": args.limit.clone(), "cursor": args.cursor.clone()}),
             Self::ListContacts(args) => serde_json::json!({"limit": args.limit.clone(), "cursor": args.cursor.clone()}),
             Self::SendMessage(args) => serde_json::json!({"thread_id": args.thread_id.clone(), "body": args.body.clone(), "provider": args.provider.clone()}),
+            Self::AuditQuery(args) => serde_json::json!({"provider": args.provider.clone(), "action": args.action.clone(), "since": args.since.clone(), "until": args.until.clone(), "source_id": args.source_id.clone(), "limit": args.limit.clone()}),
         }
     }
 }
@@ -78,5 +82,27 @@ pub struct SendMessageArgs {
     /// Provider ID to route the send through when ownership is ambiguous.
     #[arg(long)]
     pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Args)]
+pub struct AuditQueryArgs {
+    /// Include only events emitted by this provider.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Include only this action (`normalize`, `send`, or `fetch_attachment`).
+    #[arg(long)]
+    pub action: Option<String>,
+    /// Include entries at or after this RFC3339 timestamp.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Include entries at or before this RFC3339 timestamp.
+    #[arg(long)]
+    pub until: Option<String>,
+    /// Include only this provider-specific source ID.
+    #[arg(long)]
+    pub source_id: Option<String>,
+    /// Maximum number of entries to return.
+    #[arg(long)]
+    pub limit: Option<u32>,
 }
 

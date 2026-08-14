@@ -9,13 +9,13 @@
 
 ## Provider integration
 
-- [ ] T5: Thread `Arc<dyn AuditLog>` through Telegram, Email, SMS, and mock provider construction.
-- [ ] T6: Record normalization and list-query events with non-secret metadata.
-- [ ] T7: Record outbound sends and attachment downloads.
-- [ ] T8: Add provider audit tests.
+- [x] T5: Thread `Arc<dyn AuditLog>` through Telegram, Email, SMS, and mock provider construction.
+- [x] T6: Record normalization and list-query events with non-secret metadata.
+- [x] T7: Record outbound sends and attachment downloads.
+- [x] T8: Add provider audit tests.
 
 ## Read surfaces
 
-- [ ] T9: Add `audit_query` to `api/operations.yaml` and regenerate generated artifacts.
-- [ ] T10: Wire filtered audit queries into HTTP, MCP, and CLI runtimes.
+- [x] T9: Add `audit_query` to `api/operations.yaml` and regenerate generated artifacts.
+- [x] T10: Wire filtered audit queries into HTTP, MCP, and CLI runtimes.
 - [ ] T11: Add HTTP/MCP/CLI query tests.
