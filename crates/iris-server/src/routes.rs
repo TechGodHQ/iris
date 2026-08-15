@@ -14,7 +14,10 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::get,
 };
-use iris_core::{Contact, IrisError, Message, MessageProvider, ProviderCapability, Thread};
+use iris_core::{
+    AuditAction, AuditEntry, AuditFilter, Contact, IrisError, Message, MessageProvider,
+    ProviderCapability, Thread,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -25,6 +28,16 @@ pub struct ListQuery {
     pub limit: Option<u32>,
     pub before: Option<chrono::DateTime<chrono::Utc>>,
     pub cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AuditQuery {
+    provider: Option<String>,
+    action: Option<AuditAction>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+    source_id: Option<String>,
+    limit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +179,10 @@ pub(crate) async fn execute_generated_operation(
             Ok(response) => response.into_response(),
             Err(response) => response.into_response(),
         },
+        "audit_query" => match audit_query(state, input).await {
+            Ok(response) => response.into_response(),
+            Err(response) => response.into_response(),
+        },
         other => (
             StatusCode::NOT_IMPLEMENTED,
             Json(ErrorResponse {
@@ -276,6 +293,42 @@ async fn send_message(
         .await
         .map_err(|error| provider_error(provider.id(), &error))?;
     Ok(Json(message))
+}
+
+async fn audit_query(
+    state: &AppState,
+    input: generated::GeneratedOperationInput,
+) -> Result<Json<Vec<AuditEntry>>, (StatusCode, Json<ErrorResponse>)> {
+    let values = serde_json::to_value(input.query).map_err(bad_request)?;
+    let filter: AuditQuery = serde_json::from_value(values).map_err(bad_request)?;
+    if filter
+        .since
+        .is_some_and(|since| filter.until.is_some_and(|until| since > until))
+    {
+        return Err(bad_request("since must be before or equal to until"));
+    }
+    let limit = filter
+        .limit
+        .map(|limit| {
+            limit
+                .parse::<u32>()
+                .map(|limit| limit as usize)
+                .map_err(bad_request)
+        })
+        .transpose()?;
+    let entries = state
+        .audit
+        .query(&AuditFilter {
+            provider: filter.provider,
+            action: filter.action,
+            since: filter.since,
+            until: filter.until,
+            limit,
+            source_id: filter.source_id,
+        })
+        .await
+        .map_err(|error| provider_error("audit", &error))?;
+    Ok(Json(entries))
 }
 
 async fn provider_for_thread(
@@ -510,7 +563,8 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use iris_core::{
-        AttachmentContent, AttachmentRef, AttachmentStore, IrisError, MessageKind, ProviderMetadata,
+        AttachmentContent, AttachmentRef, AttachmentStore, AuditAction, AuditEvent, AuditLog,
+        IrisError, MessageKind, ProviderMetadata,
     };
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
@@ -670,6 +724,9 @@ mod tests {
                 .collect(),
             thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             attachments: Arc::new(NullStore),
+            audit: Arc::new(iris_audit::LocalFsAuditLog::new(
+                "/tmp/iris-server-test-audit",
+            )),
         }
     }
 
@@ -752,6 +809,9 @@ mod tests {
             providers: Vec::new(),
             thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             attachments: Arc::new(NullStore),
+            audit: Arc::new(iris_audit::LocalFsAuditLog::new(
+                "/tmp/iris-server-test-audit",
+            )),
         };
         let _router = super::router(app_state);
     }
@@ -827,6 +887,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_query_returns_filtered_entries_through_the_http_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let audit: Arc<dyn AuditLog> = Arc::new(iris_audit::LocalFsAuditLog::new(temp.path()));
+        audit
+            .record(AuditEvent {
+                action: AuditAction::Normalize,
+                provider: "email".into(),
+                source_id: Some("inbox-1".into()),
+                timestamp: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let expected = audit
+            .record(AuditEvent {
+                action: AuditAction::Send,
+                provider: "telegram".into(),
+                source_id: Some("outgoing-1".into()),
+                timestamp: Utc.with_ymd_and_hms(2026, 8, 14, 12, 1, 0).unwrap(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let mut state = state(Vec::new());
+        state.audit = audit;
+
+        let Json(entries) = audit_query(
+            &state,
+            input(&[("provider", "telegram"), ("action", "send"), ("limit", "1")]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries, vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn audit_query_rejects_limit_outside_the_generated_u32_contract() {
+        let state = state(Vec::new());
+
+        let (status, _) = audit_query(&state, input(&[("limit", "4294967296")]))
+            .await
+            .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn provider_failures_return_bad_gateway() {
         let state = state(vec![
             FakeProvider::new("email", "Email").failing("list_contacts"),
@@ -877,6 +985,9 @@ mod tests {
             providers: Vec::new(),
             thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             attachments: store,
+            audit: Arc::new(iris_audit::LocalFsAuditLog::new(
+                "/tmp/iris-server-test-audit",
+            )),
         };
 
         // Retrieve via the HTTP handler.
@@ -906,6 +1017,9 @@ mod tests {
             providers: Vec::new(),
             thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             attachments: Arc::new(NullStore),
+            audit: Arc::new(iris_audit::LocalFsAuditLog::new(
+                "/tmp/iris-server-test-audit",
+            )),
         };
 
         let random_id = Uuid::new_v4();
@@ -924,6 +1038,9 @@ mod tests {
             providers: Vec::new(),
             thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             attachments: Arc::new(NullStore),
+            audit: Arc::new(iris_audit::LocalFsAuditLog::new(
+                "/tmp/iris-server-test-audit",
+            )),
         };
 
         let response = get_attachment_content(
@@ -953,6 +1070,9 @@ mod tests {
             providers: Vec::new(),
             thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             attachments: store,
+            audit: Arc::new(iris_audit::LocalFsAuditLog::new(
+                "/tmp/iris-server-test-audit",
+            )),
         };
 
         let response = get_attachment_content(
@@ -989,6 +1109,9 @@ mod tests {
             providers: Vec::new(),
             thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             attachments: store,
+            audit: Arc::new(iris_audit::LocalFsAuditLog::new(
+                "/tmp/iris-server-test-audit",
+            )),
         };
 
         let response = get_attachment_content(

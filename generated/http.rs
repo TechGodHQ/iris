@@ -27,6 +27,7 @@ pub const GENERATED_ROUTES: &[GeneratedRoute] = &[
     GeneratedRoute { name: "list_threads", method: "GET", path: "/threads" },
     GeneratedRoute { name: "list_contacts", method: "GET", path: "/contacts" },
     GeneratedRoute { name: "send_message", method: "POST", path: "/messages/{thread_id}" },
+    GeneratedRoute { name: "audit_query", method: "GET", path: "/audit" },
 ];
 
 pub fn generated_router() -> Router<AppState> {
@@ -35,6 +36,7 @@ pub fn generated_router() -> Router<AppState> {
         .route("/threads", get(list_threads))
         .route("/contacts", get(list_contacts))
         .route("/messages/{thread_id}", post(send_message))
+        .route("/audit", get(audit_query))
 }
 
 async fn list_messages(
@@ -98,6 +100,22 @@ async fn send_message(
             path,
             query: BTreeMap::new(),
             body,
+        },
+    )
+    .await
+}
+
+async fn audit_query(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    super::execute_generated_operation(
+        &state,
+        "audit_query",
+        GeneratedOperationInput {
+            path: BTreeMap::new(),
+            query,
+            body: Value::Null,
         },
     )
     .await

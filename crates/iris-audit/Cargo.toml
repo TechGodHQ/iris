@@ -1,28 +1,24 @@
 [package]
-name = "iris-mcp"
+name = "iris-audit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MCP server surface for Iris"
+description = "Local filesystem hash-chained audit log for Iris"
 
 [lints]
 workspace = true
 
 [dependencies]
 iris-core = { path = "../iris-core" }
-iris-audit = { path = "../iris-audit" }
-iris-providers = { path = "../iris-providers" }
-iris-storage = { path = "../iris-storage" }
-anyhow = { workspace = true }
+async-trait = { workspace = true }
+fs2 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-dirs = "6"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

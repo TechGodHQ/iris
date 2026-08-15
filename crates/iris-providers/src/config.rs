@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use iris_core::{AttachmentStore, MessageProvider};
+use iris_core::{AttachmentStore, AuditLog, MessageProvider};
 use serde::Deserialize;
 
 use crate::email::EmailProvider;
@@ -148,18 +148,19 @@ impl SecretValue {
 /// Build providers from the default config path.
 pub fn providers_from_default_config(
     attachments: &Arc<dyn AttachmentStore>,
+    audit: &Arc<dyn AuditLog>,
 ) -> anyhow::Result<Vec<Arc<dyn MessageProvider>>> {
     if let Ok(path) = env::var(CONFIG_PATH_ENV) {
-        return providers_from_config(&IrisConfig::from_path(path)?, attachments);
+        return providers_from_config(&IrisConfig::from_path(path)?, attachments, audit);
     }
 
     for path in default_config_paths() {
         if path.exists() {
-            return providers_from_config(&IrisConfig::from_path(path)?, attachments);
+            return providers_from_config(&IrisConfig::from_path(path)?, attachments, audit);
         }
     }
 
-    Ok(vec![Arc::new(MockProvider::new())])
+    Ok(vec![Arc::new(MockProvider::with_audit(audit.clone()))])
 }
 
 /// Build providers from a loaded config.
@@ -170,31 +171,33 @@ pub fn providers_from_default_config(
 pub fn providers_from_config(
     config: &IrisConfig,
     attachments: &Arc<dyn AttachmentStore>,
+    audit: &Arc<dyn AuditLog>,
 ) -> anyhow::Result<Vec<Arc<dyn MessageProvider>>> {
     config
         .resolved_enabled_providers()?
         .into_iter()
-        .map(|provider| build_provider(&provider, attachments))
+        .map(|provider| build_provider(&provider, attachments, audit))
         .collect()
 }
 
 fn build_provider(
     provider: &ResolvedProviderConfig,
     attachments: &Arc<dyn AttachmentStore>,
+    audit: &Arc<dyn AuditLog>,
 ) -> anyhow::Result<Arc<dyn MessageProvider>> {
     match provider.id.as_str() {
-        "mock" => Ok(Arc::new(MockProvider::new())),
-        "telegram" => Ok(Arc::new(TelegramProvider::from_credentials(
-            &provider.credentials,
-            attachments.clone(),
-        )?)),
-        "email" => Ok(Arc::new(EmailProvider::from_credentials(
-            &provider.credentials,
-            attachments.clone(),
-        )?)),
-        "sms" => Ok(Arc::new(SmsProvider::from_credentials(
-            &provider.credentials,
-        )?)),
+        "mock" => Ok(Arc::new(MockProvider::with_audit(audit.clone()))),
+        "telegram" => Ok(Arc::new(
+            TelegramProvider::from_credentials(&provider.credentials, attachments.clone())?
+                .with_audit(audit.clone()),
+        )),
+        "email" => Ok(Arc::new(
+            EmailProvider::from_credentials(&provider.credentials, attachments.clone())?
+                .with_audit(audit.clone()),
+        )),
+        "sms" => Ok(Arc::new(
+            SmsProvider::from_credentials(&provider.credentials)?.with_audit(audit.clone()),
+        )),
         other => anyhow::bail!("provider is configured but not available in this build: {other}"),
     }
 }
@@ -225,6 +228,32 @@ mod tests {
 
     fn test_store() -> Arc<dyn AttachmentStore> {
         Arc::new(NullStore)
+    }
+
+    #[derive(Debug)]
+    struct NullAudit;
+
+    #[async_trait]
+    impl AuditLog for NullAudit {
+        async fn record(
+            &self,
+            _event: iris_core::AuditEvent,
+        ) -> iris_core::Result<iris_core::AuditEntry> {
+            unreachable!("config tests never record audit events")
+        }
+        async fn query(
+            &self,
+            _filter: &iris_core::AuditFilter,
+        ) -> iris_core::Result<Vec<iris_core::AuditEntry>> {
+            Ok(Vec::new())
+        }
+        async fn verify_chain(&self) -> iris_core::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn test_audit() -> Arc<dyn AuditLog> {
+        Arc::new(NullAudit)
     }
 
     #[test]
@@ -260,14 +289,15 @@ enabled = false
         )
         .expect("valid config");
 
-        let providers = providers_from_config(&config, &test_store()).expect("registry builds");
+        let providers =
+            providers_from_config(&config, &test_store(), &test_audit()).expect("registry builds");
         assert!(providers.is_empty());
     }
 
     #[test]
     fn empty_explicit_config_registers_no_providers() {
-        let providers =
-            providers_from_config(&IrisConfig::default(), &test_store()).expect("registry builds");
+        let providers = providers_from_config(&IrisConfig::default(), &test_store(), &test_audit())
+            .expect("registry builds");
         assert!(providers.is_empty());
     }
 
@@ -299,7 +329,8 @@ bot_token = "123:abc"
         )
         .expect("valid config");
 
-        let providers = providers_from_config(&config, &test_store()).expect("registry builds");
+        let providers =
+            providers_from_config(&config, &test_store(), &test_audit()).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "telegram");
     }
@@ -321,7 +352,8 @@ from = "alice@example.com"
         )
         .expect("valid config");
 
-        let providers = providers_from_config(&config, &test_store()).expect("registry builds");
+        let providers =
+            providers_from_config(&config, &test_store(), &test_audit()).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "email");
     }
@@ -340,7 +372,8 @@ self_number = "+1 575 555 0199"
         )
         .expect("valid config");
 
-        let providers = providers_from_config(&config, &test_store()).expect("registry builds");
+        let providers =
+            providers_from_config(&config, &test_store(), &test_audit()).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "sms");
     }

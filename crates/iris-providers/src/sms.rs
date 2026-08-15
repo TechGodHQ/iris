@@ -6,12 +6,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use iris_core::{
-    Contact, IrisError, Message, MessageKind, MessageProvider, ProviderCapability,
-    ProviderMetadata, Result, Thread,
+    AuditAction, AuditEvent, AuditLog, Contact, IrisError, Message, MessageKind, MessageProvider,
+    ProviderCapability, ProviderMetadata, Result, Thread,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -38,6 +39,7 @@ pub struct SmsProvider {
     ssh_command: String,
     self_number: Option<String>,
     phone_mappings: BTreeMap<String, String>,
+    audit: Option<Arc<dyn AuditLog>>,
 }
 
 impl SmsProvider {
@@ -66,7 +68,35 @@ impl SmsProvider {
             ssh_command,
             self_number: self_number.map(|number| normalize_phone(&number)),
             phone_mappings: BTreeMap::new(),
+            audit: None,
         })
+    }
+
+    /// Attach an audit sink for non-secret operation metadata.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    async fn record(
+        &self,
+        action: AuditAction,
+        source_id: Option<String>,
+        metadata: serde_json::Value,
+    ) -> Result<()> {
+        if let Some(audit) = &self.audit {
+            audit
+                .record(AuditEvent {
+                    action,
+                    provider: PROVIDER_ID.into(),
+                    source_id,
+                    timestamp: Utc::now(),
+                    metadata,
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     /// Build from resolved provider credentials.
@@ -163,6 +193,12 @@ impl MessageProvider for SmsProvider {
         let mut threads: Vec<_> = by_phone.into_values().collect();
         threads.sort_by_key(|thread| std::cmp::Reverse(thread.last_message_at));
         threads.truncate(limit.unwrap_or(50) as usize);
+        self.record(
+            AuditAction::Normalize,
+            None,
+            json!({ "operation": "list_threads", "count": threads.len() }),
+        )
+        .await?;
         Ok(threads)
     }
 
@@ -186,6 +222,12 @@ impl MessageProvider for SmsProvider {
         messages.sort_by_key(|message| std::cmp::Reverse(message.timestamp));
         messages.truncate(limit.unwrap_or(50) as usize);
         messages.sort_by_key(|message| message.timestamp);
+        self.record(
+            AuditAction::Normalize,
+            Some(thread_id.to_owned()),
+            json!({ "operation": "list_messages", "count": messages.len() }),
+        )
+        .await?;
         Ok(messages)
     }
 
@@ -199,6 +241,12 @@ impl MessageProvider for SmsProvider {
         dedupe_contacts(&mut contacts);
         contacts.sort_by(|left, right| left.source_id.cmp(&right.source_id));
         contacts.truncate(limit.unwrap_or(50) as usize);
+        self.record(
+            AuditAction::Normalize,
+            None,
+            json!({ "operation": "list_contacts", "count": contacts.len() }),
+        )
+        .await?;
         Ok(contacts)
     }
 
@@ -214,7 +262,7 @@ impl MessageProvider for SmsProvider {
             .await?;
 
         let timestamp = Utc::now();
-        Ok(Message {
+        let message = Message {
             id: message_uuid(
                 &phone,
                 &format!("outbound:{}", timestamp.timestamp_millis()),
@@ -229,7 +277,14 @@ impl MessageProvider for SmsProvider {
             timestamp,
             is_outbound: true,
             metadata: json!({ "address": phone, "delivery": "submitted" }),
-        })
+        };
+        self.record(
+            AuditAction::Send,
+            Some(thread_id.to_owned()),
+            json!({ "operation": "send_message", "message_id": message.source_id }),
+        )
+        .await?;
+        Ok(message)
     }
 }
 

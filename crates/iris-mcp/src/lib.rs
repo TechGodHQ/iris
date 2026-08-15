@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use iris_core::{Contact, IrisError, Message, MessageProvider, Thread};
+use iris_core::{
+    AuditAction, AuditEntry, AuditFilter, AuditLog, Contact, IrisError, Message, MessageProvider,
+    Thread,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -31,13 +34,14 @@ pub fn generated_tools() -> serde_json::Result<Value> {
 #[derive(Clone)]
 pub struct McpServer {
     providers: Vec<Arc<dyn MessageProvider>>,
+    audit: Arc<dyn AuditLog>,
 }
 
 impl McpServer {
-    /// Create an MCP server backed by the given providers.
+    /// Create an MCP server backed by the given providers and audit log.
     #[must_use]
-    pub fn new(providers: Vec<Arc<dyn MessageProvider>>) -> Self {
-        Self { providers }
+    pub fn new(providers: Vec<Arc<dyn MessageProvider>>, audit: Arc<dyn AuditLog>) -> Self {
+        Self { providers, audit }
     }
 
     /// Handle a single JSON-RPC request value and return a JSON-RPC response.
@@ -75,6 +79,7 @@ impl McpServer {
             "list_contacts" => serde_json::to_value(self.list_contacts(&request.arguments).await?)?,
             "list_messages" => serde_json::to_value(self.list_messages(&request.arguments).await?)?,
             "send_message" => serde_json::to_value(self.send_message(&request.arguments).await?)?,
+            "audit_query" => serde_json::to_value(self.audit_query(&request.arguments).await?)?,
             other => anyhow::bail!("unknown Iris MCP tool: {other}"),
         };
 
@@ -153,6 +158,27 @@ impl McpServer {
             None => self.provider_for_thread(&args.thread_id).await?,
         };
         Ok(provider.send_message(&args.thread_id, &args.body).await?)
+    }
+
+    async fn audit_query(&self, arguments: &Value) -> anyhow::Result<Vec<AuditEntry>> {
+        let args: AuditQueryArgs = serde_json::from_value(arguments.clone())?;
+        if args
+            .since
+            .is_some_and(|since| args.until.is_some_and(|until| since > until))
+        {
+            anyhow::bail!("since must be before or equal to until");
+        }
+        Ok(self
+            .audit
+            .query(&AuditFilter {
+                provider: args.provider,
+                action: args.action,
+                since: args.since,
+                until: args.until,
+                limit: args.limit.map(|limit| limit as usize),
+                source_id: args.source_id,
+            })
+            .await?)
     }
 
     async fn provider_for_thread(
@@ -307,6 +333,16 @@ struct SendMessageArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct AuditQueryArgs {
+    provider: Option<String>,
+    action: Option<AuditAction>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+    source_id: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ToolCallRequest {
     name: String,
     #[serde(default)]
@@ -319,13 +355,18 @@ struct _ProtocolMarker;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
+    use iris_core::{AuditAction, AuditEvent, AuditLog};
     use iris_providers::mock::MockProvider;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tokio::io::BufReader;
 
     fn server() -> McpServer {
-        McpServer::new(vec![Arc::new(MockProvider::new())])
+        McpServer::new(
+            vec![Arc::new(MockProvider::new())],
+            Arc::new(iris_audit::LocalFsAuditLog::new("/tmp/iris-mcp-test-audit")),
+        )
     }
 
     #[test]
@@ -342,6 +383,7 @@ mod tests {
         assert!(names.contains(&"list_threads"));
         assert!(names.contains(&"list_contacts"));
         assert!(names.contains(&"send_message"));
+        assert!(names.contains(&"audit_query"));
     }
 
     #[tokio::test]
@@ -372,6 +414,7 @@ mod tests {
         assert!(names.contains(&"list_threads"));
         assert!(names.contains(&"list_contacts"));
         assert!(names.contains(&"send_message"));
+        assert!(names.contains(&"audit_query"));
     }
 
     #[tokio::test]
@@ -396,6 +439,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tools_call_queries_audit_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let audit: Arc<dyn AuditLog> = Arc::new(iris_audit::LocalFsAuditLog::new(temp.path()));
+        let expected = audit
+            .record(AuditEvent {
+                action: AuditAction::Send,
+                provider: "telegram".into(),
+                source_id: Some("outgoing-1".into()),
+                timestamp: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        let server = McpServer::new(vec![Arc::new(MockProvider::new())], audit);
+
+        let response = server
+            .handle_jsonrpc(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "audit_query",
+                    "arguments": {"action": "send", "provider": "telegram"}
+                }
+            }))
+            .await;
+
+        assert_eq!(response["result"]["isError"], false);
+        let entries: Vec<AuditEntry> =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(entries, vec![expected]);
+    }
+
+    #[tokio::test]
     async fn run_jsonrpc_handles_line_delimited_requests() {
         let input = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_contacts","arguments":{"limit":1}}}
@@ -414,7 +492,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0]["result"]["tools"].as_array().expect("tools").len(),
-            4
+            5
         );
         assert_eq!(lines[1]["result"]["isError"], false);
     }

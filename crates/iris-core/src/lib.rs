@@ -4,11 +4,13 @@
 //! trait that all source connectors must implement. It has zero external
 //! I/O dependencies — providers, storage, and transport live in other crates.
 
+pub mod audit;
 pub mod error;
 pub mod model;
 pub mod provider;
 pub mod storage;
 
+pub use audit::{AuditAction, AuditEntry, AuditEvent, AuditFilter, AuditLog};
 pub use error::{IrisError, Result};
 pub use model::{Attachment, Contact, Message, MessageKind, Thread};
 pub use provider::{MessageProvider, ProviderCapability, ProviderMetadata};

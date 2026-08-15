@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 iris-core = { path = "../iris-core" }
+iris-audit = { path = "../iris-audit" }
 iris-providers = { path = "../iris-providers" }
 iris-storage = { path = "../iris-storage" }
 serde = { workspace = true }

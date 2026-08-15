@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use iris_core::model::Attachment;
 use iris_core::{
-    AttachmentContent, AttachmentStore, Contact, IrisError, Message, MessageKind, MessageProvider,
-    ProviderCapability, ProviderMetadata, Result, Thread,
+    AttachmentContent, AttachmentStore, AuditAction, AuditEvent, AuditLog, Contact, IrisError,
+    Message, MessageKind, MessageProvider, ProviderCapability, ProviderMetadata, Result, Thread,
 };
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
@@ -51,6 +51,7 @@ pub struct EmailProvider {
     /// stored here during normalization so callers receive stable Iris URLs
     /// instead of transient provider-specific pseudo-URLs.
     attachments: Arc<dyn AttachmentStore>,
+    audit: Option<Arc<dyn AuditLog>>,
 }
 
 impl EmailProvider {
@@ -69,7 +70,35 @@ impl EmailProvider {
             page_size: config.page_size,
             max_messages: config.max_messages,
             attachments,
+            audit: None,
         })
+    }
+
+    /// Attach an audit sink for non-secret operation metadata.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    async fn record(
+        &self,
+        action: AuditAction,
+        source_id: Option<String>,
+        metadata: serde_json::Value,
+    ) -> Result<()> {
+        if let Some(audit) = &self.audit {
+            audit
+                .record(AuditEvent {
+                    action,
+                    provider: PROVIDER_ID.into(),
+                    source_id,
+                    timestamp: Utc::now(),
+                    metadata,
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     /// Build from resolved provider credentials.
@@ -110,6 +139,19 @@ impl EmailProvider {
         // the async store and rewrite pseudo-URLs to stable Iris URLs.
         for email in &mut result.messages {
             email.store_attachments(&self.attachments).await?;
+            for attachment in &email.attachments {
+                self.record(
+                    AuditAction::FetchAttachment,
+                    Some(email.source_id.clone()),
+                    json!({
+                        "operation": "fetch_attachment",
+                        "mime_type": attachment.mime_type,
+                        "filename": attachment.filename,
+                        "size": attachment.size,
+                    }),
+                )
+                .await?;
+            }
         }
         Ok(result)
     }
@@ -397,6 +439,12 @@ impl MessageProvider for EmailProvider {
         let mut threads: Vec<_> = by_thread.into_values().collect();
         threads.sort_by_key(|thread| std::cmp::Reverse(thread.last_message_at));
         threads.truncate(limit.unwrap_or(50) as usize);
+        self.record(
+            AuditAction::Normalize,
+            None,
+            json!({ "operation": "list_threads", "count": threads.len() }),
+        )
+        .await?;
         Ok(threads)
     }
 
@@ -425,6 +473,12 @@ impl MessageProvider for EmailProvider {
             .collect();
         messages.sort_by_key(|message| message.timestamp);
         messages.truncate(limit.unwrap_or(50) as usize);
+        self.record(
+            AuditAction::Normalize,
+            Some(thread_id.to_owned()),
+            json!({ "operation": "list_messages", "count": messages.len() }),
+        )
+        .await?;
         Ok(messages)
     }
 
@@ -441,39 +495,48 @@ impl MessageProvider for EmailProvider {
         }
         dedupe_contacts(&mut contacts);
         contacts.truncate(limit.unwrap_or(50) as usize);
+        self.record(
+            AuditAction::Normalize,
+            None,
+            json!({ "operation": "list_contacts", "count": contacts.len() }),
+        )
+        .await?;
         Ok(contacts)
     }
 
     async fn send_message(&self, thread_id: &str, body: &str) -> Result<Message> {
-        if let Ok(parsed) = thread_id.parse::<Mailbox>() {
-            return self
-                .send_email(
-                    parsed.email.as_ref(),
-                    "Iris message",
-                    body,
-                    uuid_for(format!("thread:{}", parsed.email).as_bytes()),
-                    None,
-                    &[],
-                )
-                .await;
-        }
-
-        if let Some(reply_context) = self.reply_context(thread_id).await? {
-            return self
-                .send_email(
-                    &reply_context.recipient,
-                    &reply_context.reply_subject(),
-                    body,
-                    reply_context.thread_id,
-                    reply_context.message_id.as_deref(),
-                    &reply_context.references,
-                )
-                .await;
-        }
-
-        Err(IrisError::NotFound(format!(
-            "email thread not found and value is not an email recipient: {thread_id}"
-        )))
+        let message = if let Ok(parsed) = thread_id.parse::<Mailbox>() {
+            self.send_email(
+                parsed.email.as_ref(),
+                "Iris message",
+                body,
+                uuid_for(format!("thread:{}", parsed.email).as_bytes()),
+                None,
+                &[],
+            )
+            .await?
+        } else if let Some(reply_context) = self.reply_context(thread_id).await? {
+            self.send_email(
+                &reply_context.recipient,
+                &reply_context.reply_subject(),
+                body,
+                reply_context.thread_id,
+                reply_context.message_id.as_deref(),
+                &reply_context.references,
+            )
+            .await?
+        } else {
+            return Err(IrisError::NotFound(format!(
+                "email thread not found and value is not an email recipient: {thread_id}"
+            )));
+        };
+        self.record(
+            AuditAction::Send,
+            Some(thread_id.to_owned()),
+            json!({ "operation": "send_message", "message_id": message.source_id }),
+        )
+        .await?;
+        Ok(message)
     }
 }
 

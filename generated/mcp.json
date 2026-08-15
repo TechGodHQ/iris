@@ -89,6 +89,41 @@
         "type": "object"
       },
       "name": "send_message"
+    },
+    {
+      "description": "Query tamper-evident provider audit events.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Include only this action (`normalize`, `send`, or `fetch_attachment`).",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Maximum number of entries to return.",
+            "type": "integer"
+          },
+          "provider": {
+            "description": "Include only events emitted by this provider.",
+            "type": "string"
+          },
+          "since": {
+            "description": "Include entries at or after this RFC3339 timestamp.",
+            "type": "string"
+          },
+          "source_id": {
+            "description": "Include only this provider-specific source ID.",
+            "type": "string"
+          },
+          "until": {
+            "description": "Include entries at or before this RFC3339 timestamp.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "audit_query"
     }
   ]
 }
