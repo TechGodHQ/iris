@@ -16,7 +16,7 @@ use axum::{
 };
 use iris_core::{
     AuditAction, AuditEntry, AuditFilter, Contact, IrisError, Message, MessageProvider,
-    ProviderCapability, Thread,
+    OutboundMessage, ProviderCapability, Thread,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -320,7 +320,7 @@ async fn send_message(
         None => provider_for_thread(state, &thread_id).await?,
     };
     let message = provider
-        .send_message(&thread_id, &request.body)
+        .send_message(&thread_id, &OutboundMessage::text(&request.body))
         .await
         .map_err(|error| provider_error(provider.id(), &error))?;
     Ok(Json(message))
@@ -535,6 +535,7 @@ const fn capability_name(capability: ProviderCapability) -> &'static str {
     match capability {
         ProviderCapability::ListMessages => "list_messages",
         ProviderCapability::SendMessages => "send_messages",
+        ProviderCapability::SendAttachments => "send_attachments",
         ProviderCapability::ListThreads => "list_threads",
         ProviderCapability::ListContacts => "list_contacts",
         ProviderCapability::ReceiveRealtime => "receive_realtime",
@@ -729,7 +730,11 @@ mod tests {
             Ok(contacts)
         }
 
-        async fn send_message(&self, thread_id: &str, body: &str) -> iris_core::Result<Message> {
+        async fn send_message(
+            &self,
+            thread_id: &str,
+            message: &iris_core::OutboundMessage,
+        ) -> iris_core::Result<Message> {
             self.maybe_fail("send_message")?;
             let thread_id = Uuid::parse_str(thread_id).map_err(|error| IrisError::Provider {
                 provider: self.id().to_string(),
@@ -742,7 +747,7 @@ mod tests {
                 source_id: "sent-1".to_string(),
                 sender: contact(self.id(), "me", "Me"),
                 kind: MessageKind::Text,
-                body: body.to_string(),
+                body: message.body.clone(),
                 attachments: Vec::new(),
                 timestamp: Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap(),
                 is_outbound: true,

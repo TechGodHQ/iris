@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use crate::outbound::OutboundMessage;
 use crate::{Contact, Message, MessageStream, Result, Thread};
 
 /// Capabilities a provider may support. Not all providers support all operations.
@@ -81,7 +82,16 @@ pub trait MessageProvider: Send + Sync {
     async fn list_contacts(&self, limit: Option<u32>) -> Result<Vec<Contact>>;
 
     /// Send a message. Only available if the provider has `SendMessages` capability.
-    async fn send_message(&self, thread_id: &str, body: &str) -> Result<Message>;
+    ///
+    /// The structured [`OutboundMessage`] carries the body text plus optional
+    /// attachments. Providers that do not advertise `SendAttachments` must
+    /// reject a non-empty attachment list with
+    /// [`IrisError::UnsupportedCapability`](crate::IrisError::UnsupportedCapability)
+    /// before making any external request; text-only sends behave exactly as
+    /// before this contract existed. The returned [`Message`] is the one
+    /// produced by the provider's first external request (for multi-request
+    /// sends, later media are not synthesized into it).
+    async fn send_message(&self, thread_id: &str, message: &OutboundMessage) -> Result<Message>;
 
     /// Subscribe to a fallible realtime stream of normalized messages.
     ///
@@ -158,7 +168,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn send_message(&self, _thread_id: &str, _body: &str) -> Result<Message> {
+        async fn send_message(&self, _thread_id: &str, _message: &OutboundMessage) -> Result<Message> {
             unreachable!("test provider never sends")
         }
     }

@@ -6,9 +6,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use iris_core::model::Attachment;
+use iris_core::outbound::enforce_capability;
 use iris_core::{
     AttachmentContent, AttachmentStore, AuditAction, AuditEvent, AuditLog, Contact, IrisError,
-    Message, MessageKind, MessageProvider, ProviderCapability, ProviderMetadata, Result, Thread,
+    Message, MessageKind, MessageProvider, OutboundMessage, ProviderCapability, ProviderMetadata,
+    Result, Thread,
 };
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
@@ -504,12 +506,15 @@ impl MessageProvider for EmailProvider {
         Ok(contacts)
     }
 
-    async fn send_message(&self, thread_id: &str, body: &str) -> Result<Message> {
-        let message = if let Ok(parsed) = thread_id.parse::<Mailbox>() {
+    async fn send_message(&self, thread_id: &str, message: &OutboundMessage) -> Result<Message> {
+        // Email MIME multipart attachment dispatch lands in a later slice
+        // (T6). Until then, email is text-only under the new contract.
+        enforce_capability(message, PROVIDER_ID, false)?;
+        let sent = if let Ok(parsed) = thread_id.parse::<Mailbox>() {
             self.send_email(
                 parsed.email.as_ref(),
                 "Iris message",
-                body,
+                message.body.as_str(),
                 uuid_for(format!("thread:{}", parsed.email).as_bytes()),
                 None,
                 &[],
@@ -519,7 +524,7 @@ impl MessageProvider for EmailProvider {
             self.send_email(
                 &reply_context.recipient,
                 &reply_context.reply_subject(),
-                body,
+                message.body.as_str(),
                 reply_context.thread_id,
                 reply_context.message_id.as_deref(),
                 &reply_context.references,
@@ -533,10 +538,14 @@ impl MessageProvider for EmailProvider {
         self.record(
             AuditAction::Send,
             Some(thread_id.to_owned()),
-            json!({ "operation": "send_message", "message_id": message.source_id }),
+            json!({
+                "operation": "send_message",
+                "message_id": sent.source_id,
+                "attachment_count": message.attachments.len(),
+            }),
         )
         .await?;
-        Ok(message)
+        Ok(sent)
     }
 }
 

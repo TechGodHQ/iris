@@ -7,6 +7,7 @@
 pub mod audit;
 pub mod error;
 pub mod model;
+pub mod outbound;
 pub mod provider;
 pub mod realtime;
 pub mod storage;
@@ -14,6 +15,7 @@ pub mod storage;
 pub use audit::{AuditAction, AuditEntry, AuditEvent, AuditFilter, AuditLog, RecordOutcome};
 pub use error::{IrisError, Result};
 pub use model::{Attachment, Contact, Message, MessageKind, Thread};
+pub use outbound::{OutboundAttachment, OutboundMessage, ResolvedAttachment};
 pub use provider::{MessageProvider, ProviderCapability, ProviderMetadata};
 pub use realtime::{
     MessageStream, REALTIME_AUDIT_SCHEMA_VERSION, RealtimeAttachmentSummary, RealtimeAuditMetadata,

@@ -1,7 +1,7 @@
 //! CLI subcommands.
 
 use clap::Args;
-use iris_core::{AuditAction, AuditFilter, AuditLog, MessageProvider};
+use iris_core::{AuditAction, AuditFilter, AuditLog, MessageProvider, OutboundMessage};
 use iris_providers::config::{IrisConfig, providers_from_config, providers_from_default_config};
 use std::fmt::Write as _;
 
@@ -149,7 +149,10 @@ async fn send_message(args: generated::SendMessageArgs) -> anyhow::Result<()> {
     }
 
     for provider in matching_providers {
-        if let Ok(message) = provider.send_message(&args.thread_id, &args.body).await {
+        if let Ok(message) = provider
+            .send_message(&args.thread_id, &OutboundMessage::text(&args.body))
+            .await
+        {
             return print_json(&message);
         }
     }
