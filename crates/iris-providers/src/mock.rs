@@ -201,17 +201,7 @@ impl MessageProvider for MockProvider {
 
     async fn send_message(&self, thread_id: &str, message: &OutboundMessage) -> Result<Message> {
         enforce_capability(message, METADATA.id, true)?;
-        let resolved = match &self.store {
-            // The mock has no external transport; resolution failure is the
-            // only pre-dispatch failure mode it can exhibit.
-            Some(store) => resolve_attachments(message, store).await?,
-            None if message.is_text_only() => Vec::new(),
-            None => {
-                return Err(IrisError::Config(
-                    "mock provider has no attachment store to resolve stored references".to_owned(),
-                ));
-            }
-        };
+        let resolved = resolve_attachments(message, self.store.as_ref()).await?;
         let sent = Message {
             id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
@@ -468,5 +458,29 @@ mod tests {
                 .expect("records readable")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn mock_without_store_accepts_inline_attachments() {
+        let provider = MockProvider::new();
+        provider
+            .send_message(
+                "thread-2",
+                &OutboundMessage {
+                    body: "inline only".to_owned(),
+                    attachments: vec![OutboundAttachment::Bytes {
+                        mime_type: "image/png".to_owned(),
+                        filename: Some("inline.png".to_owned()),
+                        bytes: vec![9, 9, 9],
+                    }],
+                },
+            )
+            .await
+            .expect("inline attachments resolve without a store");
+
+        let sends = provider.recorded_sends().expect("records readable");
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].attachments.len(), 1);
+        assert_eq!(sends[0].attachments[0].bytes, vec![9, 9, 9]);
     }
 }

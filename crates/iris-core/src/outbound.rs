@@ -83,16 +83,16 @@ impl ResolvedAttachment {
     }
 }
 
-/// Resolve the attachments of `message` against `store`.
+/// Resolve the attachments of `message` against an optional `store`.
 ///
 /// Inline attachments are validated in place (non-empty MIME type, non-empty
-/// bytes). Stored references are fetched from the store. The returned list
-/// preserves user-provided order exactly. Any failure — an invalid inline
-/// attachment or a missing/unreadable stored ID — fails the whole resolution
-/// so the provider never dispatches a partial send.
+/// bytes) and never require a store. Stored references are fetched from the
+/// store; a missing store or a missing/unreadable stored ID fails the whole
+/// resolution so the provider never dispatches a partial send. The returned
+/// list preserves user-provided order exactly.
 pub async fn resolve_attachments(
     message: &OutboundMessage,
-    store: &Arc<dyn AttachmentStore>,
+    store: Option<&Arc<dyn AttachmentStore>>,
 ) -> Result<Vec<ResolvedAttachment>> {
     let mut resolved = Vec::with_capacity(message.attachments.len());
     for attachment in &message.attachments {
@@ -119,11 +119,19 @@ pub async fn resolve_attachments(
                 });
             }
             OutboundAttachment::Stored(id) => {
-                let content = store.get(id).await.map_err(|error| {
-                    IrisError::Config(format!(
-                        "stored attachment {id} could not be resolved: {error}"
-                    ))
-                })?;
+                let content = match store {
+                    Some(store) => store.get(id).await.map_err(|error| {
+                        IrisError::Config(format!(
+                            "stored attachment {id} could not be resolved: {error}"
+                        ))
+                    })?,
+                    None => {
+                        return Err(IrisError::Config(format!(
+                            "stored attachment {id} cannot be resolved: no attachment store \
+                             configured"
+                        )));
+                    }
+                };
                 resolved.push(ResolvedAttachment::from_content(content));
             }
         }
@@ -219,7 +227,9 @@ mod tests {
             }],
         };
         let store = store_with(vec![]);
-        let error = resolve_attachments(&message, &store).await.unwrap_err();
+        let error = resolve_attachments(&message, Some(&store))
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, IrisError::Config(ref message) if message.contains("MIME")),
             "unexpected error: {error:?}"
@@ -237,7 +247,9 @@ mod tests {
             }],
         };
         let store = store_with(vec![]);
-        let error = resolve_attachments(&message, &store).await.unwrap_err();
+        let error = resolve_attachments(&message, Some(&store))
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, IrisError::Config(ref message) if message.contains("bytes")),
             "unexpected error: {error:?}"
@@ -252,7 +264,9 @@ mod tests {
             attachments: vec![OutboundAttachment::Stored(missing)],
         };
         let store = store_with(vec![]);
-        let error = resolve_attachments(&message, &store).await.unwrap_err();
+        let error = resolve_attachments(&message, Some(&store))
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, IrisError::Config(ref message) if message.contains(&missing.to_string())),
             "unexpected error: {error:?}"
@@ -277,7 +291,7 @@ mod tests {
                 OutboundAttachment::Stored(stored_id),
             ],
         };
-        let resolved = resolve_attachments(&message, &store).await.unwrap();
+        let resolved = resolve_attachments(&message, Some(&store)).await.unwrap();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].filename.as_deref(), Some("inline.png"));
         assert_eq!(resolved[0].bytes, vec![1, 2, 3]);
