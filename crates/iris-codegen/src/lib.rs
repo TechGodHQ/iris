@@ -48,6 +48,71 @@ pub struct Operation {
     /// Input parameters for the operation.
     #[serde(default)]
     pub parameters: Vec<Parameter>,
+    /// Delivery kind for the response. `sse` marks a streaming operation whose
+    /// HTTP surface is a Server-Sent Events stream rather than a unary JSON
+    /// response; the default `unary` behavior is unchanged.
+    #[serde(default)]
+    pub delivery: Delivery,
+    /// Explicit surface allowlist. When present, only the listed surfaces are
+    /// generated; when absent, all surfaces (HTTP, CLI, MCP) are generated as
+    /// before. `delivery: sse` requires `http` to be listed.
+    #[serde(default)]
+    pub surfaces: Option<Vec<Surface>>,
+}
+
+/// Response delivery kind for a generated operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    /// Unary JSON request/response (the existing behavior).
+    #[default]
+    Unary,
+    /// Server-Sent Events stream (`text/event-stream`).
+    Sse,
+}
+
+/// A generated surface an operation may be exposed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Surface {
+    /// The HTTP REST surface.
+    Http,
+    /// The CLI command surface.
+    Cli,
+    /// The MCP tool surface.
+    Mcp,
+}
+
+impl Operation {
+    /// Whether this operation emits a streaming SSE response.
+    #[must_use]
+    pub const fn is_sse(&self) -> bool {
+        matches!(self.delivery, Delivery::Sse)
+    }
+
+    /// Whether the HTTP surface is generated for this operation.
+    #[must_use]
+    pub fn generates_http(&self) -> bool {
+        self.surfaces
+            .as_ref()
+            .is_none_or(|surfaces| surfaces.contains(&Surface::Http))
+    }
+
+    /// Whether the CLI surface is generated for this operation.
+    #[must_use]
+    pub fn generates_cli(&self) -> bool {
+        self.surfaces
+            .as_ref()
+            .is_none_or(|surfaces| surfaces.contains(&Surface::Cli))
+    }
+
+    /// Whether the MCP surface is generated for this operation.
+    #[must_use]
+    pub fn generates_mcp(&self) -> bool {
+        self.surfaces
+            .as_ref()
+            .is_none_or(|surfaces| surfaces.contains(&Surface::Mcp))
+    }
 }
 
 /// HTTP method for a generated REST operation.
@@ -193,6 +258,26 @@ pub fn validate_definition(definition: &ApiDefinition) -> Result<()> {
                 operation.path
             );
         }
+
+        if let Some(surfaces) = &operation.surfaces {
+            anyhow::ensure!(
+                !surfaces.is_empty(),
+                "operation {} declares an empty surfaces list",
+                operation.name
+            );
+        }
+        if operation.is_sse() {
+            anyhow::ensure!(
+                operation.generates_http(),
+                "operation {} uses delivery: sse but does not list the http surface",
+                operation.name
+            );
+            anyhow::ensure!(
+                operation.method == HttpMethod::Get,
+                "operation {} uses delivery: sse but is not a GET",
+                operation.name
+            );
+        }
     }
 
     Ok(())
@@ -250,6 +335,9 @@ fn generate_cli(definition: &ApiDefinition) -> String {
     out.push_str("#[derive(Debug, Clone, Subcommand)]\n");
     out.push_str("pub enum GeneratedCommand {\n");
     for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
+        }
         push_doc_comment(&mut out, "    ", &operation.description);
         out.push_str("    ");
         out.push_str(&pascal_case(&operation.name));
@@ -263,6 +351,9 @@ fn generate_cli(definition: &ApiDefinition) -> String {
     out.push_str("    pub const fn operation_name(&self) -> &'static str {\n");
     out.push_str("        match self {\n");
     for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
+        }
         out.push_str("            Self::");
         out.push_str(&pascal_case(&operation.name));
         out.push_str("(_) => ");
@@ -274,6 +365,9 @@ fn generate_cli(definition: &ApiDefinition) -> String {
     out.push_str("    pub fn parameters_json(&self) -> serde_json::Value {\n");
     out.push_str("        match self {\n");
     for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
+        }
         out.push_str("            Self::");
         out.push_str(&pascal_case(&operation.name));
         out.push_str("(args) => serde_json::json!({");
@@ -295,6 +389,9 @@ fn generate_cli(definition: &ApiDefinition) -> String {
     out.push_str("}\n\n");
 
     for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
+        }
         out.push_str("#[derive(Debug, Clone, Serialize, Deserialize, Args)]\n");
         out.push_str("pub struct ");
         out.push_str(&pascal_case(&operation.name));
@@ -342,6 +439,9 @@ fn generate_http(definition: &ApiDefinition) -> String {
     out.push_str("}\n\n");
     out.push_str("pub const GENERATED_ROUTES: &[GeneratedRoute] = &[\n");
     for operation in &definition.operations {
+        if !operation.generates_http() {
+            continue;
+        }
         out.push_str("    GeneratedRoute { name: ");
         out.push_str(&rust_string_literal(&operation.name));
         out.push_str(", method: ");
@@ -354,6 +454,9 @@ fn generate_http(definition: &ApiDefinition) -> String {
     out.push_str("pub fn generated_router() -> Router<AppState> {\n");
     out.push_str("    Router::new()\n");
     for operation in &definition.operations {
+        if !operation.generates_http() || operation.is_sse() {
+            continue;
+        }
         out.push_str("        .route(");
         out.push_str(&rust_string_literal(&axum_path(&operation.path)));
         out.push_str(", ");
@@ -366,60 +469,16 @@ fn generate_http(definition: &ApiDefinition) -> String {
     }
     out.push_str("}\n\n");
 
-    for (operation_index, operation) in definition.operations.iter().enumerate() {
-        let has_path = operation
-            .parameters
-            .iter()
-            .any(|parameter| parameter.location == ParameterLocation::Path);
-        let has_query = operation
-            .parameters
-            .iter()
-            .any(|parameter| parameter.location == ParameterLocation::Query);
-        let has_body = operation
-            .parameters
-            .iter()
-            .any(|parameter| parameter.location == ParameterLocation::Body);
+    out.push_str(&generate_sse_surface(definition));
 
-        out.push_str("async fn ");
-        out.push_str(&operation.name);
-        out.push_str("(\n");
-        out.push_str("    State(state): State<AppState>,\n");
-        if has_path {
-            out.push_str("    Path(path): Path<BTreeMap<String, String>>,\n");
-        }
-        if has_query {
-            out.push_str("    Query(query): Query<BTreeMap<String, String>>,\n");
-        }
-        if has_body {
-            out.push_str("    Json(body): Json<Value>,\n");
-        }
-        out.push_str(") -> Response {\n");
-        out.push_str("    super::execute_generated_operation(\n");
-        out.push_str("        &state,\n");
-        out.push_str("        ");
-        out.push_str(&rust_string_literal(&operation.name));
-        out.push_str(",\n");
-        out.push_str("        GeneratedOperationInput {\n");
-        if has_path {
-            out.push_str("            path,\n");
-        } else {
-            out.push_str("            path: BTreeMap::new(),\n");
-        }
-        if has_query {
-            out.push_str("            query,\n");
-        } else {
-            out.push_str("            query: BTreeMap::new(),\n");
-        }
-        if has_body {
-            out.push_str("            body,\n");
-        } else {
-            out.push_str("            body: Value::Null,\n");
-        }
-        out.push_str("        },\n");
-        out.push_str("    )\n");
-        out.push_str("    .await\n");
-        out.push_str("}\n");
-        if operation_index + 1 < definition.operations.len() {
+    let unary_operations: Vec<&Operation> = definition
+        .operations
+        .iter()
+        .filter(|operation| operation.generates_http() && !operation.is_sse())
+        .collect();
+    for (operation_index, operation) in unary_operations.iter().enumerate() {
+        push_unary_handler(&mut out, operation);
+        if operation_index + 1 < unary_operations.len() {
             out.push('\n');
         }
     }
@@ -427,10 +486,116 @@ fn generate_http(definition: &ApiDefinition) -> String {
     out
 }
 
+/// Emit one unary Axum handler for a non-streaming HTTP operation.
+fn push_unary_handler(out: &mut String, operation: &Operation) {
+    let has_path = operation
+        .parameters
+        .iter()
+        .any(|parameter| parameter.location == ParameterLocation::Path);
+    let has_query = operation
+        .parameters
+        .iter()
+        .any(|parameter| parameter.location == ParameterLocation::Query);
+    let has_body = operation
+        .parameters
+        .iter()
+        .any(|parameter| parameter.location == ParameterLocation::Body);
+
+    out.push_str("async fn ");
+    out.push_str(&operation.name);
+    out.push_str("(\n");
+    out.push_str("    State(state): State<AppState>,\n");
+    if has_path {
+        out.push_str("    Path(path): Path<BTreeMap<String, String>>,\n");
+    }
+    if has_query {
+        out.push_str("    Query(query): Query<BTreeMap<String, String>>,\n");
+    }
+    if has_body {
+        out.push_str("    Json(body): Json<Value>,\n");
+    }
+    out.push_str(") -> Response {\n");
+    out.push_str("    super::execute_generated_operation(\n");
+    out.push_str("        &state,\n");
+    out.push_str("        ");
+    out.push_str(&rust_string_literal(&operation.name));
+    out.push_str(",\n");
+    out.push_str("        GeneratedOperationInput {\n");
+    if has_path {
+        out.push_str("            path,\n");
+    } else {
+        out.push_str("            path: BTreeMap::new(),\n");
+    }
+    if has_query {
+        out.push_str("            query,\n");
+    } else {
+        out.push_str("            query: BTreeMap::new(),\n");
+    }
+    if has_body {
+        out.push_str("            body,\n");
+    } else {
+        out.push_str("            body: Value::Null,\n");
+    }
+    out.push_str("        },\n");
+    out.push_str("    )\n");
+    out.push_str("    .await\n");
+    out.push_str("}\n");
+}
+
+/// Emit the SSE surface for streaming operations: route metadata plus a named
+/// runtime binding hook per operation. The handwritten server binds the actual
+/// handler, so no duplicate Axum route exists in generated code.
+fn generate_sse_surface(definition: &ApiDefinition) -> String {
+    let sse_operations: Vec<&Operation> = definition
+        .operations
+        .iter()
+        .filter(|operation| operation.is_sse() && operation.generates_http())
+        .collect();
+    if sse_operations.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("/// Streaming (SSE) operations declared in the API definition. The\n");
+    out.push_str("/// generated surface exposes only this metadata plus the binding hooks\n");
+    out.push_str("/// below; the handwritten server supplies the handler.\n");
+    out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
+    out.push_str("pub struct GeneratedSseRoute {\n");
+    out.push_str("    pub name: &'static str,\n");
+    out.push_str("    pub method: &'static str,\n");
+    out.push_str("    pub path: &'static str,\n");
+    out.push_str("}\n\n");
+    out.push_str("pub const GENERATED_SSE_ROUTES: &[GeneratedSseRoute] = &[\n");
+    for operation in &sse_operations {
+        out.push_str("    GeneratedSseRoute { name: ");
+        out.push_str(&rust_string_literal(&operation.name));
+        out.push_str(", method: ");
+        out.push_str(&rust_string_literal(operation.method.as_str()));
+        out.push_str(", path: ");
+        out.push_str(&rust_string_literal(&axum_path(&operation.path)));
+        out.push_str(" },\n");
+    }
+    out.push_str("];\n\n");
+    for operation in &sse_operations {
+        out.push_str("/// Runtime binding hook for the `");
+        out.push_str(&operation.name);
+        out.push_str("` SSE operation. The handwritten server implements this\n");
+        out.push_str("/// binding; generated code does not generate a duplicate route.\n");
+        out.push_str("pub fn bind_");
+        out.push_str(&operation.name);
+        out.push_str("(router: Router<AppState>) -> Router<AppState> {\n");
+        out.push_str("    super::bind_runtime_sse_");
+        out.push_str(&operation.name);
+        out.push_str("(router)\n");
+        out.push_str("}\n\n");
+    }
+    out
+}
+
 fn generate_mcp(definition: &ApiDefinition) -> String {
     let tools: Vec<_> = definition
         .operations
         .iter()
+        .filter(|operation| operation.generates_mcp() && !operation.is_sse())
         .map(|operation| {
             let mut required = Vec::new();
             let mut properties = serde_json::Map::new();
@@ -658,6 +823,8 @@ mod tests {
                 required: true,
                 location: ParameterLocation::Path,
             }],
+            delivery: Delivery::Unary,
+            surfaces: None,
         });
 
         let artifacts = generate_all(&definition);
@@ -678,6 +845,8 @@ mod tests {
                     read: true,
                     output_type: "Vec<Thread>".to_string(),
                     parameters: Vec::new(),
+                    delivery: Delivery::Unary,
+                    surfaces: None,
                 },
                 Operation {
                     name: "list_threads".to_string(),
@@ -687,6 +856,8 @@ mod tests {
                     read: true,
                     output_type: "Vec<Thread>".to_string(),
                     parameters: Vec::new(),
+                    delivery: Delivery::Unary,
+                    surfaces: None,
                 },
             ],
         };
@@ -706,6 +877,8 @@ mod tests {
                 read: true,
                 output_type: "Vec<Thread>".to_string(),
                 parameters: Vec::new(),
+                delivery: Delivery::Unary,
+                surfaces: None,
             }],
         };
 
@@ -713,6 +886,101 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("reserved by generated HTTP module")
+        );
+    }
+
+    #[test]
+    fn rejects_sse_without_http_surface() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "subscribe_events".to_string(),
+                description: "Streaming events.".to_string(),
+                method: HttpMethod::Get,
+                path: "/v1/events".to_string(),
+                read: true,
+                output_type: "SSE stream".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Sse,
+                surfaces: Some(vec![Surface::Cli]),
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("sse without http rejected");
+        assert!(err.to_string().contains("does not list the http surface"));
+    }
+
+    #[test]
+    fn rejects_sse_without_get_method() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "subscribe_events".to_string(),
+                description: "Streaming events.".to_string(),
+                method: HttpMethod::Post,
+                path: "/v1/events".to_string(),
+                read: false,
+                output_type: "SSE stream".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Sse,
+                surfaces: Some(vec![Surface::Http]),
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("sse post rejected");
+        assert!(err.to_string().contains("is not a GET"));
+    }
+
+    #[test]
+    fn rejects_empty_surfaces_list() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "list_threads".to_string(),
+                description: "No surfaces.".to_string(),
+                method: HttpMethod::Get,
+                path: "/threads".to_string(),
+                read: true,
+                output_type: "Vec<Thread>".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Unary,
+                surfaces: Some(Vec::new()),
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("empty surfaces rejected");
+        assert!(err.to_string().contains("empty surfaces list"));
+    }
+
+    #[test]
+    fn sse_operations_are_excluded_from_mcp_and_unary_routes() {
+        let definition =
+            load_api_definition("../../api/operations.yaml").expect("definition loads");
+        let subscribe = definition
+            .operations
+            .iter()
+            .find(|operation| operation.name == "subscribe_events")
+            .expect("subscribe_events declared");
+        assert!(subscribe.is_sse());
+        assert!(subscribe.generates_http());
+        assert!(subscribe.generates_cli());
+        assert!(!subscribe.generates_mcp());
+
+        let artifacts = generate_all(&definition);
+        // No MCP tool is generated for the SSE operation.
+        assert!(
+            !artifacts
+                .mcp_json
+                .contains("\"name\": \"subscribe_events\"")
+        );
+        // No unary route/handler is generated for the SSE operation.
+        assert!(!artifacts.http_rs.contains("async fn subscribe_events("));
+        // Metadata + binding hook are generated instead.
+        assert!(artifacts.http_rs.contains("GENERATED_SSE_ROUTES"));
+        assert!(artifacts.http_rs.contains("bind_subscribe_events"));
+        assert!(artifacts.http_rs.contains("/v1/events"));
+        // The CLI watch variant is declared.
+        assert!(
+            artifacts
+                .cli_rs
+                .contains("SubscribeEvents(SubscribeEventsArgs)")
         );
     }
 }

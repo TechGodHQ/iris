@@ -3,6 +3,7 @@
 use clap::Args;
 use iris_core::{AuditAction, AuditFilter, AuditLog, MessageProvider};
 use iris_providers::config::{IrisConfig, providers_from_config, providers_from_default_config};
+use std::fmt::Write as _;
 
 use crate::generated;
 
@@ -52,6 +53,7 @@ async fn execute_generated_operation(
         "list_contacts" => list_contacts(serde_json::from_value(parameters)?).await,
         "send_message" => send_message(serde_json::from_value(parameters)?).await,
         "audit_query" => audit_query(serde_json::from_value(parameters)?).await,
+        "subscribe_events" => subscribe_events(serde_json::from_value(parameters)?).await,
         other => {
             anyhow::bail!("generated operation is not implemented by the CLI runtime: {other}")
         }
@@ -156,6 +158,25 @@ async fn send_message(args: generated::SendMessageArgs) -> anyhow::Result<()> {
 
 async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
     print_json(&query_audit_entries(&audit_log(), args).await?)
+}
+
+/// `subscribe_events` — the generated `iris watch` surface.
+///
+/// The SSE client runtime (URL configuration via `IRIS_SERVER_URL`, SSE frame
+/// parsing, JSONL stdout, stderr diagnostics, exit policies) is implemented in
+/// a subsequent slice; until then this arm reports the gap explicitly rather
+/// than inventing behavior. The `async` signature matches the dispatch table;
+/// awaits arrive with the T11 runtime.
+#[allow(clippy::unused_async)]
+async fn subscribe_events(args: generated::SubscribeEventsArgs) -> anyhow::Result<()> {
+    let mut message = String::from("iris watch is not implemented by this build yet");
+    if let Some(provider) = args.provider {
+        write!(message, " (provider filter: {provider})")?;
+    }
+    if let Some(thread_id) = args.thread_id {
+        write!(message, " (thread filter: {thread_id})")?;
+    }
+    anyhow::bail!("{message}")
 }
 
 async fn query_audit_entries(

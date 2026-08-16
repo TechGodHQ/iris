@@ -28,6 +28,7 @@ pub const GENERATED_ROUTES: &[GeneratedRoute] = &[
     GeneratedRoute { name: "list_contacts", method: "GET", path: "/contacts" },
     GeneratedRoute { name: "send_message", method: "POST", path: "/messages/{thread_id}" },
     GeneratedRoute { name: "audit_query", method: "GET", path: "/audit" },
+    GeneratedRoute { name: "subscribe_events", method: "GET", path: "/v1/events" },
 ];
 
 pub fn generated_router() -> Router<AppState> {
@@ -37,6 +38,26 @@ pub fn generated_router() -> Router<AppState> {
         .route("/contacts", get(list_contacts))
         .route("/messages/{thread_id}", post(send_message))
         .route("/audit", get(audit_query))
+}
+
+/// Streaming (SSE) operations declared in the API definition. The
+/// generated surface exposes only this metadata plus the binding hooks
+/// below; the handwritten server supplies the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneratedSseRoute {
+    pub name: &'static str,
+    pub method: &'static str,
+    pub path: &'static str,
+}
+
+pub const GENERATED_SSE_ROUTES: &[GeneratedSseRoute] = &[
+    GeneratedSseRoute { name: "subscribe_events", method: "GET", path: "/v1/events" },
+];
+
+/// Runtime binding hook for the `subscribe_events` SSE operation. The handwritten server implements this
+/// binding; generated code does not generate a duplicate route.
+pub fn bind_subscribe_events(router: Router<AppState>) -> Router<AppState> {
+    super::bind_runtime_sse_subscribe_events(router)
 }
 
 async fn list_messages(

@@ -211,6 +211,25 @@ mod tests {
             })
         }
 
+        async fn record_once(
+            &self,
+            provider: &str,
+            source_id: &str,
+            event: AuditEvent,
+        ) -> iris_core::Result<iris_core::RecordOutcome> {
+            let duplicate = {
+                let events = self.0.lock().expect("audit lock");
+                events.iter().any(|entry| {
+                    entry.provider == provider && entry.source_id.as_deref() == Some(source_id)
+                })
+            };
+            if duplicate {
+                return Ok(iris_core::RecordOutcome::AlreadyRecorded);
+            }
+            self.0.lock().expect("audit lock").push(event);
+            Ok(iris_core::RecordOutcome::Inserted)
+        }
+
         async fn query(&self, _filter: &AuditFilter) -> iris_core::Result<Vec<AuditEntry>> {
             Ok(Vec::new())
         }

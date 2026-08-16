@@ -8,10 +8,15 @@ pub mod audit;
 pub mod error;
 pub mod model;
 pub mod provider;
+pub mod realtime;
 pub mod storage;
 
-pub use audit::{AuditAction, AuditEntry, AuditEvent, AuditFilter, AuditLog};
+pub use audit::{AuditAction, AuditEntry, AuditEvent, AuditFilter, AuditLog, RecordOutcome};
 pub use error::{IrisError, Result};
 pub use model::{Attachment, Contact, Message, MessageKind, Thread};
 pub use provider::{MessageProvider, ProviderCapability, ProviderMetadata};
+pub use realtime::{
+    MessageStream, REALTIME_AUDIT_SCHEMA_VERSION, RealtimeAttachmentSummary, RealtimeAuditMetadata,
+    RealtimeEventKind,
+};
 pub use storage::{AttachmentContent, AttachmentRef, AttachmentStore};

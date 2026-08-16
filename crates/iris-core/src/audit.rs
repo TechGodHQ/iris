@@ -65,6 +65,33 @@ pub struct AuditFilter {
     pub source_id: Option<String>,
 }
 
+impl AuditFilter {
+    /// Filter for the record-once key `(provider, source_id)`.
+    ///
+    /// Realtime ingress uses this to check whether a `(provider, update_id)`
+    /// pair was already recorded before appending a new entry.
+    #[must_use]
+    pub fn for_record_once_key(provider: &str, source_id: &str) -> Self {
+        Self {
+            provider: Some(provider.to_string()),
+            source_id: Some(source_id.to_string()),
+            action: None,
+            since: None,
+            until: None,
+            limit: None,
+        }
+    }
+}
+
+/// Outcome of an atomic record-once append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordOutcome {
+    /// No prior entry existed for the key; a new entry was appended.
+    Inserted,
+    /// An entry with the same key already exists; nothing was appended.
+    AlreadyRecorded,
+}
+
 /// Append-only, provider-agnostic audit storage.
 #[async_trait]
 pub trait AuditLog: std::fmt::Debug + Send + Sync {
@@ -76,4 +103,19 @@ pub trait AuditLog: std::fmt::Debug + Send + Sync {
 
     /// Recompute the chain and return whether every entry is intact.
     async fn verify_chain(&self) -> Result<bool>;
+
+    /// Atomically append `event` only when no entry with the same
+    /// `(provider, source_id)` key exists yet, and report which happened.
+    ///
+    /// Uniqueness MUST be enforced inside the audit backend under the same
+    /// serialization that guards `record`, so concurrent writers (including
+    /// separate processes sharing an audit root) cannot both observe "no
+    /// prior entry" and double-append. Backends without a natural key
+    /// structure must still guarantee key-atomicity.
+    async fn record_once(
+        &self,
+        provider: &str,
+        source_id: &str,
+        event: AuditEvent,
+    ) -> Result<RecordOutcome>;
 }
