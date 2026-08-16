@@ -168,7 +168,7 @@ async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
 /// than inventing behavior. The `async` signature matches the dispatch table;
 /// awaits arrive with the T11 runtime.
 #[allow(clippy::unused_async)]
-async fn subscribe_events(args: generated::SubscribeEventsArgs) -> anyhow::Result<()> {
+async fn subscribe_events(args: generated::WatchArgs) -> anyhow::Result<()> {
     let mut message = String::from("iris watch is not implemented by this build yet");
     if let Some(provider) = args.provider {
         write!(message, " (provider filter: {provider})")?;

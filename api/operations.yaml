@@ -123,6 +123,7 @@ operations:
     output_type: SSE stream
     delivery: sse
     surfaces: [http, cli]
+    cli_command: watch
     parameters:
       - name: provider
         description: Optional exact-match provider filter for emitted events.

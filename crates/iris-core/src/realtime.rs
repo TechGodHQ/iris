@@ -84,7 +84,7 @@ pub struct RealtimeAuditMetadata {
     thread_id: Option<String>,
     message_id: Option<String>,
     message_kind: Option<MessageKind>,
-    timestamp: DateTime<Utc>,
+    timestamp: Option<DateTime<Utc>>,
     attachments: Vec<RealtimeAttachmentSummary>,
 }
 
@@ -95,7 +95,7 @@ impl RealtimeAuditMetadata {
         event_kind: RealtimeEventKind,
         provider: impl Into<String>,
         update_id: impl Into<String>,
-        timestamp: DateTime<Utc>,
+        timestamp: impl Into<Option<DateTime<Utc>>>,
     ) -> Self {
         Self {
             schema_version: REALTIME_AUDIT_SCHEMA_VERSION,
@@ -106,7 +106,7 @@ impl RealtimeAuditMetadata {
             thread_id: None,
             message_id: None,
             message_kind: None,
-            timestamp,
+            timestamp: timestamp.into(),
             attachments: Vec::new(),
         }
     }

@@ -17,7 +17,7 @@ pub enum GeneratedCommand {
     /// Query tamper-evident provider audit events.
     AuditQuery(AuditQueryArgs),
     /// Subscribe to a fallible realtime event stream over SSE.
-    SubscribeEvents(SubscribeEventsArgs),
+    Watch(WatchArgs),
 }
 
 impl GeneratedCommand {
@@ -28,7 +28,7 @@ impl GeneratedCommand {
             Self::ListContacts(_) => "list_contacts",
             Self::SendMessage(_) => "send_message",
             Self::AuditQuery(_) => "audit_query",
-            Self::SubscribeEvents(_) => "subscribe_events",
+            Self::Watch(_) => "subscribe_events",
         }
     }
 
@@ -39,7 +39,7 @@ impl GeneratedCommand {
             Self::ListContacts(args) => serde_json::json!({"limit": args.limit.clone(), "cursor": args.cursor.clone()}),
             Self::SendMessage(args) => serde_json::json!({"thread_id": args.thread_id.clone(), "body": args.body.clone(), "provider": args.provider.clone()}),
             Self::AuditQuery(args) => serde_json::json!({"provider": args.provider.clone(), "action": args.action.clone(), "since": args.since.clone(), "until": args.until.clone(), "source_id": args.source_id.clone(), "limit": args.limit.clone()}),
-            Self::SubscribeEvents(args) => serde_json::json!({"provider": args.provider.clone(), "thread_id": args.thread_id.clone()}),
+            Self::Watch(args) => serde_json::json!({"provider": args.provider.clone(), "thread_id": args.thread_id.clone()}),
         }
     }
 }
@@ -111,7 +111,7 @@ pub struct AuditQueryArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]
-pub struct SubscribeEventsArgs {
+pub struct WatchArgs {
     /// Optional exact-match provider filter for emitted events.
     #[arg(long)]
     pub provider: Option<String>,

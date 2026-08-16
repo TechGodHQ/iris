@@ -58,6 +58,12 @@ pub struct Operation {
     /// before. `delivery: sse` requires `http` to be listed.
     #[serde(default)]
     pub surfaces: Option<Vec<Surface>>,
+    /// Override for the generated CLI subcommand name (kebab-case). Defaults
+    /// to the operation name. Used where the public CLI contract names a
+    /// command differently from the operation (e.g. `subscribe_events` is
+    /// exposed as `iris watch`).
+    #[serde(default)]
+    pub cli_command: Option<String>,
 }
 
 /// Response delivery kind for a generated operation.
@@ -213,74 +219,130 @@ pub fn validate_definition(definition: &ApiDefinition) -> Result<()> {
             "operation {} read/method mismatch: reads must be GET, writes must be POST",
             operation.name
         );
+        validate_operation_parameters(operation)?;
+        validate_operation_surfaces(operation)?;
+    }
 
-        let mut parameter_names = std::collections::BTreeSet::new();
-        for parameter in &operation.parameters {
-            anyhow::ensure!(
-                is_valid_identifier(&parameter.name),
-                "parameter name must be a Rust-safe snake_case identifier: {}.{}",
-                operation.name,
-                parameter.name
-            );
-            anyhow::ensure!(
-                parameter_names.insert(parameter.name.as_str()),
-                "duplicate parameter name: {}.{}",
-                operation.name,
-                parameter.name
-            );
+    // CLI command overrides must not collide with any generated subcommand.
+    let mut cli_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
         }
-
-        let path_parameters = path_parameters(&operation.path)?;
-        for path_parameter in &path_parameters {
-            anyhow::ensure!(
-                operation
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter.name == *path_parameter
-                        && parameter.location == ParameterLocation::Path),
-                "operation {} path placeholder {{{}}} has no matching path parameter",
-                operation.name,
-                path_parameter
-            );
-        }
-        for parameter in operation
-            .parameters
-            .iter()
-            .filter(|parameter| parameter.location == ParameterLocation::Path)
-        {
-            anyhow::ensure!(
-                path_parameters
-                    .iter()
-                    .any(|path_parameter| path_parameter == &parameter.name),
-                "operation {} path parameter {} is not present in path {}",
-                operation.name,
-                parameter.name,
-                operation.path
-            );
-        }
-
-        if let Some(surfaces) = &operation.surfaces {
-            anyhow::ensure!(
-                !surfaces.is_empty(),
-                "operation {} declares an empty surfaces list",
-                operation.name
-            );
-        }
-        if operation.is_sse() {
-            anyhow::ensure!(
-                operation.generates_http(),
-                "operation {} uses delivery: sse but does not list the http surface",
-                operation.name
-            );
-            anyhow::ensure!(
-                operation.method == HttpMethod::Get,
-                "operation {} uses delivery: sse but is not a GET",
-                operation.name
-            );
-        }
+        let name = operation
+            .cli_command
+            .clone()
+            .unwrap_or_else(|| operation.name.clone());
+        anyhow::ensure!(
+            cli_names.insert(name),
+            "operation {} declares a CLI command name that collides with another operation",
+            operation.name
+        );
     }
 
     Ok(())
+}
+
+/// Validate parameter names and path/parameter consistency for one operation.
+fn validate_operation_parameters(operation: &Operation) -> Result<()> {
+    let mut parameter_names = std::collections::BTreeSet::new();
+    for parameter in &operation.parameters {
+        anyhow::ensure!(
+            is_valid_identifier(&parameter.name),
+            "parameter name must be a Rust-safe snake_case identifier: {}.{}",
+            operation.name,
+            parameter.name
+        );
+        anyhow::ensure!(
+            parameter_names.insert(parameter.name.as_str()),
+            "duplicate parameter name: {}.{}",
+            operation.name,
+            parameter.name
+        );
+    }
+
+    let path_parameters = path_parameters(&operation.path)?;
+    for path_parameter in &path_parameters {
+        anyhow::ensure!(
+            operation
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == *path_parameter
+                    && parameter.location == ParameterLocation::Path),
+            "operation {} path placeholder {{{}}} has no matching path parameter",
+            operation.name,
+            path_parameter
+        );
+    }
+    for parameter in operation
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.location == ParameterLocation::Path)
+    {
+        anyhow::ensure!(
+            path_parameters
+                .iter()
+                .any(|path_parameter| path_parameter == &parameter.name),
+            "operation {} path parameter {} is not present in path {}",
+            operation.name,
+            parameter.name,
+            operation.path
+        );
+    }
+    Ok(())
+}
+
+/// Validate surface allowlists, delivery-kind rules, and CLI command names.
+fn validate_operation_surfaces(operation: &Operation) -> Result<()> {
+    if let Some(surfaces) = &operation.surfaces {
+        anyhow::ensure!(
+            !surfaces.is_empty(),
+            "operation {} declares an empty surfaces list",
+            operation.name
+        );
+    }
+    if operation.is_sse() {
+        anyhow::ensure!(
+            operation.generates_http(),
+            "operation {} uses delivery: sse but does not list the http surface",
+            operation.name
+        );
+        anyhow::ensure!(
+            operation.method == HttpMethod::Get,
+            "operation {} uses delivery: sse but is not a GET",
+            operation.name
+        );
+        anyhow::ensure!(
+            !operation.generates_mcp(),
+            "operation {} uses delivery: sse but lists the mcp surface; \
+             SSE operations are excluded from MCP generation",
+            operation.name
+        );
+    }
+    if let Some(cli_command) = &operation.cli_command {
+        anyhow::ensure!(
+            !cli_command.is_empty(),
+            "operation {} declares an empty cli_command",
+            operation.name
+        );
+        anyhow::ensure!(
+            is_kebab_case(cli_command),
+            "operation {} declares cli_command {cli_command:?} which is not kebab-case",
+            operation.name
+        );
+    }
+    Ok(())
+}
+
+/// Whether a value is lowercase kebab-case (letters, digits, single hyphens).
+fn is_kebab_case(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Generate all committed artifacts for a definition.
@@ -340,9 +402,9 @@ fn generate_cli(definition: &ApiDefinition) -> String {
         }
         push_doc_comment(&mut out, "    ", &operation.description);
         out.push_str("    ");
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push('(');
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push_str("Args),\n");
     }
     out.push_str("}\n\n");
@@ -355,7 +417,7 @@ fn generate_cli(definition: &ApiDefinition) -> String {
             continue;
         }
         out.push_str("            Self::");
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push_str("(_) => ");
         out.push_str(&rust_string_literal(&operation.name));
         out.push_str(",\n");
@@ -369,7 +431,7 @@ fn generate_cli(definition: &ApiDefinition) -> String {
             continue;
         }
         out.push_str("            Self::");
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push_str("(args) => serde_json::json!({");
         for (index, parameter) in operation.parameters.iter().enumerate() {
             if index > 0 {
@@ -394,7 +456,7 @@ fn generate_cli(definition: &ApiDefinition) -> String {
         }
         out.push_str("#[derive(Debug, Clone, Serialize, Deserialize, Args)]\n");
         out.push_str("pub struct ");
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push_str("Args {\n");
         for parameter in &operation.parameters {
             push_doc_comment(&mut out, "    ", &parameter.description);
@@ -739,6 +801,16 @@ fn is_snake_case(value: &str) -> bool {
         && !value.contains("__")
 }
 
+/// The variant name for an operation's generated CLI command.
+///
+/// The name is pascal-cased. Honors an explicit `cli_command` override (for
+/// example `subscribe_events`, exposed as `iris watch`); defaults to the
+/// operation name.
+fn cli_variant_name(operation: &Operation) -> String {
+    let command = operation.cli_command.as_deref().unwrap_or(&operation.name);
+    pascal_case(command)
+}
+
 fn pascal_case(value: &str) -> String {
     value
         .split('_')
@@ -825,6 +897,7 @@ mod tests {
             }],
             delivery: Delivery::Unary,
             surfaces: None,
+            cli_command: None,
         });
 
         let artifacts = generate_all(&definition);
@@ -847,6 +920,7 @@ mod tests {
                     parameters: Vec::new(),
                     delivery: Delivery::Unary,
                     surfaces: None,
+                    cli_command: None,
                 },
                 Operation {
                     name: "list_threads".to_string(),
@@ -858,6 +932,7 @@ mod tests {
                     parameters: Vec::new(),
                     delivery: Delivery::Unary,
                     surfaces: None,
+                    cli_command: None,
                 },
             ],
         };
@@ -879,6 +954,7 @@ mod tests {
                 parameters: Vec::new(),
                 delivery: Delivery::Unary,
                 surfaces: None,
+                cli_command: None,
             }],
         };
 
@@ -902,6 +978,7 @@ mod tests {
                 parameters: Vec::new(),
                 delivery: Delivery::Sse,
                 surfaces: Some(vec![Surface::Cli]),
+                cli_command: None,
             }],
         };
 
@@ -922,6 +999,7 @@ mod tests {
                 parameters: Vec::new(),
                 delivery: Delivery::Sse,
                 surfaces: Some(vec![Surface::Http]),
+                cli_command: None,
             }],
         };
 
@@ -942,6 +1020,7 @@ mod tests {
                 parameters: Vec::new(),
                 delivery: Delivery::Unary,
                 surfaces: Some(Vec::new()),
+                cli_command: None,
             }],
         };
 
@@ -976,11 +1055,88 @@ mod tests {
         assert!(artifacts.http_rs.contains("GENERATED_SSE_ROUTES"));
         assert!(artifacts.http_rs.contains("bind_subscribe_events"));
         assert!(artifacts.http_rs.contains("/v1/events"));
-        // The CLI watch variant is declared.
+        // The CLI watch variant is declared under its public `watch` name.
+        assert!(artifacts.cli_rs.contains("Watch(WatchArgs)"));
         assert!(
             artifacts
                 .cli_rs
-                .contains("SubscribeEvents(SubscribeEventsArgs)")
+                .contains("Self::Watch(_) => \"subscribe_events\"")
         );
+    }
+
+    #[test]
+    fn rejects_sse_with_mcp_surface() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "subscribe_events".to_string(),
+                description: "Streaming events.".to_string(),
+                method: HttpMethod::Get,
+                path: "/v1/events".to_string(),
+                read: true,
+                output_type: "SSE stream".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Sse,
+                surfaces: Some(vec![Surface::Http, Surface::Mcp]),
+                cli_command: None,
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("sse with mcp rejected");
+        assert!(err.to_string().contains("excluded from MCP generation"));
+    }
+
+    #[test]
+    fn rejects_non_kebab_cli_command() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "subscribe_events".to_string(),
+                description: "Streaming events.".to_string(),
+                method: HttpMethod::Get,
+                path: "/v1/events".to_string(),
+                read: true,
+                output_type: "SSE stream".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Sse,
+                surfaces: Some(vec![Surface::Http, Surface::Cli]),
+                cli_command: Some("Not_Kebab".to_string()),
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("non-kebab cli_command rejected");
+        assert!(err.to_string().contains("not kebab-case"));
+    }
+
+    #[test]
+    fn rejects_colliding_cli_command_names() {
+        let sse_operation = Operation {
+            name: "subscribe_events".to_string(),
+            description: "Streaming events.".to_string(),
+            method: HttpMethod::Get,
+            path: "/v1/events".to_string(),
+            read: true,
+            output_type: "SSE stream".to_string(),
+            parameters: Vec::new(),
+            delivery: Delivery::Sse,
+            surfaces: Some(vec![Surface::Http, Surface::Cli]),
+            cli_command: Some("watch".to_string()),
+        };
+        let existing_watch = Operation {
+            name: "watch".to_string(),
+            description: "An existing watch command.".to_string(),
+            method: HttpMethod::Get,
+            path: "/v1/watch".to_string(),
+            read: true,
+            output_type: "Vec<Thread>".to_string(),
+            parameters: Vec::new(),
+            delivery: Delivery::Unary,
+            surfaces: None,
+            cli_command: None,
+        };
+        let definition = ApiDefinition {
+            operations: vec![sse_operation, existing_watch],
+        };
+
+        let err = validate_definition(&definition).expect_err("colliding CLI names rejected");
+        assert!(err.to_string().contains("collides with another operation"));
     }
 }

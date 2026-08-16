@@ -152,12 +152,20 @@ impl AuditLog for LocalFsAuditLog {
     /// and cross-process advisory lock that guard `record`, so concurrent
     /// writers (including separate CLI/MCP/server processes sharing this
     /// audit root) cannot both observe "no prior entry".
+    ///
+    /// The persisted event is normalized to carry the key: `event.provider`
+    /// and `event.source_id` are overwritten with the passed values so the
+    /// uniqueness scan (which compares stored entries' provider and
+    /// `source_id`)
+    /// always matches what was written for that key.
     async fn record_once(
         &self,
         provider: &str,
         source_id: &str,
-        event: AuditEvent,
+        mut event: AuditEvent,
     ) -> Result<RecordOutcome> {
+        event.provider = provider.to_string();
+        event.source_id = Some(source_id.to_string());
         let (_, outcome) = self
             .append_with_key_check(Some((provider, source_id)), event)
             .await?;
@@ -281,12 +289,13 @@ mod tests {
     async fn record_once_inserts_then_reports_already_recorded() {
         let temp = tempfile::tempdir().unwrap();
         let log = LocalFsAuditLog::new(temp.path());
+        // The event's own provider/source_id deliberately disagree with the
+        // record-once key; the persisted entry must carry the key so the
+        // uniqueness scan matches stored data.
+        let mut mismatched = event(AuditAction::Normalize, "chat-777");
+        mismatched.provider = "wrong-provider".to_string();
         let first = log
-            .record_once(
-                "telegram",
-                "update-1",
-                event(AuditAction::Normalize, "update-1"),
-            )
+            .record_once("telegram", "update-1", mismatched)
             .await
             .unwrap();
         assert_eq!(first, RecordOutcome::Inserted);
@@ -299,8 +308,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second, RecordOutcome::AlreadyRecorded);
-        // Exactly one entry exists despite two calls.
-        assert_eq!(log.query(&AuditFilter::default()).await.unwrap().len(), 1);
+        // Exactly one entry exists despite two calls, and it carries the key.
+        let stored = log.query(&AuditFilter::default()).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].event.provider, "telegram");
+        assert_eq!(stored[0].event.source_id.as_deref(), Some("update-1"));
         // A different key still appends.
         let third = log
             .record_once(
