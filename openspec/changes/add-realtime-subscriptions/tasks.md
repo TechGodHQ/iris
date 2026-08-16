@@ -2,10 +2,10 @@
 
 ## Contract and specification
 
-- [ ] T1: Approve the frozen OpenSpec contract before implementation.
-- [ ] T2: Add fallible-item realtime stream support, lifecycle shutdown, capability/default behavior, error taxonomy, and atomic audit `record_once` idempotency primitive to `iris-core`/audit backend.
-- [ ] T3: Extend API codegen with SSE delivery and explicit HTTP/CLI-only surfaces; regenerate artifacts.
-- [ ] T4: Add core/codegen tests for unsupported subscriptions and SSE operation validation.
+- [x] T1: Approve the frozen OpenSpec contract before implementation.
+- [x] T2: Add fallible-item realtime stream support, lifecycle shutdown, capability/default behavior, error taxonomy, and atomic audit `record_once` idempotency primitive to `iris-core`/audit backend.
+- [x] T3: Extend API codegen with SSE delivery and explicit HTTP/CLI-only surfaces; regenerate artifacts.
+- [x] T4: Add core/codegen tests for unsupported subscriptions and SSE operation validation.
 
 ## Telegram provider
 
