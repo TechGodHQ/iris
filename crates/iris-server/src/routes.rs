@@ -60,12 +60,43 @@ pub struct ProviderResponse {
 
 pub fn router(state: AppState) -> Router {
     debug_assert!(!generated::GENERATED_ROUTES.is_empty());
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/providers", get(list_providers))
         .route("/v1/attachments/{id}/content", get(get_attachment_content))
-        .merge(generated::generated_router())
-        .with_state(state)
+        .merge(generated::generated_router());
+    // Bind generated SSE operations before applying state (the generated
+    // binding hook is typed over `Router<AppState>`).
+    let router = generated::bind_subscribe_events(router);
+    // The generated metadata must stay consistent with the bound route set.
+    debug_assert!(
+        generated::GENERATED_SSE_ROUTES
+            .iter()
+            .any(|route| route.name == "subscribe_events" && route.path == "/v1/events"),
+        "generated SSE metadata must cover the runtime-bound subscribe_events route"
+    );
+    router.with_state(state)
+}
+
+/// Runtime binding for the generated `subscribe_events` SSE operation.
+///
+/// The realtime SSE handler itself (`GET /v1/events`) is implemented in a
+/// subsequent slice; until then the route returns HTTP 501 so the surface
+/// contract exists without inventing behavior.
+pub(crate) fn bind_runtime_sse_subscribe_events(
+    router: Router<crate::app::AppState>,
+) -> Router<crate::app::AppState> {
+    router.route(
+        "/v1/events",
+        get(|| async {
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({
+                    "error": "subscribe_events is not implemented by this server build yet"
+                })),
+            )
+        }),
+    )
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -482,7 +513,11 @@ fn provider_error(provider_id: &str, error: &IrisError) -> (StatusCode, Json<Err
     let status = match error {
         IrisError::ProviderNotFound(_) | IrisError::NotFound(_) => StatusCode::NOT_FOUND,
         IrisError::UnsupportedCapability { .. } => StatusCode::BAD_REQUEST,
-        IrisError::Provider { .. }
+        IrisError::RealtimeUnavailable { .. } | IrisError::SlowConsumer => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        IrisError::RealtimeRetryExhausted { .. }
+        | IrisError::Provider { .. }
         | IrisError::Config(_)
         | IrisError::Transport(_)
         | IrisError::Serialization(_) => StatusCode::BAD_GATEWAY,

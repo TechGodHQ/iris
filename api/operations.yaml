@@ -115,3 +115,23 @@ operations:
         type: u32
         required: false
         location: query
+  - name: subscribe_events
+    description: Subscribe to a fallible realtime event stream over SSE.
+    method: GET
+    path: /v1/events
+    read: true
+    output_type: SSE stream
+    delivery: sse
+    surfaces: [http, cli]
+    cli_command: watch
+    parameters:
+      - name: provider
+        description: Optional exact-match provider filter for emitted events.
+        type: string
+        required: false
+        location: query
+      - name: thread_id
+        description: Optional exact-match thread filter for emitted events.
+        type: string
+        required: false
+        location: query

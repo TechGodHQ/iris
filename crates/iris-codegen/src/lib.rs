@@ -48,6 +48,77 @@ pub struct Operation {
     /// Input parameters for the operation.
     #[serde(default)]
     pub parameters: Vec<Parameter>,
+    /// Delivery kind for the response. `sse` marks a streaming operation whose
+    /// HTTP surface is a Server-Sent Events stream rather than a unary JSON
+    /// response; the default `unary` behavior is unchanged.
+    #[serde(default)]
+    pub delivery: Delivery,
+    /// Explicit surface allowlist. When present, only the listed surfaces are
+    /// generated; when absent, all surfaces (HTTP, CLI, MCP) are generated as
+    /// before. `delivery: sse` requires `http` to be listed.
+    #[serde(default)]
+    pub surfaces: Option<Vec<Surface>>,
+    /// Override for the generated CLI subcommand name (kebab-case). Defaults
+    /// to the operation name. Used where the public CLI contract names a
+    /// command differently from the operation (e.g. `subscribe_events` is
+    /// exposed as `iris watch`).
+    #[serde(default)]
+    pub cli_command: Option<String>,
+}
+
+/// Response delivery kind for a generated operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    /// Unary JSON request/response (the existing behavior).
+    #[default]
+    Unary,
+    /// Server-Sent Events stream (`text/event-stream`).
+    Sse,
+}
+
+/// A generated surface an operation may be exposed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Surface {
+    /// The HTTP REST surface.
+    Http,
+    /// The CLI command surface.
+    Cli,
+    /// The MCP tool surface.
+    Mcp,
+}
+
+impl Operation {
+    /// Whether this operation emits a streaming SSE response.
+    #[must_use]
+    pub const fn is_sse(&self) -> bool {
+        matches!(self.delivery, Delivery::Sse)
+    }
+
+    /// Whether the HTTP surface is generated for this operation.
+    #[must_use]
+    pub fn generates_http(&self) -> bool {
+        self.surfaces
+            .as_ref()
+            .is_none_or(|surfaces| surfaces.contains(&Surface::Http))
+    }
+
+    /// Whether the CLI surface is generated for this operation.
+    #[must_use]
+    pub fn generates_cli(&self) -> bool {
+        self.surfaces
+            .as_ref()
+            .is_none_or(|surfaces| surfaces.contains(&Surface::Cli))
+    }
+
+    /// Whether the MCP surface is generated for this operation.
+    #[must_use]
+    pub fn generates_mcp(&self) -> bool {
+        self.surfaces
+            .as_ref()
+            .is_none_or(|surfaces| surfaces.contains(&Surface::Mcp))
+    }
 }
 
 /// HTTP method for a generated REST operation.
@@ -148,54 +219,130 @@ pub fn validate_definition(definition: &ApiDefinition) -> Result<()> {
             "operation {} read/method mismatch: reads must be GET, writes must be POST",
             operation.name
         );
+        validate_operation_parameters(operation)?;
+        validate_operation_surfaces(operation)?;
+    }
 
-        let mut parameter_names = std::collections::BTreeSet::new();
-        for parameter in &operation.parameters {
-            anyhow::ensure!(
-                is_valid_identifier(&parameter.name),
-                "parameter name must be a Rust-safe snake_case identifier: {}.{}",
-                operation.name,
-                parameter.name
-            );
-            anyhow::ensure!(
-                parameter_names.insert(parameter.name.as_str()),
-                "duplicate parameter name: {}.{}",
-                operation.name,
-                parameter.name
-            );
+    // CLI command overrides must not collide with any generated subcommand.
+    let mut cli_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
         }
-
-        let path_parameters = path_parameters(&operation.path)?;
-        for path_parameter in &path_parameters {
-            anyhow::ensure!(
-                operation
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter.name == *path_parameter
-                        && parameter.location == ParameterLocation::Path),
-                "operation {} path placeholder {{{}}} has no matching path parameter",
-                operation.name,
-                path_parameter
-            );
-        }
-        for parameter in operation
-            .parameters
-            .iter()
-            .filter(|parameter| parameter.location == ParameterLocation::Path)
-        {
-            anyhow::ensure!(
-                path_parameters
-                    .iter()
-                    .any(|path_parameter| path_parameter == &parameter.name),
-                "operation {} path parameter {} is not present in path {}",
-                operation.name,
-                parameter.name,
-                operation.path
-            );
-        }
+        let name = operation
+            .cli_command
+            .clone()
+            .unwrap_or_else(|| operation.name.clone());
+        anyhow::ensure!(
+            cli_names.insert(name),
+            "operation {} declares a CLI command name that collides with another operation",
+            operation.name
+        );
     }
 
     Ok(())
+}
+
+/// Validate parameter names and path/parameter consistency for one operation.
+fn validate_operation_parameters(operation: &Operation) -> Result<()> {
+    let mut parameter_names = std::collections::BTreeSet::new();
+    for parameter in &operation.parameters {
+        anyhow::ensure!(
+            is_valid_identifier(&parameter.name),
+            "parameter name must be a Rust-safe snake_case identifier: {}.{}",
+            operation.name,
+            parameter.name
+        );
+        anyhow::ensure!(
+            parameter_names.insert(parameter.name.as_str()),
+            "duplicate parameter name: {}.{}",
+            operation.name,
+            parameter.name
+        );
+    }
+
+    let path_parameters = path_parameters(&operation.path)?;
+    for path_parameter in &path_parameters {
+        anyhow::ensure!(
+            operation
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == *path_parameter
+                    && parameter.location == ParameterLocation::Path),
+            "operation {} path placeholder {{{}}} has no matching path parameter",
+            operation.name,
+            path_parameter
+        );
+    }
+    for parameter in operation
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.location == ParameterLocation::Path)
+    {
+        anyhow::ensure!(
+            path_parameters
+                .iter()
+                .any(|path_parameter| path_parameter == &parameter.name),
+            "operation {} path parameter {} is not present in path {}",
+            operation.name,
+            parameter.name,
+            operation.path
+        );
+    }
+    Ok(())
+}
+
+/// Validate surface allowlists, delivery-kind rules, and CLI command names.
+fn validate_operation_surfaces(operation: &Operation) -> Result<()> {
+    if let Some(surfaces) = &operation.surfaces {
+        anyhow::ensure!(
+            !surfaces.is_empty(),
+            "operation {} declares an empty surfaces list",
+            operation.name
+        );
+    }
+    if operation.is_sse() {
+        anyhow::ensure!(
+            operation.generates_http(),
+            "operation {} uses delivery: sse but does not list the http surface",
+            operation.name
+        );
+        anyhow::ensure!(
+            operation.method == HttpMethod::Get,
+            "operation {} uses delivery: sse but is not a GET",
+            operation.name
+        );
+        anyhow::ensure!(
+            !operation.generates_mcp(),
+            "operation {} uses delivery: sse but lists the mcp surface; \
+             SSE operations are excluded from MCP generation",
+            operation.name
+        );
+    }
+    if let Some(cli_command) = &operation.cli_command {
+        anyhow::ensure!(
+            !cli_command.is_empty(),
+            "operation {} declares an empty cli_command",
+            operation.name
+        );
+        anyhow::ensure!(
+            is_kebab_case(cli_command),
+            "operation {} declares cli_command {cli_command:?} which is not kebab-case",
+            operation.name
+        );
+    }
+    Ok(())
+}
+
+/// Whether a value is lowercase kebab-case (letters, digits, single hyphens).
+fn is_kebab_case(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Generate all committed artifacts for a definition.
@@ -250,11 +397,14 @@ fn generate_cli(definition: &ApiDefinition) -> String {
     out.push_str("#[derive(Debug, Clone, Subcommand)]\n");
     out.push_str("pub enum GeneratedCommand {\n");
     for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
+        }
         push_doc_comment(&mut out, "    ", &operation.description);
         out.push_str("    ");
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push('(');
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push_str("Args),\n");
     }
     out.push_str("}\n\n");
@@ -263,8 +413,11 @@ fn generate_cli(definition: &ApiDefinition) -> String {
     out.push_str("    pub const fn operation_name(&self) -> &'static str {\n");
     out.push_str("        match self {\n");
     for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
+        }
         out.push_str("            Self::");
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push_str("(_) => ");
         out.push_str(&rust_string_literal(&operation.name));
         out.push_str(",\n");
@@ -274,8 +427,11 @@ fn generate_cli(definition: &ApiDefinition) -> String {
     out.push_str("    pub fn parameters_json(&self) -> serde_json::Value {\n");
     out.push_str("        match self {\n");
     for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
+        }
         out.push_str("            Self::");
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push_str("(args) => serde_json::json!({");
         for (index, parameter) in operation.parameters.iter().enumerate() {
             if index > 0 {
@@ -295,9 +451,12 @@ fn generate_cli(definition: &ApiDefinition) -> String {
     out.push_str("}\n\n");
 
     for operation in &definition.operations {
+        if !operation.generates_cli() {
+            continue;
+        }
         out.push_str("#[derive(Debug, Clone, Serialize, Deserialize, Args)]\n");
         out.push_str("pub struct ");
-        out.push_str(&pascal_case(&operation.name));
+        out.push_str(&cli_variant_name(operation));
         out.push_str("Args {\n");
         for parameter in &operation.parameters {
             push_doc_comment(&mut out, "    ", &parameter.description);
@@ -342,6 +501,9 @@ fn generate_http(definition: &ApiDefinition) -> String {
     out.push_str("}\n\n");
     out.push_str("pub const GENERATED_ROUTES: &[GeneratedRoute] = &[\n");
     for operation in &definition.operations {
+        if !operation.generates_http() {
+            continue;
+        }
         out.push_str("    GeneratedRoute { name: ");
         out.push_str(&rust_string_literal(&operation.name));
         out.push_str(", method: ");
@@ -354,6 +516,9 @@ fn generate_http(definition: &ApiDefinition) -> String {
     out.push_str("pub fn generated_router() -> Router<AppState> {\n");
     out.push_str("    Router::new()\n");
     for operation in &definition.operations {
+        if !operation.generates_http() || operation.is_sse() {
+            continue;
+        }
         out.push_str("        .route(");
         out.push_str(&rust_string_literal(&axum_path(&operation.path)));
         out.push_str(", ");
@@ -366,60 +531,16 @@ fn generate_http(definition: &ApiDefinition) -> String {
     }
     out.push_str("}\n\n");
 
-    for (operation_index, operation) in definition.operations.iter().enumerate() {
-        let has_path = operation
-            .parameters
-            .iter()
-            .any(|parameter| parameter.location == ParameterLocation::Path);
-        let has_query = operation
-            .parameters
-            .iter()
-            .any(|parameter| parameter.location == ParameterLocation::Query);
-        let has_body = operation
-            .parameters
-            .iter()
-            .any(|parameter| parameter.location == ParameterLocation::Body);
+    out.push_str(&generate_sse_surface(definition));
 
-        out.push_str("async fn ");
-        out.push_str(&operation.name);
-        out.push_str("(\n");
-        out.push_str("    State(state): State<AppState>,\n");
-        if has_path {
-            out.push_str("    Path(path): Path<BTreeMap<String, String>>,\n");
-        }
-        if has_query {
-            out.push_str("    Query(query): Query<BTreeMap<String, String>>,\n");
-        }
-        if has_body {
-            out.push_str("    Json(body): Json<Value>,\n");
-        }
-        out.push_str(") -> Response {\n");
-        out.push_str("    super::execute_generated_operation(\n");
-        out.push_str("        &state,\n");
-        out.push_str("        ");
-        out.push_str(&rust_string_literal(&operation.name));
-        out.push_str(",\n");
-        out.push_str("        GeneratedOperationInput {\n");
-        if has_path {
-            out.push_str("            path,\n");
-        } else {
-            out.push_str("            path: BTreeMap::new(),\n");
-        }
-        if has_query {
-            out.push_str("            query,\n");
-        } else {
-            out.push_str("            query: BTreeMap::new(),\n");
-        }
-        if has_body {
-            out.push_str("            body,\n");
-        } else {
-            out.push_str("            body: Value::Null,\n");
-        }
-        out.push_str("        },\n");
-        out.push_str("    )\n");
-        out.push_str("    .await\n");
-        out.push_str("}\n");
-        if operation_index + 1 < definition.operations.len() {
+    let unary_operations: Vec<&Operation> = definition
+        .operations
+        .iter()
+        .filter(|operation| operation.generates_http() && !operation.is_sse())
+        .collect();
+    for (operation_index, operation) in unary_operations.iter().enumerate() {
+        push_unary_handler(&mut out, operation);
+        if operation_index + 1 < unary_operations.len() {
             out.push('\n');
         }
     }
@@ -427,10 +548,116 @@ fn generate_http(definition: &ApiDefinition) -> String {
     out
 }
 
+/// Emit one unary Axum handler for a non-streaming HTTP operation.
+fn push_unary_handler(out: &mut String, operation: &Operation) {
+    let has_path = operation
+        .parameters
+        .iter()
+        .any(|parameter| parameter.location == ParameterLocation::Path);
+    let has_query = operation
+        .parameters
+        .iter()
+        .any(|parameter| parameter.location == ParameterLocation::Query);
+    let has_body = operation
+        .parameters
+        .iter()
+        .any(|parameter| parameter.location == ParameterLocation::Body);
+
+    out.push_str("async fn ");
+    out.push_str(&operation.name);
+    out.push_str("(\n");
+    out.push_str("    State(state): State<AppState>,\n");
+    if has_path {
+        out.push_str("    Path(path): Path<BTreeMap<String, String>>,\n");
+    }
+    if has_query {
+        out.push_str("    Query(query): Query<BTreeMap<String, String>>,\n");
+    }
+    if has_body {
+        out.push_str("    Json(body): Json<Value>,\n");
+    }
+    out.push_str(") -> Response {\n");
+    out.push_str("    super::execute_generated_operation(\n");
+    out.push_str("        &state,\n");
+    out.push_str("        ");
+    out.push_str(&rust_string_literal(&operation.name));
+    out.push_str(",\n");
+    out.push_str("        GeneratedOperationInput {\n");
+    if has_path {
+        out.push_str("            path,\n");
+    } else {
+        out.push_str("            path: BTreeMap::new(),\n");
+    }
+    if has_query {
+        out.push_str("            query,\n");
+    } else {
+        out.push_str("            query: BTreeMap::new(),\n");
+    }
+    if has_body {
+        out.push_str("            body,\n");
+    } else {
+        out.push_str("            body: Value::Null,\n");
+    }
+    out.push_str("        },\n");
+    out.push_str("    )\n");
+    out.push_str("    .await\n");
+    out.push_str("}\n");
+}
+
+/// Emit the SSE surface for streaming operations: route metadata plus a named
+/// runtime binding hook per operation. The handwritten server binds the actual
+/// handler, so no duplicate Axum route exists in generated code.
+fn generate_sse_surface(definition: &ApiDefinition) -> String {
+    let sse_operations: Vec<&Operation> = definition
+        .operations
+        .iter()
+        .filter(|operation| operation.is_sse() && operation.generates_http())
+        .collect();
+    if sse_operations.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("/// Streaming (SSE) operations declared in the API definition. The\n");
+    out.push_str("/// generated surface exposes only this metadata plus the binding hooks\n");
+    out.push_str("/// below; the handwritten server supplies the handler.\n");
+    out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n");
+    out.push_str("pub struct GeneratedSseRoute {\n");
+    out.push_str("    pub name: &'static str,\n");
+    out.push_str("    pub method: &'static str,\n");
+    out.push_str("    pub path: &'static str,\n");
+    out.push_str("}\n\n");
+    out.push_str("pub const GENERATED_SSE_ROUTES: &[GeneratedSseRoute] = &[\n");
+    for operation in &sse_operations {
+        out.push_str("    GeneratedSseRoute { name: ");
+        out.push_str(&rust_string_literal(&operation.name));
+        out.push_str(", method: ");
+        out.push_str(&rust_string_literal(operation.method.as_str()));
+        out.push_str(", path: ");
+        out.push_str(&rust_string_literal(&axum_path(&operation.path)));
+        out.push_str(" },\n");
+    }
+    out.push_str("];\n\n");
+    for operation in &sse_operations {
+        out.push_str("/// Runtime binding hook for the `");
+        out.push_str(&operation.name);
+        out.push_str("` SSE operation. The handwritten server implements this\n");
+        out.push_str("/// binding; generated code does not generate a duplicate route.\n");
+        out.push_str("pub fn bind_");
+        out.push_str(&operation.name);
+        out.push_str("(router: Router<AppState>) -> Router<AppState> {\n");
+        out.push_str("    super::bind_runtime_sse_");
+        out.push_str(&operation.name);
+        out.push_str("(router)\n");
+        out.push_str("}\n\n");
+    }
+    out
+}
+
 fn generate_mcp(definition: &ApiDefinition) -> String {
     let tools: Vec<_> = definition
         .operations
         .iter()
+        .filter(|operation| operation.generates_mcp() && !operation.is_sse())
         .map(|operation| {
             let mut required = Vec::new();
             let mut properties = serde_json::Map::new();
@@ -574,6 +801,16 @@ fn is_snake_case(value: &str) -> bool {
         && !value.contains("__")
 }
 
+/// The variant name for an operation's generated CLI command.
+///
+/// The name is pascal-cased. Honors an explicit `cli_command` override (for
+/// example `subscribe_events`, exposed as `iris watch`); defaults to the
+/// operation name.
+fn cli_variant_name(operation: &Operation) -> String {
+    let command = operation.cli_command.as_deref().unwrap_or(&operation.name);
+    pascal_case(command)
+}
+
 fn pascal_case(value: &str) -> String {
     value
         .split('_')
@@ -658,6 +895,9 @@ mod tests {
                 required: true,
                 location: ParameterLocation::Path,
             }],
+            delivery: Delivery::Unary,
+            surfaces: None,
+            cli_command: None,
         });
 
         let artifacts = generate_all(&definition);
@@ -678,6 +918,9 @@ mod tests {
                     read: true,
                     output_type: "Vec<Thread>".to_string(),
                     parameters: Vec::new(),
+                    delivery: Delivery::Unary,
+                    surfaces: None,
+                    cli_command: None,
                 },
                 Operation {
                     name: "list_threads".to_string(),
@@ -687,6 +930,9 @@ mod tests {
                     read: true,
                     output_type: "Vec<Thread>".to_string(),
                     parameters: Vec::new(),
+                    delivery: Delivery::Unary,
+                    surfaces: None,
+                    cli_command: None,
                 },
             ],
         };
@@ -706,6 +952,9 @@ mod tests {
                 read: true,
                 output_type: "Vec<Thread>".to_string(),
                 parameters: Vec::new(),
+                delivery: Delivery::Unary,
+                surfaces: None,
+                cli_command: None,
             }],
         };
 
@@ -714,5 +963,180 @@ mod tests {
             err.to_string()
                 .contains("reserved by generated HTTP module")
         );
+    }
+
+    #[test]
+    fn rejects_sse_without_http_surface() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "subscribe_events".to_string(),
+                description: "Streaming events.".to_string(),
+                method: HttpMethod::Get,
+                path: "/v1/events".to_string(),
+                read: true,
+                output_type: "SSE stream".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Sse,
+                surfaces: Some(vec![Surface::Cli]),
+                cli_command: None,
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("sse without http rejected");
+        assert!(err.to_string().contains("does not list the http surface"));
+    }
+
+    #[test]
+    fn rejects_sse_without_get_method() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "subscribe_events".to_string(),
+                description: "Streaming events.".to_string(),
+                method: HttpMethod::Post,
+                path: "/v1/events".to_string(),
+                read: false,
+                output_type: "SSE stream".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Sse,
+                surfaces: Some(vec![Surface::Http]),
+                cli_command: None,
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("sse post rejected");
+        assert!(err.to_string().contains("is not a GET"));
+    }
+
+    #[test]
+    fn rejects_empty_surfaces_list() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "list_threads".to_string(),
+                description: "No surfaces.".to_string(),
+                method: HttpMethod::Get,
+                path: "/threads".to_string(),
+                read: true,
+                output_type: "Vec<Thread>".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Unary,
+                surfaces: Some(Vec::new()),
+                cli_command: None,
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("empty surfaces rejected");
+        assert!(err.to_string().contains("empty surfaces list"));
+    }
+
+    #[test]
+    fn sse_operations_are_excluded_from_mcp_and_unary_routes() {
+        let definition =
+            load_api_definition("../../api/operations.yaml").expect("definition loads");
+        let subscribe = definition
+            .operations
+            .iter()
+            .find(|operation| operation.name == "subscribe_events")
+            .expect("subscribe_events declared");
+        assert!(subscribe.is_sse());
+        assert!(subscribe.generates_http());
+        assert!(subscribe.generates_cli());
+        assert!(!subscribe.generates_mcp());
+
+        let artifacts = generate_all(&definition);
+        // No MCP tool is generated for the SSE operation.
+        assert!(
+            !artifacts
+                .mcp_json
+                .contains("\"name\": \"subscribe_events\"")
+        );
+        // No unary route/handler is generated for the SSE operation.
+        assert!(!artifacts.http_rs.contains("async fn subscribe_events("));
+        // Metadata + binding hook are generated instead.
+        assert!(artifacts.http_rs.contains("GENERATED_SSE_ROUTES"));
+        assert!(artifacts.http_rs.contains("bind_subscribe_events"));
+        assert!(artifacts.http_rs.contains("/v1/events"));
+        // The CLI watch variant is declared under its public `watch` name.
+        assert!(artifacts.cli_rs.contains("Watch(WatchArgs)"));
+        assert!(
+            artifacts
+                .cli_rs
+                .contains("Self::Watch(_) => \"subscribe_events\"")
+        );
+    }
+
+    #[test]
+    fn rejects_sse_with_mcp_surface() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "subscribe_events".to_string(),
+                description: "Streaming events.".to_string(),
+                method: HttpMethod::Get,
+                path: "/v1/events".to_string(),
+                read: true,
+                output_type: "SSE stream".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Sse,
+                surfaces: Some(vec![Surface::Http, Surface::Mcp]),
+                cli_command: None,
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("sse with mcp rejected");
+        assert!(err.to_string().contains("excluded from MCP generation"));
+    }
+
+    #[test]
+    fn rejects_non_kebab_cli_command() {
+        let definition = ApiDefinition {
+            operations: vec![Operation {
+                name: "subscribe_events".to_string(),
+                description: "Streaming events.".to_string(),
+                method: HttpMethod::Get,
+                path: "/v1/events".to_string(),
+                read: true,
+                output_type: "SSE stream".to_string(),
+                parameters: Vec::new(),
+                delivery: Delivery::Sse,
+                surfaces: Some(vec![Surface::Http, Surface::Cli]),
+                cli_command: Some("Not_Kebab".to_string()),
+            }],
+        };
+
+        let err = validate_definition(&definition).expect_err("non-kebab cli_command rejected");
+        assert!(err.to_string().contains("not kebab-case"));
+    }
+
+    #[test]
+    fn rejects_colliding_cli_command_names() {
+        let sse_operation = Operation {
+            name: "subscribe_events".to_string(),
+            description: "Streaming events.".to_string(),
+            method: HttpMethod::Get,
+            path: "/v1/events".to_string(),
+            read: true,
+            output_type: "SSE stream".to_string(),
+            parameters: Vec::new(),
+            delivery: Delivery::Sse,
+            surfaces: Some(vec![Surface::Http, Surface::Cli]),
+            cli_command: Some("watch".to_string()),
+        };
+        let existing_watch = Operation {
+            name: "watch".to_string(),
+            description: "An existing watch command.".to_string(),
+            method: HttpMethod::Get,
+            path: "/v1/watch".to_string(),
+            read: true,
+            output_type: "Vec<Thread>".to_string(),
+            parameters: Vec::new(),
+            delivery: Delivery::Unary,
+            surfaces: None,
+            cli_command: None,
+        };
+        let definition = ApiDefinition {
+            operations: vec![sse_operation, existing_watch],
+        };
+
+        let err = validate_definition(&definition).expect_err("colliding CLI names rejected");
+        assert!(err.to_string().contains("collides with another operation"));
     }
 }

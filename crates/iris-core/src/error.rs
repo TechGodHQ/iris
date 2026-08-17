@@ -20,6 +20,20 @@ pub enum IrisError {
         capability: String,
     },
 
+    /// A realtime subscription cannot be established by this provider right
+    /// now (capability advertised but runtime readiness not satisfied).
+    #[error("realtime subscription unavailable for provider '{provider}': {code}")]
+    RealtimeUnavailable { provider: String, code: String },
+
+    /// A realtime subscriber's bounded queue overflowed; the subscriber is
+    /// terminated with this terminal error.
+    #[error("realtime subscriber terminated: consumer too slow (queue overflow)")]
+    SlowConsumer,
+
+    /// A realtime poller exhausted its transient retry budget.
+    #[error("realtime transient retry budget exhausted after {attempts} attempts: {last_error}")]
+    RealtimeRetryExhausted { attempts: u32, last_error: String },
+
     /// A resource was not found.
     #[error("not found: {0}")]
     NotFound(String),

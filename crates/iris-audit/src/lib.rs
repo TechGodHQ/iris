@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use fs2::FileExt;
-use iris_core::{AuditEntry, AuditEvent, AuditFilter, AuditLog, IrisError, Result};
+use iris_core::{AuditEntry, AuditEvent, AuditFilter, AuditLog, IrisError, RecordOutcome, Result};
 use sha2::{Digest, Sha256};
 use tokio::{fs, sync::Mutex};
 
@@ -92,18 +92,36 @@ impl LocalFsAuditLog {
         .await
         .map_err(|error| IrisError::Storage(error.to_string()))?
     }
-}
 
-#[async_trait]
-impl AuditLog for LocalFsAuditLog {
-    async fn record(&self, event: AuditEvent) -> Result<AuditEntry> {
+    /// Append an entry under both serialization locks, optionally refusing
+    /// the append when an entry with the same `(provider, source_id)` key
+    /// already exists. Returns the appended entry (or the refusal outcome).
+    async fn append_with_key_check(
+        &self,
+        key: Option<(&str, &str)>,
+        event: AuditEvent,
+    ) -> Result<(AuditEntry, RecordOutcome)> {
         let _guard = self.write_lock.lock().await;
         let _file_lock = self.acquire_write_lock().await?;
-        let previous = self
-            .read_entries()
-            .await?
-            .last()
-            .map(|entry| entry.self_hash.clone());
+        let entries = self.read_entries().await?;
+        if let Some((provider, source_id)) = key {
+            let duplicate = entries.iter().any(|entry| {
+                entry.event.provider == provider
+                    && entry.event.source_id.as_deref() == Some(source_id)
+            });
+            if duplicate {
+                return Ok((
+                    AuditEntry {
+                        id: uuid::Uuid::new_v4(),
+                        event,
+                        prev_hash: None,
+                        self_hash: String::new(),
+                    },
+                    RecordOutcome::AlreadyRecorded,
+                ));
+            }
+        }
+        let previous = entries.last().map(|entry| entry.self_hash.clone());
         let mut entry = AuditEntry {
             id: uuid::Uuid::new_v4(),
             event,
@@ -118,7 +136,40 @@ impl AuditLog for LocalFsAuditLog {
             serde_json::to_string(&entry).map_err(|e| IrisError::Serialization(e.to_string()))?;
         line.push('\n');
         write_entry_atomically(dir, entry.id, line).await?;
+        Ok((entry, RecordOutcome::Inserted))
+    }
+}
+
+#[async_trait]
+impl AuditLog for LocalFsAuditLog {
+    async fn record(&self, event: AuditEvent) -> Result<AuditEntry> {
+        let (entry, _) = self.append_with_key_check(None, event).await?;
         Ok(entry)
+    }
+
+    /// Atomically append only when no entry shares the `(provider, source_id)`
+    /// key. The check and the append happen under the same in-process mutex
+    /// and cross-process advisory lock that guard `record`, so concurrent
+    /// writers (including separate CLI/MCP/server processes sharing this
+    /// audit root) cannot both observe "no prior entry".
+    ///
+    /// The persisted event is normalized to carry the key: `event.provider`
+    /// and `event.source_id` are overwritten with the passed values so the
+    /// uniqueness scan (which compares stored entries' provider and
+    /// `source_id`)
+    /// always matches what was written for that key.
+    async fn record_once(
+        &self,
+        provider: &str,
+        source_id: &str,
+        mut event: AuditEvent,
+    ) -> Result<RecordOutcome> {
+        event.provider = provider.to_string();
+        event.source_id = Some(source_id.to_string());
+        let (_, outcome) = self
+            .append_with_key_check(Some((provider, source_id)), event)
+            .await?;
+        Ok(outcome)
     }
 
     async fn query(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>> {
@@ -222,7 +273,7 @@ fn storage_error(error: std::io::Error) -> IrisError {
 mod tests {
     use super::LocalFsAuditLog;
     use chrono::{TimeZone, Utc};
-    use iris_core::{AuditAction, AuditEvent, AuditFilter, AuditLog};
+    use iris_core::{AuditAction, AuditEvent, AuditFilter, AuditLog, RecordOutcome};
 
     fn event(action: AuditAction, source: &str) -> AuditEvent {
         AuditEvent {
@@ -232,6 +283,93 @@ mod tests {
             timestamp: Utc.with_ymd_and_hms(2026, 8, 13, 12, 0, 0).unwrap(),
             metadata: serde_json::json!({"count": 1}),
         }
+    }
+
+    #[tokio::test]
+    async fn record_once_inserts_then_reports_already_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = LocalFsAuditLog::new(temp.path());
+        // The event's own provider/source_id deliberately disagree with the
+        // record-once key; the persisted entry must carry the key so the
+        // uniqueness scan matches stored data.
+        let mut mismatched = event(AuditAction::Normalize, "chat-777");
+        mismatched.provider = "wrong-provider".to_string();
+        let first = log
+            .record_once("telegram", "update-1", mismatched)
+            .await
+            .unwrap();
+        assert_eq!(first, RecordOutcome::Inserted);
+        let second = log
+            .record_once(
+                "telegram",
+                "update-1",
+                event(AuditAction::Normalize, "update-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second, RecordOutcome::AlreadyRecorded);
+        // Exactly one entry exists despite two calls, and it carries the key.
+        let stored = log.query(&AuditFilter::default()).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].event.provider, "telegram");
+        assert_eq!(stored[0].event.source_id.as_deref(), Some("update-1"));
+        // A different key still appends.
+        let third = log
+            .record_once(
+                "telegram",
+                "update-2",
+                event(AuditAction::Normalize, "update-2"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(third, RecordOutcome::Inserted);
+        assert_eq!(log.query(&AuditFilter::default()).await.unwrap().len(), 2);
+        assert!(log.verify_chain().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn record_once_is_atomic_across_independent_instances() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = LocalFsAuditLog::new(temp.path());
+        let second = LocalFsAuditLog::new(temp.path());
+        let (a, b) = tokio::join!(
+            first.record_once(
+                "telegram",
+                "update-9",
+                event(AuditAction::Normalize, "update-9")
+            ),
+            second.record_once(
+                "telegram",
+                "update-9",
+                event(AuditAction::Normalize, "update-9")
+            ),
+        );
+        let outcomes: Vec<RecordOutcome> = vec![a.unwrap(), b.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == RecordOutcome::Inserted)
+                .count(),
+            1,
+            "exactly one writer may insert for a given key"
+        );
+        assert_eq!(first.query(&AuditFilter::default()).await.unwrap().len(), 1);
+        assert!(first.verify_chain().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn record_still_allows_duplicate_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = LocalFsAuditLog::new(temp.path());
+        log.record(event(AuditAction::Normalize, "same-thread"))
+            .await
+            .unwrap();
+        log.record(event(AuditAction::Send, "same-thread"))
+            .await
+            .unwrap();
+        // Regular record intentionally permits repeated source IDs (normal
+        // provider operations repeat thread IDs).
+        assert_eq!(log.query(&AuditFilter::default()).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

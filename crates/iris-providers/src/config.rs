@@ -241,6 +241,14 @@ mod tests {
         ) -> iris_core::Result<iris_core::AuditEntry> {
             unreachable!("config tests never record audit events")
         }
+        async fn record_once(
+            &self,
+            _provider: &str,
+            _source_id: &str,
+            _event: iris_core::AuditEvent,
+        ) -> iris_core::Result<iris_core::RecordOutcome> {
+            unreachable!("config tests never record audit events")
+        }
         async fn query(
             &self,
             _filter: &iris_core::AuditFilter,
