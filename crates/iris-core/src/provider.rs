@@ -13,6 +13,8 @@ pub enum ProviderCapability {
     ListMessages,
     /// Can send outbound messages.
     SendMessages,
+    /// Can send outbound attachments alongside message text.
+    SendAttachments,
     /// Can list threads/conversations.
     ListThreads,
     /// Can list contacts.
@@ -168,7 +170,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn send_message(&self, _thread_id: &str, _message: &OutboundMessage) -> Result<Message> {
+        async fn send_message(
+            &self,
+            _thread_id: &str,
+            _message: &OutboundMessage,
+        ) -> Result<Message> {
             unreachable!("test provider never sends")
         }
     }
