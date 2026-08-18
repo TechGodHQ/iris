@@ -419,8 +419,9 @@ fn find_url_start(text: &str) -> Option<usize> {
     }
 }
 
-/// Replace Telegram bot-token-shaped substrings (`123456789:AA…`, 30+
-/// character secret run) with `<token>`.
+/// Replace Telegram bot-token-shaped substrings (`123456789:AA…` — a
+/// numeric ID of any length followed by `:` and a 30+ character secret
+/// run) with `<token>`.
 fn replace_bare_tokens(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -431,8 +432,7 @@ fn replace_bare_tokens(text: &str) -> String {
             while i < chars.len() && chars[i].is_ascii_digit() {
                 i += 1;
             }
-            let digits = i - digits_start;
-            if (8..=10).contains(&digits)
+            if i > digits_start
                 && i + 1 < chars.len()
                 && chars[i] == ':'
                 && chars[i + 1].is_ascii_alphanumeric()

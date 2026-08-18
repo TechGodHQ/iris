@@ -89,9 +89,12 @@ impl SseParser {
 
     /// Feed raw bytes; return every complete frame they closed.
     ///
-    /// Lines may end with LF, CRLF, or a lone CR (SSE spec). A trailing
-    /// lone CR at the buffer edge waits for the next byte in case it is
-    /// the first half of a CRLF pair split across chunks.
+    /// Lines may end with LF, CRLF, or a lone CR (SSE spec). A CR is a
+    /// terminator immediately: if it turns out to be the first half of a
+    /// CRLF pair, the leftover LF reads as a blank line, which dispatches
+    /// the accumulated frame at exactly the point CRLF would have. This
+    /// keeps a server that pauses right after a bare CR from stalling the
+    /// parser.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
         self.buffer.push_str(&String::from_utf8_lossy(chunk));
         let mut frames = Vec::new();
@@ -99,10 +102,6 @@ impl SseParser {
             let bytes = self.buffer.as_bytes();
             let is_cr = bytes[pos] == b'\r';
             let crlf = is_cr && bytes.get(pos + 1) == Some(&b'\n');
-            if is_cr && !crlf && pos + 1 == bytes.len() {
-                // Lone CR at the buffer edge: might be a split CRLF — wait.
-                break;
-            }
             let terminator_len = usize::from(crlf) + 1;
             let line: String = self.buffer.drain(..pos + terminator_len).collect();
             let line = line.trim_end_matches(['\r', '\n']);
@@ -191,7 +190,7 @@ where
     W: Send + Unpin + tokio::io::AsyncWrite,
     E: Send + Unpin + tokio::io::AsyncWrite,
 {
-    let mut request = client.get(format!("{url_base}/v1/events"));
+    let mut request = client.get(format!("{}/v1/events", url_base.trim_end_matches('/')));
     if let Some(provider) = &args.provider {
         request = request.query(&[("provider", provider)]);
     }
@@ -208,25 +207,27 @@ where
     }
 
     let filtered = args.provider.is_some();
-    let mut saw_error = false;
+    // The aggregate exit policy keys off how the stream ENDS: non-zero
+    // only when the last event before close was a terminal error (a later
+    // message proves another branch outlived the error).
+    let mut ended_in_error = false;
     let mut parser = SseParser::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         for frame in parser.feed(&chunk) {
-            if handle_frame(frame, filtered, &mut out, &mut err, &mut saw_error).await? {
+            if handle_frame(frame, filtered, &mut out, &mut err, &mut ended_in_error).await? {
                 return Ok(std::process::ExitCode::from(WATCH_EXIT_ERROR));
             }
         }
     }
     for frame in parser.finish() {
-        if handle_frame(frame, filtered, &mut out, &mut err, &mut saw_error).await? {
+        if handle_frame(frame, filtered, &mut out, &mut err, &mut ended_in_error).await? {
             return Ok(std::process::ExitCode::from(WATCH_EXIT_ERROR));
         }
     }
-    if saw_error {
-        // Unfiltered aggregate: the stream ended, so the erroring branch
-        // was the last one — its terminal error is the aggregate's.
+    if ended_in_error {
+        // Unfiltered aggregate: the last branch terminated in error.
         return Ok(std::process::ExitCode::from(WATCH_EXIT_ERROR));
     }
     Ok(std::process::ExitCode::SUCCESS)
@@ -241,7 +242,7 @@ async fn handle_frame<W, E>(
     filtered: bool,
     out: &mut W,
     err: &mut E,
-    saw_error: &mut bool,
+    ended_in_error: &mut bool,
 ) -> anyhow::Result<bool>
 where
     W: Send + Unpin + tokio::io::AsyncWrite,
@@ -249,10 +250,11 @@ where
 {
     match frame {
         SseFrame::Message(data) => {
+            *ended_in_error = false;
             write_line(out, &data).await?;
         }
         SseFrame::Error(data) => {
-            *saw_error = true;
+            *ended_in_error = true;
             write_line(err, &format!("watch: error frame: {data}")).await?;
             // A provider-filtered stream closes after its error.
             if filtered {
@@ -380,7 +382,7 @@ mod tests {
     /// JSONL stdout, clean end → exit 0).
     #[tokio::test]
     async fn watch_round_trips_messages_end_to_end() {
-        let (addr, _flag) = spawn_test_server(false).await;
+        let (addr, _flag) = spawn_test_server(Ending::Clean).await;
         let args = WatchArgs {
             provider: None,
             thread_id: None,
@@ -404,11 +406,38 @@ mod tests {
         assert!(stderr.is_empty(), "stderr: {stderr}");
     }
 
+    /// An error followed by a later message (another branch outlived it)
+    /// then a clean end → exit 0: the aggregate did not end in error.
+    #[tokio::test]
+    async fn watch_error_then_message_then_clean_end_exits_zero() {
+        let (addr, _flag) = spawn_test_server(Ending::ErrorThenMessage).await;
+        let args = WatchArgs {
+            provider: None,
+            thread_id: None,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = watch_with_io(
+            &args,
+            &format!("http://{addr}"),
+            &reqwest::Client::new(),
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+        let stdout = String::from_utf8(out).expect("utf8");
+        let stderr = String::from_utf8(err).expect("utf8");
+        assert!(stdout.contains("survivor message"), "stdout: {stdout}");
+        assert!(stderr.contains("error frame"), "stderr: {stderr}");
+    }
+
     /// Aggregate error at end-of-stream → non-zero exit, stderr carries
     /// the diagnostic, stdout still has prior messages.
     #[tokio::test]
     async fn watch_aggregate_error_exits_nonzero() {
-        let (addr, _flag) = spawn_test_server(true).await;
+        let (addr, _flag) = spawn_test_server(Ending::Error).await;
         let args = WatchArgs {
             provider: None,
             thread_id: None,
@@ -435,7 +464,7 @@ mod tests {
     /// Filtered (provider=) stream error → immediate non-zero exit.
     #[tokio::test]
     async fn watch_filtered_error_exits_nonzero() {
-        let (addr, _flag) = spawn_test_server(true).await;
+        let (addr, _flag) = spawn_test_server(Ending::Error).await;
         let args = WatchArgs {
             provider: Some("fake".into()),
             thread_id: None,
@@ -460,7 +489,7 @@ mod tests {
     /// status on stderr.
     #[tokio::test]
     async fn watch_http_error_reports_to_stderr() {
-        let (addr, _flag) = spawn_test_server(false).await;
+        let (addr, _flag) = spawn_test_server(Ending::Clean).await;
         let args = WatchArgs {
             provider: Some("nonexistent".into()),
             thread_id: None,
@@ -489,7 +518,7 @@ mod tests {
     /// filters the wire accordingly.
     #[tokio::test]
     async fn watch_passes_thread_filter_query() {
-        let (addr, _flag) = spawn_test_server(false).await;
+        let (addr, _flag) = spawn_test_server(Ending::Clean).await;
         let args = WatchArgs {
             provider: None,
             thread_id: Some("00000000-0000-0000-0000-000000000042".into()),
@@ -515,12 +544,23 @@ mod tests {
     // In-process server harness
     // -------------------------------------------------------------------
 
+    /// What the scripted provider emits after its two messages.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Ending {
+        /// The stream ends cleanly (tx dropped).
+        Clean,
+        /// A terminal error is the last event before the stream ends.
+        Error,
+        /// A terminal error, then a further message proving another branch
+        /// outlived it, then the stream ends cleanly.
+        ErrorThenMessage,
+    }
+
     /// Spawn an in-process server whose `/v1/events` emits a wrong-thread
-    /// message, a right-thread message, and (optionally) a terminal error,
-    /// then ends the stream.
+    /// message, a right-thread message, then the chosen ending.
     #[allow(clippy::too_many_lines)]
     async fn spawn_test_server(
-        error_at_end: bool,
+        ending: Ending,
     ) -> (
         std::net::SocketAddr,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -534,7 +574,7 @@ mod tests {
 
         struct ScriptedProvider {
             metadata: ProviderMetadata,
-            error_at_end: bool,
+            ending: Ending,
         }
 
         #[async_trait]
@@ -564,7 +604,8 @@ mod tests {
             }
             async fn subscribe_realtime(&self) -> Result<MessageStream> {
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Message>>(16);
-                let error_at_end = self.error_at_end;
+                let ending = self.ending;
+                let is_survivor = self.metadata.id == "survivor";
                 tokio::spawn(async move {
                     let base = Message {
                         id: uuid::Uuid::new_v4(),
@@ -593,9 +634,22 @@ mod tests {
                         body: "wrong thread".into(),
                         ..base.clone()
                     };
+                    if is_survivor {
+                        // A second branch that outlives fake's terminal
+                        // error: its later message is what proves the
+                        // aggregate did not end in error.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        let survivor = Message {
+                            body: "survivor message".into(),
+                            ..base.clone()
+                        };
+                        let _ = tx.send(Ok(survivor)).await;
+                        // `tx` drops here → this branch ends.
+                        return;
+                    }
                     let _ = tx.send(Ok(wrong)).await;
-                    let _ = tx.send(Ok(base)).await;
-                    if error_at_end {
+                    let _ = tx.send(Ok(base.clone())).await;
+                    if ending != Ending::Clean {
                         let _ = tx
                             .send(Err(IrisError::Provider {
                                 provider: "fake".into(),
@@ -670,11 +724,24 @@ mod tests {
                 name: "Fake",
                 capabilities: &[ProviderCapability::ReceiveRealtime],
             },
-            error_at_end,
+            ending,
         };
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(error_at_end));
+        let survivor = ScriptedProvider {
+            metadata: ProviderMetadata {
+                id: "survivor",
+                name: "Survivor",
+                capabilities: &[ProviderCapability::ReceiveRealtime],
+            },
+            ending,
+        };
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut providers =
+            vec![std::sync::Arc::new(provider) as std::sync::Arc<dyn iris_core::MessageProvider>];
+        if ending == Ending::ErrorThenMessage {
+            providers.push(std::sync::Arc::new(survivor));
+        }
         let app = iris_server::create_app_with_sse(
-            vec![std::sync::Arc::new(provider)],
+            providers,
             std::sync::Arc::new(NullStore),
             std::sync::Arc::new(NullAudit),
             iris_server::SseSettings::default(),
