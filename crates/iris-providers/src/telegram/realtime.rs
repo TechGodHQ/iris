@@ -1150,6 +1150,28 @@ mod tests {
         assert!(RealtimeSettings::default().validate().is_ok());
     }
 
+    #[tokio::test]
+    async fn invalid_realtime_settings_return_config_error_not_panic() {
+        let server = MockServer::start().await;
+        let provider =
+            TelegramProvider::with_base_url("123:abc", server.uri(), Arc::new(InMemoryStore))
+                .expect("provider builds")
+                .with_audit(Arc::new(RecordingAudit::default()))
+                .with_realtime_settings(RealtimeSettings {
+                    retry_budget: 0,
+                    long_poll_timeout_seconds: 30,
+                });
+        let error = provider
+            .subscribe_realtime()
+            .await
+            .err()
+            .expect("invalid settings rejected with Config error");
+        assert!(
+            matches!(error, IrisError::Config(ref message) if message.contains("realtime")),
+            "unexpected error: {error:?}"
+        );
+    }
+
     // --- Fan-out / ordering ---------------------------------------------------
 
     #[tokio::test]

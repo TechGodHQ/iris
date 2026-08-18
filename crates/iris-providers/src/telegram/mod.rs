@@ -485,6 +485,12 @@ impl MessageProvider for TelegramProvider {
                 code: "audit sink required for realtime ingress".into(),
             });
         }
+        // Validate settings here (not inside hub construction) so invalid
+        // config surfaces as `IrisError::Config` rather than a panic from
+        // `get_or_init`, which cannot return an error.
+        if let Some(settings) = &self.realtime_settings {
+            settings.validate()?;
+        }
         let hub = self.realtime_hub();
         hub.subscribe(self.clone())
     }
