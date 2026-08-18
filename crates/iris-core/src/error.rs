@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 /// All Iris errors flow through this type.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum IrisError {
     /// A provider returned an error.
     #[error("provider '{provider}' error: {message}")]

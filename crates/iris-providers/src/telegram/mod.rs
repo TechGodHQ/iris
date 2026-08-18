@@ -3,6 +3,11 @@
 //! Telegram bots can only read messages delivered to the bot. This provider
 //! therefore normalizes the visible `getUpdates` backlog rather than pretending
 //! to provide an account-wide Telegram archive.
+//!
+//! Realtime support (audited long polling with bounded subscriber fan-out)
+//! lives in the [`realtime`] submodule.
+
+pub mod realtime;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -12,11 +17,14 @@ use chrono::{DateTime, TimeZone, Utc};
 use iris_core::model::Attachment;
 use iris_core::{
     AttachmentContent, AttachmentStore, AuditAction, AuditEvent, AuditLog, Contact, IrisError,
-    Message, MessageKind, MessageProvider, ProviderCapability, ProviderMetadata, Result, Thread,
+    Message, MessageKind, MessageProvider, MessageStream, ProviderCapability, ProviderMetadata,
+    Result, Thread,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+pub use realtime::{RealtimeHub, RealtimeSettings};
 
 const PROVIDER_ID: &str = "telegram";
 const METADATA: ProviderMetadata = ProviderMetadata {
@@ -43,6 +51,12 @@ pub struct TelegramProvider {
     /// instead of transient Telegram `file_id` references that expire after ~1h.
     attachments: Arc<dyn AttachmentStore>,
     audit: Option<Arc<dyn AuditLog>>,
+    /// Lazily-created realtime hub. Interior mutability without `Clone`
+    /// breakage: the hub is created on the first `subscribe_realtime` call
+    /// and shared between provider clones via `Arc`.
+    realtime: std::sync::OnceLock<Arc<RealtimeHub>>,
+    /// Optional realtime poller settings override (validated on hub creation).
+    realtime_settings: Option<RealtimeSettings>,
 }
 
 impl TelegramProvider {
@@ -71,6 +85,8 @@ impl TelegramProvider {
             bot_token,
             attachments,
             audit: None,
+            realtime: std::sync::OnceLock::new(),
+            realtime_settings: None,
         })
     }
 
@@ -79,6 +95,29 @@ impl TelegramProvider {
     pub fn with_audit(mut self, audit: Arc<dyn AuditLog>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Override realtime poller settings (retry budget, long-poll timeout).
+    ///
+    /// Settings are validated when the hub is constructed on the first
+    /// subscription; invalid settings surface there.
+    #[must_use]
+    pub const fn with_realtime_settings(mut self, settings: RealtimeSettings) -> Self {
+        self.realtime_settings = Some(settings);
+        self
+    }
+
+    /// The lazily-created realtime hub shared by this provider instance.
+    fn realtime_hub(&self) -> Arc<RealtimeHub> {
+        let settings = self.realtime_settings.clone().unwrap_or_default();
+        self.realtime
+            .get_or_init(|| match RealtimeHub::new(settings) {
+                Ok(hub) => Arc::new(hub),
+                // Settings were validated by construction here; unreachable
+                // in practice.
+                Err(error) => panic!("invalid realtime settings: {error}"),
+            })
+            .clone()
     }
 
     async fn record(
@@ -431,6 +470,34 @@ impl MessageProvider for TelegramProvider {
         )
         .await?;
         Ok(message)
+    }
+
+    /// Subscribe to a fallible realtime stream of normalized messages.
+    ///
+    /// Requires an attached audit sink (realtime ingress is audited before
+    /// fan-out); without one the subscription is rejected up front with
+    /// [`IrisError::RealtimeUnavailable`] rather than yielding unaudited
+    /// messages. See [`realtime`] for the delivery contract.
+    async fn subscribe_realtime(&self) -> Result<MessageStream> {
+        if self.audit.is_none() {
+            return Err(IrisError::RealtimeUnavailable {
+                provider: PROVIDER_ID.into(),
+                code: "audit sink required for realtime ingress".into(),
+            });
+        }
+        let hub = self.realtime_hub();
+        hub.subscribe(self.clone())
+    }
+
+    /// Shut down realtime infrastructure owned by this provider.
+    ///
+    /// Cancels any in-flight long poll, joins the poller task, and ends
+    /// every subscriber stream. Idempotent.
+    async fn shutdown_realtime(&self) -> Result<()> {
+        if let Some(hub) = self.realtime.get() {
+            hub.shutdown().await;
+        }
+        Ok(())
     }
 }
 

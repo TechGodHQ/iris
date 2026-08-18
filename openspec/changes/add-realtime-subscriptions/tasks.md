@@ -9,10 +9,10 @@
 
 ## Telegram provider
 
-- [ ] T5: Add the required audited `RealtimeHub`: per-subscriber bounded fan-out, process-memory cursor, cancellation ownership, and last-subscriber shutdown.
-- [ ] T6: Add Telegram long polling, normalization/attachment policy, audit metadata validation/idempotency, and explicit offset commit rules.
-- [ ] T7: Implement 409, poison-update, transient retry-budget, audit-failure, and slow-subscriber terminal semantics.
-- [ ] T8: Add deterministic provider tests for multi-subscriber ordering, guaranteed overflow error, offsets/disconnect races, cancellation/join, re-subscription, poison update classes, retries, and atomic audit behavior.
+- [x] T5: Add the required audited `RealtimeHub`: per-subscriber bounded fan-out, process-memory cursor, cancellation ownership, and last-subscriber shutdown.
+- [x] T6: Add Telegram long polling, normalization/attachment policy, audit metadata validation/idempotency, and explicit offset commit rules.
+- [x] T7: Implement 409, poison-update, transient retry-budget, audit-failure, and slow-subscriber terminal semantics.
+- [x] T8: Add deterministic provider tests for multi-subscriber ordering, guaranteed overflow error, offsets/disconnect races, cancellation/join, re-subscription, poison update classes, retries, and atomic audit behavior.
 
 ## Surfaces
 
