@@ -80,23 +80,13 @@ pub fn router(state: AppState) -> Router {
 
 /// Runtime binding for the generated `subscribe_events` SSE operation.
 ///
-/// The realtime SSE handler itself (`GET /v1/events`) is implemented in a
-/// subsequent slice; until then the route returns HTTP 501 so the surface
-/// contract exists without inventing behavior.
+/// Binds the sole `GET /v1/events` handler implemented in [`crate::sse`]:
+/// provider/thread filters, SSE statuses and error schemas, the wire-idle
+/// heartbeat, and disconnect-driven subscription cleanup.
 pub(crate) fn bind_runtime_sse_subscribe_events(
     router: Router<crate::app::AppState>,
 ) -> Router<crate::app::AppState> {
-    router.route(
-        "/v1/events",
-        get(|| async {
-            (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(serde_json::json!({
-                    "error": "subscribe_events is not implemented by this server build yet"
-                })),
-            )
-        }),
-    )
+    router.route("/v1/events", get(crate::sse::subscribe_events))
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -767,6 +757,7 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            sse: crate::sse::SseSettings::default(),
         }
     }
 
@@ -852,6 +843,7 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            sse: crate::sse::SseSettings::default(),
         };
         let _router = super::router(app_state);
     }
@@ -1028,6 +1020,7 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            sse: crate::sse::SseSettings::default(),
         };
 
         // Retrieve via the HTTP handler.
@@ -1060,6 +1053,7 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            sse: crate::sse::SseSettings::default(),
         };
 
         let random_id = Uuid::new_v4();
@@ -1081,6 +1075,7 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            sse: crate::sse::SseSettings::default(),
         };
 
         let response = get_attachment_content(
@@ -1113,6 +1108,7 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            sse: crate::sse::SseSettings::default(),
         };
 
         let response = get_attachment_content(
@@ -1152,6 +1148,7 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            sse: crate::sse::SseSettings::default(),
         };
 
         let response = get_attachment_content(

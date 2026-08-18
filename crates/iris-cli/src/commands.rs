@@ -3,7 +3,6 @@
 use clap::Args;
 use iris_core::{AuditAction, AuditFilter, AuditLog, MessageProvider, OutboundMessage};
 use iris_providers::config::{IrisConfig, providers_from_config, providers_from_default_config};
-use std::fmt::Write as _;
 
 use crate::generated;
 
@@ -165,21 +164,13 @@ async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
 
 /// `subscribe_events` — the generated `iris watch` surface.
 ///
-/// The SSE client runtime (URL configuration via `IRIS_SERVER_URL`, SSE frame
-/// parsing, JSONL stdout, stderr diagnostics, exit policies) is implemented in
-/// a subsequent slice; until then this arm reports the gap explicitly rather
-/// than inventing behavior. The `async` signature matches the dispatch table;
-/// awaits arrive with the T11 runtime.
-#[allow(clippy::unused_async)]
+/// Streams `GET /v1/events` from `IRIS_SERVER_URL` (default
+/// `http://127.0.0.1:3000`): every `message` JSON is written unchanged as
+/// one stdout line (JSONL), `error` diagnostics go to stderr, and the
+/// process exits non-zero when the selected stream or all aggregate
+/// branches terminate in error. See [`crate::watch`].
 async fn subscribe_events(args: generated::WatchArgs) -> anyhow::Result<()> {
-    let mut message = String::from("iris watch is not implemented by this build yet");
-    if let Some(provider) = args.provider {
-        write!(message, " (provider filter: {provider})")?;
-    }
-    if let Some(thread_id) = args.thread_id {
-        write!(message, " (thread filter: {thread_id})")?;
-    }
-    anyhow::bail!("{message}")
+    crate::watch::watch(args).await
 }
 
 async fn query_audit_entries(
@@ -229,13 +220,58 @@ pub fn list_providers() -> anyhow::Result<()> {
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let store = attachment_store();
     let audit = audit_log();
-    let providers = get_providers_from_path(args.config.as_deref(), &store, &audit);
-    let app = iris_server::create_app(providers?, store, audit);
+    let providers = get_providers_from_path(args.config.as_deref(), &store, &audit)?;
+    let app = iris_server::create_app(providers.clone(), store, audit);
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
     tracing::info!("Iris server listening on {}", args.addr);
-    axum::serve(listener, app).await?;
+    // Graceful shutdown: SIGINT/SIGTERM stops accepting, then every
+    // provider's realtime infrastructure is shut down and awaited (the
+    // frozen realtime design's lifecycle requirement).
+    axum::serve(listener, app)
+        .with_graceful_shutdown(realtime_aware_shutdown(providers))
+        .await?;
     Ok(())
+}
+
+/// Wait for the OS shutdown signal (Ctrl-C or SIGTERM).
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+}
+
+/// Wait for shutdown, then stop and await every provider's realtime
+/// infrastructure.
+async fn realtime_aware_shutdown(providers: Vec<std::sync::Arc<dyn iris_core::MessageProvider>>) {
+    wait_for_shutdown_signal().await;
+    for provider in &providers {
+        if let Err(error) = provider.shutdown_realtime().await {
+            tracing::warn!(
+                provider = provider.id(),
+                %error,
+                "realtime shutdown reported an error"
+            );
+        }
+    }
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {

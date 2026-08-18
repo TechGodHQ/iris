@@ -6,5 +6,7 @@
 
 pub mod app;
 pub mod routes;
+pub mod sse;
 
-pub use app::create_app;
+pub use app::{create_app, create_app_with_sse};
+pub use sse::SseSettings;
