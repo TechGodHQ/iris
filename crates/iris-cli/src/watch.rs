@@ -568,8 +568,8 @@ mod tests {
         use async_trait::async_trait;
         use iris_core::{
             AttachmentStore, AuditEntry, AuditFilter, AuditLog, Contact, IrisError, Message,
-            MessageKind, MessageProvider, MessageStream, ProviderCapability, ProviderMetadata,
-            RecordOutcome, Result, Thread,
+            MessageKind, MessageProvider, MessageStream, OutboundMessage, ProviderCapability,
+            ProviderMetadata, RecordOutcome, Result, Thread,
         };
 
         struct ScriptedProvider {
@@ -596,7 +596,11 @@ mod tests {
             async fn list_contacts(&self, _limit: Option<u32>) -> Result<Vec<Contact>> {
                 Ok(Vec::new())
             }
-            async fn send_message(&self, _thread_id: &str, _body: &str) -> Result<Message> {
+            async fn send_message(
+                &self,
+                _thread_id: &str,
+                _message: &OutboundMessage,
+            ) -> Result<Message> {
                 Err(IrisError::UnsupportedCapability {
                     provider: self.metadata.id.to_string(),
                     capability: "SendMessages".to_string(),

@@ -9,8 +9,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use iris_core::{
     AttachmentStore, AuditEntry, AuditFilter, AuditLog, Contact, IrisError, Message, MessageKind,
-    MessageProvider, MessageStream, ProviderCapability, ProviderMetadata, RecordOutcome, Result,
-    Thread,
+    MessageProvider, MessageStream, OutboundMessage, ProviderCapability, ProviderMetadata,
+    RecordOutcome, Result, Thread,
 };
 use iris_server::{SseSettings, create_app_with_sse};
 use tokio::sync::mpsc;
@@ -106,7 +106,7 @@ impl MessageProvider for FakeRealtimeProvider {
         Ok(Vec::new())
     }
 
-    async fn send_message(&self, _thread_id: &str, _body: &str) -> Result<Message> {
+    async fn send_message(&self, _thread_id: &str, _message: &OutboundMessage) -> Result<Message> {
         Err(IrisError::UnsupportedCapability {
             provider: self.metadata.id.to_string(),
             capability: "SendMessages".to_string(),
@@ -177,7 +177,7 @@ impl MessageProvider for PlainProvider {
     async fn list_contacts(&self, _limit: Option<u32>) -> Result<Vec<Contact>> {
         Ok(Vec::new())
     }
-    async fn send_message(&self, _thread_id: &str, _body: &str) -> Result<Message> {
+    async fn send_message(&self, _thread_id: &str, _message: &OutboundMessage) -> Result<Message> {
         Err(IrisError::UnsupportedCapability {
             provider: self.metadata.id.to_string(),
             capability: "SendMessages".to_string(),
