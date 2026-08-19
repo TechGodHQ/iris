@@ -9,9 +9,9 @@
 - [x] T2: Add `OutboundMessage`, `OutboundAttachment`, `SendAttachments`, and the breaking `send_message` provider contract in `iris-core`.
 - [x] T3: Add attachment-store resolution and capability-gated send plumbing to provider construction/routing.
 - [x] T4: Migrate Mock and SMS providers with deterministic attachment behavior and text-only rejection.
-- [ ] T5: Implement Telegram multipart media sends with MIME routing, caption ordering, and request tests.
-- [ ] T6: Implement Email MIME multipart sends with attachment serialization tests.
-- [ ] T7: Preserve audit semantics with content-free successful-send summaries and explicit partial-dispatch outcomes.
+- [x] T5: Implement Telegram multipart media sends with MIME routing, caption ordering, and request tests.
+- [x] T6: Implement Email MIME multipart sends with attachment serialization tests.
+- [x] T7: Preserve audit semantics with content-free successful-send summaries and explicit partial-dispatch outcomes.
 
 ## Generated surfaces
 

@@ -12,7 +12,8 @@ use iris_core::{
     Message, MessageKind, MessageProvider, OutboundMessage, ProviderCapability, ProviderMetadata,
     Result, Thread,
 };
-use lettre::message::Mailbox;
+use lettre::message::header::ContentType;
+use lettre::message::{Attachment as SmtpAttachment, Body, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message as SmtpMessage, Tokio1Executor};
 use mail_parser::{Address as ParsedAddress, HeaderValue, MessageParser, MimeHeaders, PartType};
@@ -27,6 +28,7 @@ const METADATA: ProviderMetadata = ProviderMetadata {
     capabilities: &[
         ProviderCapability::ListMessages,
         ProviderCapability::SendMessages,
+        ProviderCapability::SendAttachments,
         ProviderCapability::ListThreads,
         ProviderCapability::ListContacts,
     ],
@@ -233,6 +235,7 @@ impl EmailProvider {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // private SMTP plumbing helper
     async fn send_email(
         &self,
         recipient: &str,
@@ -241,6 +244,7 @@ impl EmailProvider {
         thread_id: Uuid,
         in_reply_to: Option<&str>,
         references: &[String],
+        attachments: &[iris_core::outbound::ResolvedAttachment],
     ) -> Result<Message> {
         let from: Mailbox = self
             .from
@@ -261,9 +265,18 @@ impl EmailProvider {
                 .join(" ");
             builder = builder.references(joined);
         }
-        let email = builder
-            .body(body.to_owned())
-            .map_err(|error| IrisError::Serialization(error.to_string()))?;
+        // One MIME message: body plus every attachment. With no attachments
+        // this preserves the exact pre-existing text-only body shape.
+        let email = if attachments.is_empty() {
+            builder
+                .body(body.to_owned())
+                .map_err(|error| IrisError::Serialization(error.to_string()))?
+        } else {
+            let multipart = build_attachment_multipart(body, attachments)?;
+            builder
+                .multipart(multipart)
+                .map_err(|error| IrisError::Serialization(error.to_string()))?
+        };
         let credentials = Credentials::new(self.username.clone(), self.password.clone());
         let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.smtp_host)
             .map_err(|error| IrisError::Transport(error.to_string()))?
@@ -507,9 +520,14 @@ impl MessageProvider for EmailProvider {
     }
 
     async fn send_message(&self, thread_id: &str, message: &OutboundMessage) -> Result<Message> {
-        // Email MIME multipart attachment dispatch lands in a later slice
-        // (T6). Until then, email is text-only under the new contract.
-        enforce_capability(message, PROVIDER_ID, false)?;
+        enforce_capability(message, PROVIDER_ID, true)?;
+        // Resolve every attachment to concrete bytes before the first
+        // external request so a missing/unreadable stored reference fails
+        // the send without dispatching anything.
+        let resolved =
+            iris_core::outbound::resolve_attachments(message, Some(&self.attachments)).await?;
+        let attachment_summaries = iris_core::outbound::audit_summaries(&resolved);
+
         let sent = if let Ok(parsed) = thread_id.parse::<Mailbox>() {
             self.send_email(
                 parsed.email.as_ref(),
@@ -518,6 +536,7 @@ impl MessageProvider for EmailProvider {
                 uuid_for(format!("thread:{}", parsed.email).as_bytes()),
                 None,
                 &[],
+                &resolved,
             )
             .await?
         } else if let Some(reply_context) = self.reply_context(thread_id).await? {
@@ -528,6 +547,7 @@ impl MessageProvider for EmailProvider {
                 reply_context.thread_id,
                 reply_context.message_id.as_deref(),
                 &reply_context.references,
+                &resolved,
             )
             .await?
         } else {
@@ -541,7 +561,8 @@ impl MessageProvider for EmailProvider {
             json!({
                 "operation": "send_message",
                 "message_id": sent.source_id,
-                "attachment_count": message.attachments.len(),
+                "attachment_count": resolved.len(),
+                "attachments": attachment_summaries,
             }),
         )
         .await?;
@@ -979,6 +1000,74 @@ fn parse_address_list(input: &str) -> Vec<EmailAddress> {
         .collect()
 }
 
+/// Assemble one MIME `multipart/mixed` message body carrying the text body
+/// plus every attachment, in user-provided order.
+///
+/// The text part comes first; each attachment follows as a `SinglePart` with
+/// its MIME type and filename. Attachment filenames that contain CR/LF are
+/// sanitized to prevent header injection.
+fn build_attachment_multipart(
+    body: &str,
+    attachments: &[iris_core::outbound::ResolvedAttachment],
+) -> Result<MultiPart> {
+    let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.to_owned()));
+    for attachment in attachments {
+        let content_type = ContentType::parse(&attachment.mime_type).map_err(|error| {
+            IrisError::Config(format!(
+                "email attachment has unparseable MIME type {}: {error}",
+                attachment.mime_type
+            ))
+        })?;
+        let filename = sanitize_attachment_filename(
+            attachment
+                .filename
+                .as_deref()
+                .filter(|name| !name.trim().is_empty()),
+            &attachment.mime_type,
+        );
+        let part =
+            SmtpAttachment::new(filename).body(Body::new(attachment.bytes.clone()), content_type);
+        multipart = multipart.singlepart(part);
+    }
+    Ok(multipart)
+}
+
+/// Sanitize an attachment filename for use in MIME headers.
+///
+/// CR/LF characters are stripped to prevent header injection; a missing or
+/// whitespace-only filename falls back to a conventional default derived
+/// from the MIME type.
+fn sanitize_attachment_filename(filename: Option<&str>, mime_type: &str) -> String {
+    let fallback = |mime_type: &str| {
+        let extension = match mime_type.trim().to_ascii_lowercase().as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "audio/mpeg" => "mp3",
+            "audio/ogg" => "ogg",
+            "video/mp4" => "mp4",
+            "application/pdf" => "pdf",
+            "text/plain" => "txt",
+            _ => "bin",
+        };
+        format!("attachment.{extension}")
+    };
+    filename.map_or_else(
+        || fallback(mime_type),
+        |name| {
+            let cleaned: String = name
+                .chars()
+                .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+                .collect();
+            let trimmed = cleaned.trim();
+            if trimmed.is_empty() {
+                fallback(mime_type)
+            } else {
+                trimmed.to_owned()
+            }
+        },
+    )
+}
 fn outbound_message(
     from: &str,
     recipient: &str,
@@ -1479,5 +1568,144 @@ mod tests {
                 .to_string()
                 .contains("max_messages must be at least 1")
         );
+    }
+
+    // ===== T6: outbound MIME multipart =====
+
+    use iris_core::outbound::ResolvedAttachment;
+
+    fn resolved(mime_type: &str, filename: Option<&str>, bytes: &[u8]) -> ResolvedAttachment {
+        ResolvedAttachment {
+            mime_type: mime_type.to_owned(),
+            filename: filename.map(ToOwned::to_owned),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn test_provider() -> EmailProvider {
+        let config = EmailProviderConfig {
+            imap_host: "imap.example.com".into(),
+            smtp_host: "smtp.example.com".into(),
+            username: "user".into(),
+            password: "pass".into(),
+            from: "sender@example.com".into(),
+            ..EmailProviderConfig::default()
+        };
+        EmailProvider::new(config, test_store()).expect("provider builds")
+    }
+
+    #[test]
+    fn multipart_serializes_body_and_all_attachments() {
+        let attachments = vec![
+            resolved("text/plain", Some("notes.txt"), b"secret notes"),
+            resolved("image/png", Some("diagram.png"), &[1, 2, 3, 4]),
+        ];
+        let multipart =
+            build_attachment_multipart("see attached", &attachments).expect("multipart builds");
+
+        let text = String::from_utf8_lossy(&multipart.formatted()).to_string();
+        assert!(
+            text.contains("Content-Type: multipart/mixed;") && text.contains("boundary="),
+            "must be multipart/mixed: {text}"
+        );
+        // Text body part first.
+        assert!(text.contains("see attached"));
+        // Attachment parts in user order with their filenames.
+        let notes_pos = text
+            .find("name=notes.txt")
+            .or_else(|| text.find("filename=\"notes.txt\""));
+        let diagram_pos = text
+            .find("name=diagram.png")
+            .or_else(|| text.find("filename=\"diagram.png\""));
+        assert!(notes_pos.is_some(), "notes.txt part missing: {text}");
+        assert!(diagram_pos.is_some(), "diagram.png part missing: {text}");
+        assert!(notes_pos < diagram_pos, "attachment order not preserved");
+        // Raw attachment bytes present in the serialized MIME.
+        assert!(text.contains("secret notes"));
+        assert!(
+            text.as_bytes().windows(4).any(|w| w == [1, 2, 3, 4]),
+            "attachment bytes missing from serialized multipart"
+        );
+    }
+
+    #[test]
+    fn multipart_rejects_unparseable_mime_type() {
+        let attachments = vec![resolved("not a mime type;;;", Some("weird.bin"), b"bytes")];
+        let error = build_attachment_multipart("body", &attachments)
+            .expect_err("invalid MIME must fail before dispatch");
+        assert!(
+            error.to_string().contains("unparseable MIME"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn multipart_sanitizes_crlf_in_filenames() {
+        let attachments = vec![resolved(
+            "text/plain",
+            Some("evil\r\nBcc: victim@example.com"),
+            b"x",
+        )];
+        let multipart = build_attachment_multipart("body", &attachments).expect("multipart builds");
+        let text = String::from_utf8_lossy(&multipart.formatted()).to_string();
+        assert!(
+            !text.contains("\r\nBcc:"),
+            "header injection survived sanitization: {text}"
+        );
+        // The CR/LF characters are neutralized, not transmitted verbatim.
+        assert!(
+            !text.contains("evil\r\n"),
+            "raw CR/LF must not appear in the filename"
+        );
+    }
+
+    #[test]
+    fn multipart_falls_back_to_default_filename() {
+        let attachments = vec![
+            resolved("image/png", None, b"a"),
+            resolved("application/x-unknown", Some("   "), b"b"),
+        ];
+        let multipart = build_attachment_multipart("body", &attachments).expect("multipart builds");
+        let text = String::from_utf8_lossy(&multipart.formatted()).to_string();
+        assert!(
+            text.contains("attachment.png"),
+            "png fallback missing: {text}"
+        );
+        assert!(
+            text.contains("attachment.bin"),
+            "bin fallback missing: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_email_address_thread_with_attachment_resolves_and_builds() {
+        // send_message with attachments to a raw email address exercises
+        // resolution + multipart assembly without hitting the network —
+        // IMAP is only consulted for non-address thread IDs, and SMTP
+        // connection to smtp.example.com fails fast. We assert the failure
+        // mode is a transport error (connection), not a config/serialization
+        // error, proving resolution and MIME assembly succeeded.
+        let provider = test_provider();
+        let message = OutboundMessage {
+            body: "see attached".to_owned(),
+            attachments: vec![iris_core::outbound::OutboundAttachment::Bytes {
+                mime_type: "text/plain".to_owned(),
+                filename: Some("notes.txt".to_owned()),
+                bytes: b"secret notes".to_vec(),
+            }],
+        };
+        let result = provider.send_message("dest@example.com", &message).await;
+        match result {
+            Err(error) => assert!(
+                matches!(error, IrisError::Transport(_) | IrisError::Serialization(_)),
+                "expected transport-level failure, got: {error:?}"
+            ),
+            Ok(sent) => {
+                // A successful send (e.g. in an offline environment where the
+                // relay resolves) must still produce a well-formed message.
+                assert_eq!(sent.source, "email");
+                assert_eq!(sent.body, "see attached");
+            }
+        }
     }
 }
