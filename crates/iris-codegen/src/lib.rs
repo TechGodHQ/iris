@@ -25,6 +25,7 @@ pub fn iris_generate_config() -> GenerateConfig {
         http_dispatch_fn: "super::execute_generated_operation".to_string(),
         http_state_type: "crate::app::AppState".to_string(),
         sse_binding_prefix: "super::".to_string(),
+        http_raw_dispatch_fn: "super::execute_generated_raw_operation".to_string(),
         generator_name: "hydra (iris)".to_string(),
     }
 }

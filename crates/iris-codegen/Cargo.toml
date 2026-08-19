@@ -10,8 +10,8 @@ description = "Code generation for Iris — hydra-backed, keeps CLI, MCP, and HT
 workspace = true
 
 [dependencies]
-hydra-core = { git = "https://github.com/TechGodHQ/hydra.git", tag = "v0.1.0" }
-hydra-codegen = { git = "https://github.com/TechGodHQ/hydra.git", tag = "v0.1.0" }
+hydra-core = { git = "https://github.com/TechGodHQ/hydra.git", tag = "v0.1.1" }
+hydra-codegen = { git = "https://github.com/TechGodHQ/hydra.git", tag = "v0.1.1" }
 anyhow = { workspace = true }
 
 [dev-dependencies]
