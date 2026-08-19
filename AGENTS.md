@@ -83,7 +83,7 @@ cargo fmt --all -- --check
 
 - Commits should use Shiv's global git identity.
 - Runner-generated commits may include `Co-authored-by: Archon <archon@purelymail.com>`.
-- Do not merge PRs automatically; human review/merge is required.
+- Auto-merge is permitted per the standing gate policy: CI green and gate confidence >= 0.80.
 - Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`.
 
 ## OpenSpec
