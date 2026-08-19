@@ -494,6 +494,18 @@ impl MessageProvider for TelegramProvider {
 
     async fn send_message(&self, thread_id: &str, message: &OutboundMessage) -> Result<Message> {
         enforce_capability(message, PROVIDER_ID, true)?;
+
+        // Resolve attachments (if any) BEFORE resolving the chat id:
+        // resolve_chat_id may issue an external getUpdates request for UUID
+        // thread ids, and the frozen outbound contract requires a missing or
+        // unreadable stored attachment to fail the send before the
+        // provider's first external request.
+        let resolved = if message.is_text_only() {
+            Vec::new()
+        } else {
+            iris_core::outbound::resolve_attachments(message, Some(&self.attachments)).await?
+        };
+
         let chat_id = self.resolve_chat_id(thread_id).await?;
 
         if message.is_text_only() {
@@ -522,15 +534,10 @@ impl MessageProvider for TelegramProvider {
             return Ok(sent);
         }
 
-        // Attachment path: resolve every attachment to concrete bytes before
-        // the first external request so a missing/unreadable stored reference
-        // fails the send without partially dispatching.
-        let resolved =
-            iris_core::outbound::resolve_attachments(message, Some(&self.attachments)).await?;
-
-        // First attachment carries the message body as its caption; each
-        // additional attachment is a follow-up request with an empty caption.
-        // No Telegram albums in this change.
+        // Attachment path: attachments were resolved above, before the chat
+        // id lookup. First attachment carries the message body as its
+        // caption; each additional attachment is a follow-up request with an
+        // empty caption. No Telegram albums in this change.
         let mut sent_first: Option<Message> = None;
         let mut dispatched: Vec<iris_core::outbound::ResolvedAttachment> = Vec::new();
         for (index, attachment) in resolved.iter().enumerate() {
@@ -1918,6 +1925,58 @@ mod tests {
         assert!(
             !metadata_text.contains("base64"),
             "audit metadata must not contain base64 payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_stored_attachment_resolution_fails_before_any_request() {
+        // Store that fails every lookup.
+        struct FailingStore;
+        impl std::fmt::Debug for FailingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("FailingStore")
+            }
+        }
+        #[async_trait]
+        impl AttachmentStore for FailingStore {
+            async fn store(&self, _content: AttachmentContent) -> Result<AttachmentRef> {
+                Err(IrisError::Storage("read-only test store".into()))
+            }
+            async fn get(&self, id: &Uuid) -> Result<AttachmentContent> {
+                Err(IrisError::NotFound(format!("attachment: {id}")))
+            }
+            async fn delete(&self, _id: &Uuid) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // Empty server: ANY request (getUpdates for UUID thread resolution,
+        // or a media send) would fail the test via the strict assertion below.
+        let server = wiremock::MockServer::start().await;
+
+        let provider =
+            TelegramProvider::with_base_url("123:abc", server.uri(), Arc::new(FailingStore))
+                .expect("provider builds");
+
+        let message = OutboundMessage {
+            body: "forward this".to_owned(),
+            attachments: vec![OutboundAttachment::Stored(Uuid::new_v4())],
+        };
+        // UUID thread id would force resolve_chat_id into getUpdates —
+        // the resolution error must fire before any of that.
+        let error = provider
+            .send_message(&Uuid::new_v4().to_string(), &message)
+            .await
+            .expect_err("missing stored attachment must fail the send");
+
+        assert!(
+            error.to_string().contains("could not be resolved"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "no external request may occur before attachment resolution"
         );
     }
 
