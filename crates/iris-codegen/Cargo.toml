@@ -4,15 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Code generation for Iris — keeps CLI, MCP, and HTTP surfaces in sync"
+description = "Code generation for Iris — hydra-backed, keeps CLI, MCP, and HTTP surfaces in sync"
 
 [lints]
 workspace = true
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_yaml = "0.9"
+hydra-core = { git = "https://github.com/TechGodHQ/hydra.git", branch = "main" }
+hydra-codegen = { git = "https://github.com/TechGodHQ/hydra.git", branch = "main" }
 anyhow = { workspace = true }
 
 [dev-dependencies]

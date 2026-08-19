@@ -1,5 +1,32 @@
 {
-  "generated_from": "api/operations.yaml",
+  "locations": {
+    "audit_query": {
+      "action": "query",
+      "limit": "query",
+      "provider": "query",
+      "since": "query",
+      "source_id": "query",
+      "until": "query"
+    },
+    "list_contacts": {
+      "cursor": "query",
+      "limit": "query"
+    },
+    "list_messages": {
+      "before": "query",
+      "limit": "query",
+      "thread_id": "path"
+    },
+    "list_threads": {
+      "cursor": "query",
+      "limit": "query"
+    },
+    "send_message": {
+      "body": "body",
+      "provider": "body",
+      "thread_id": "path"
+    }
+  },
   "tools": [
     {
       "description": "List normalized messages in a thread.",

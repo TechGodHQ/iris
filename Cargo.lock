@@ -725,6 +725,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "hydra-codegen"
+version = "0.1.0"
+source = "git+https://github.com/TechGodHQ/hydra.git?branch=main#b233a1314cf32f65518c96a7175ae14b1f337233"
+dependencies = [
+ "anyhow",
+ "hydra-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
+name = "hydra-core"
+version = "0.1.0"
+source = "git+https://github.com/TechGodHQ/hydra.git?branch=main#b233a1314cf32f65518c96a7175ae14b1f337233"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "hyper"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -997,10 +1020,9 @@ name = "iris-codegen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hydra-codegen",
+ "hydra-core",
  "pretty_assertions",
- "serde",
- "serde_json",
- "serde_yaml",
  "tempfile",
 ]
 
