@@ -550,18 +550,30 @@ impl MessageProvider for TelegramProvider {
                     // A multi-request send that fails after earlier requests
                     // were accepted records a content-free partial-dispatch
                     // audit event with an explicit non-success outcome; the
-                    // overall operation still returns the error.
-                    self.record(
-                        AuditAction::Send,
-                        Some(thread_id.to_owned()),
-                        json!({
-                            "operation": "send_message",
-                            "outcome": "partial_dispatch",
-                            "attachment_count": dispatched.len(),
-                            "attachments": iris_core::outbound::audit_summaries(&dispatched),
-                        }),
-                    )
-                    .await?;
+                    // overall operation still returns the error. A failure
+                    // of the very first request dispatched nothing, so no
+                    // partial-dispatch event applies. An audit-write failure
+                    // here must not mask the original send error.
+                    if !dispatched.is_empty() {
+                        let audit_outcome = self
+                            .record(
+                                AuditAction::Send,
+                                Some(thread_id.to_owned()),
+                                json!({
+                                    "operation": "send_message",
+                                    "outcome": "partial_dispatch",
+                                    "attachment_count": dispatched.len(),
+                                    "attachments": iris_core::outbound::audit_summaries(&dispatched),
+                                }),
+                            )
+                            .await;
+                        if let Err(audit_error) = audit_outcome {
+                            tracing::warn!(
+                                error = %audit_error,
+                                "failed to record partial-dispatch audit event"
+                            );
+                        }
+                    }
                     return Err(error);
                 }
             }
@@ -1906,6 +1918,51 @@ mod tests {
         assert!(
             !metadata_text.contains("base64"),
             "audit metadata must not contain base64 payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_first_request_failure_records_no_partial_dispatch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let audit = Arc::new(SendAudit::default());
+        let provider = TelegramProvider::with_base_url("123:abc", server.uri(), test_store())
+            .expect("provider builds")
+            .with_audit(audit.clone());
+
+        // The very first media request fails — nothing was dispatched, so
+        // no partial-dispatch audit event may be recorded.
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "description": "chat not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let message = OutboundMessage {
+            body: "attempt".to_owned(),
+            attachments: vec![OutboundAttachment::Bytes {
+                mime_type: "image/png".to_owned(),
+                filename: Some("first.png".to_owned()),
+                bytes: vec![1],
+            }],
+        };
+        let error = provider
+            .send_message("-100", &message)
+            .await
+            .expect_err("first request failure must error the send");
+
+        assert!(
+            error.to_string().contains("chat not found"),
+            "error should carry the failed request description: {error}"
+        );
+        assert!(
+            audit.events.lock().unwrap().is_empty(),
+            "no audit event may be recorded when nothing was dispatched"
         );
     }
 
