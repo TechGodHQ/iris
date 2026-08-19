@@ -16,7 +16,7 @@
 
 ## Surfaces
 
-- [ ] T9: Add `subscribe_events` SSE contract at `GET /v1/events` and generated route/CLI metadata.
-- [ ] T10: Implement SSE status/error schemas, provider/thread filters, 15-second wire-idle heartbeat, and disconnect cleanup.
-- [ ] T11: Implement `iris watch` URL configuration, SSE parsing, JSONL stdout, diagnostics, and aggregate/filtered error exit policies.
-- [ ] T12: Add HTTP/CLI behavior tests and run build, tests, clippy, format, and codegen freshness gates.
+- [x] T9: Add `subscribe_events` SSE contract at `GET /v1/events` and generated route/CLI metadata.
+- [x] T10: Implement SSE status/error schemas, provider/thread filters, 15-second wire-idle heartbeat, and disconnect cleanup.
+- [x] T11: Implement `iris watch` URL configuration, SSE parsing, JSONL stdout, diagnostics, and aggregate/filtered error exit policies.
+- [x] T12: Add HTTP/CLI behavior tests and run build, tests, clippy, format, and codegen freshness gates.
