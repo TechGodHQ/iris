@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use iris_core::{
     AuditAction, AuditEntry, AuditFilter, AuditLog, Contact, IrisError, Message, MessageProvider,
-    Thread,
+    OutboundMessage, Thread,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -157,7 +157,9 @@ impl McpServer {
             Some(provider_id) => self.provider_by_id(provider_id)?,
             None => self.provider_for_thread(&args.thread_id).await?,
         };
-        Ok(provider.send_message(&args.thread_id, &args.body).await?)
+        Ok(provider
+            .send_message(&args.thread_id, &OutboundMessage::text(&args.body))
+            .await?)
     }
 
     async fn audit_query(&self, arguments: &Value) -> anyhow::Result<Vec<AuditEntry>> {

@@ -15,10 +15,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use iris_core::model::Attachment;
+use iris_core::outbound::enforce_capability;
 use iris_core::{
     AttachmentContent, AttachmentStore, AuditAction, AuditEvent, AuditLog, Contact, IrisError,
-    Message, MessageKind, MessageProvider, MessageStream, ProviderCapability, ProviderMetadata,
-    Result, Thread,
+    Message, MessageKind, MessageProvider, MessageStream, OutboundMessage, ProviderCapability,
+    ProviderMetadata, Result, Thread,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -449,12 +450,15 @@ impl MessageProvider for TelegramProvider {
         Ok(contacts)
     }
 
-    async fn send_message(&self, thread_id: &str, body: &str) -> Result<Message> {
+    async fn send_message(&self, thread_id: &str, message: &OutboundMessage) -> Result<Message> {
+        // Telegram multipart media dispatch lands in a later slice (T5).
+        // Until then, telegram is text-only under the new contract.
+        enforce_capability(message, PROVIDER_ID, false)?;
         let chat_id = self.resolve_chat_id(thread_id).await?;
         let response = self
             .client
             .post(self.method_url("sendMessage"))
-            .json(&json!({ "chat_id": chat_id, "text": body }))
+            .json(&json!({ "chat_id": chat_id, "text": message.body }))
             .send()
             .await
             .map_err(|error| IrisError::Transport(error.to_string()))?;
@@ -462,14 +466,18 @@ impl MessageProvider for TelegramProvider {
             .json()
             .await
             .map_err(|error| IrisError::Serialization(error.to_string()))?;
-        let message = envelope.into_result()?.to_message();
+        let sent = envelope.into_result()?.to_message();
         self.record(
             AuditAction::Send,
             Some(thread_id.to_owned()),
-            json!({ "operation": "send_message", "message_id": message.source_id }),
+            json!({
+                "operation": "send_message",
+                "message_id": sent.source_id,
+                "attachment_count": message.attachments.len(),
+            }),
         )
         .await?;
-        Ok(message)
+        Ok(sent)
     }
 
     /// Subscribe to a fallible realtime stream of normalized messages.

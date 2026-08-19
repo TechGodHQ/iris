@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use iris_core::outbound::enforce_capability;
 use iris_core::{
     AuditAction, AuditEvent, AuditLog, Contact, IrisError, Message, MessageKind, MessageProvider,
-    ProviderCapability, ProviderMetadata, Result, Thread,
+    OutboundMessage, ProviderCapability, ProviderMetadata, Result, Thread,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -250,7 +251,9 @@ impl MessageProvider for SmsProvider {
         Ok(contacts)
     }
 
-    async fn send_message(&self, thread_id: &str, body: &str) -> Result<Message> {
+    async fn send_message(&self, thread_id: &str, message: &OutboundMessage) -> Result<Message> {
+        enforce_capability(message, PROVIDER_ID, false)?;
+        let body = message.body.as_str();
         let records = self.sms_records().await?;
         let phone = resolve_phone(
             thread_id,
