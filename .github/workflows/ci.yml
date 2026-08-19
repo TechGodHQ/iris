@@ -88,3 +88,19 @@ jobs:
 
       - name: Run audit
         run: cargo audit
+
+  creed:
+    name: Creed context drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install creed
+        run: go install github.com/techgodhq/creed@v0.3.0
+
+      - name: Emitted agent context must match .creed source
+        run: creed diff
