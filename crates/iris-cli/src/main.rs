@@ -10,6 +10,8 @@ mod generated {
 
 use clap::{Parser, Subcommand};
 
+mod watch;
+
 #[derive(Parser)]
 #[command(name = "iris")]
 #[command(version, about = "LLM-first, source-agnostic messaging system")]
