@@ -81,6 +81,31 @@ impl ResolvedAttachment {
             bytes: content.bytes,
         }
     }
+
+    /// Content-free audit summary for this attachment.
+    ///
+    /// Records only the MIME type, filename, and byte count — never raw
+    /// bytes or base64 — so audit entries can describe attachments
+    /// without reconstructing their content.
+    #[must_use]
+    pub fn audit_summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "mime_type": self.mime_type,
+            "filename": self.filename,
+            "byte_count": self.bytes.len(),
+        })
+    }
+}
+
+/// Content-free audit summaries for a list of resolved attachments.
+///
+/// See [`ResolvedAttachment::audit_summary`] for the per-attachment shape.
+#[must_use]
+pub fn audit_summaries(attachments: &[ResolvedAttachment]) -> Vec<serde_json::Value> {
+    attachments
+        .iter()
+        .map(ResolvedAttachment::audit_summary)
+        .collect()
 }
 
 /// Resolve the attachments of `message` against an optional `store`.

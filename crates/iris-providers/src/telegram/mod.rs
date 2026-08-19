@@ -34,6 +34,7 @@ const METADATA: ProviderMetadata = ProviderMetadata {
     capabilities: &[
         ProviderCapability::ListMessages,
         ProviderCapability::SendMessages,
+        ProviderCapability::SendAttachments,
         ProviderCapability::ListThreads,
         ProviderCapability::ListContacts,
         ProviderCapability::ReceiveRealtime,
@@ -174,6 +175,47 @@ impl TelegramProvider {
                 })
             })
             .collect())
+    }
+
+    /// Send one media request for a resolved attachment, selecting the
+    /// Telegram Bot API method by MIME type.
+    ///
+    /// `sendPhoto` / `sendAudio` / `sendVideo` / `sendDocument` are selected
+    /// from the attachment's MIME type; unknown types fall back to
+    /// `sendDocument`. The caption rides on whichever request the caller
+    /// assigns it to (the first attachment per the outbound contract).
+    async fn send_media_request(
+        &self,
+        chat_id: i64,
+        attachment: &iris_core::outbound::ResolvedAttachment,
+        caption: &str,
+    ) -> Result<Message> {
+        let method = telegram_media_method(&attachment.mime_type);
+        let filename = attachment
+            .filename
+            .clone()
+            .unwrap_or_else(|| default_filename(&attachment.mime_type));
+        let file_part = reqwest::multipart::Part::bytes(attachment.bytes.clone())
+            .file_name(filename)
+            .mime_str(&attachment.mime_type)
+            .map_err(|error| IrisError::Config(format!("invalid attachment MIME type: {error}")))?;
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("caption", caption.to_owned())
+            .part(media_field_name(method), file_part);
+
+        let response = self
+            .client
+            .post(self.method_url(method))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| IrisError::Transport(error.to_string()))?;
+        let envelope: TelegramResponse<TelegramMessage> = response
+            .json()
+            .await
+            .map_err(|error| IrisError::Serialization(error.to_string()))?;
+        Ok(envelope.into_result()?.to_message())
     }
 
     async fn get_updates(
@@ -451,29 +493,89 @@ impl MessageProvider for TelegramProvider {
     }
 
     async fn send_message(&self, thread_id: &str, message: &OutboundMessage) -> Result<Message> {
-        // Telegram multipart media dispatch lands in a later slice (T5).
-        // Until then, telegram is text-only under the new contract.
-        enforce_capability(message, PROVIDER_ID, false)?;
+        enforce_capability(message, PROVIDER_ID, true)?;
         let chat_id = self.resolve_chat_id(thread_id).await?;
-        let response = self
-            .client
-            .post(self.method_url("sendMessage"))
-            .json(&json!({ "chat_id": chat_id, "text": message.body }))
-            .send()
-            .await
-            .map_err(|error| IrisError::Transport(error.to_string()))?;
-        let envelope: TelegramResponse<TelegramMessage> = response
-            .json()
-            .await
-            .map_err(|error| IrisError::Serialization(error.to_string()))?;
-        let sent = envelope.into_result()?.to_message();
+
+        if message.is_text_only() {
+            let response = self
+                .client
+                .post(self.method_url("sendMessage"))
+                .json(&json!({ "chat_id": chat_id, "text": message.body }))
+                .send()
+                .await
+                .map_err(|error| IrisError::Transport(error.to_string()))?;
+            let envelope: TelegramResponse<TelegramMessage> = response
+                .json()
+                .await
+                .map_err(|error| IrisError::Serialization(error.to_string()))?;
+            let sent = envelope.into_result()?.to_message();
+            self.record(
+                AuditAction::Send,
+                Some(thread_id.to_owned()),
+                json!({
+                    "operation": "send_message",
+                    "message_id": sent.source_id,
+                    "attachment_count": 0,
+                }),
+            )
+            .await?;
+            return Ok(sent);
+        }
+
+        // Attachment path: resolve every attachment to concrete bytes before
+        // the first external request so a missing/unreadable stored reference
+        // fails the send without partially dispatching.
+        let resolved =
+            iris_core::outbound::resolve_attachments(message, Some(&self.attachments)).await?;
+
+        // First attachment carries the message body as its caption; each
+        // additional attachment is a follow-up request with an empty caption.
+        // No Telegram albums in this change.
+        let mut sent_first: Option<Message> = None;
+        let mut dispatched: Vec<iris_core::outbound::ResolvedAttachment> = Vec::new();
+        for (index, attachment) in resolved.iter().enumerate() {
+            let caption = if index == 0 {
+                message.body.clone()
+            } else {
+                String::new()
+            };
+            match self.send_media_request(chat_id, attachment, &caption).await {
+                Ok(sent) => {
+                    if index == 0 {
+                        sent_first = Some(sent);
+                    }
+                    dispatched.push(attachment.clone());
+                }
+                Err(error) => {
+                    // A multi-request send that fails after earlier requests
+                    // were accepted records a content-free partial-dispatch
+                    // audit event with an explicit non-success outcome; the
+                    // overall operation still returns the error.
+                    self.record(
+                        AuditAction::Send,
+                        Some(thread_id.to_owned()),
+                        json!({
+                            "operation": "send_message",
+                            "outcome": "partial_dispatch",
+                            "attachment_count": dispatched.len(),
+                            "attachments": iris_core::outbound::audit_summaries(&dispatched),
+                        }),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            }
+        }
+
+        let sent = sent_first.expect("attachment loop ran at least once");
         self.record(
             AuditAction::Send,
             Some(thread_id.to_owned()),
             json!({
                 "operation": "send_message",
                 "message_id": sent.source_id,
-                "attachment_count": message.attachments.len(),
+                "attachment_count": resolved.len(),
+                "attachments": iris_core::outbound::audit_summaries(&resolved),
             }),
         )
         .await?;
@@ -829,6 +931,54 @@ impl TelegramUser {
     }
 }
 
+/// Select the Telegram Bot API method for an outbound attachment MIME type.
+///
+/// `image/*` routes to `sendPhoto`, `audio/*` to `sendAudio`, `video/*` to
+/// `sendVideo`; everything else (including unknown types) falls back to
+/// `sendDocument`, which accepts arbitrary files.
+fn telegram_media_method(mime_type: &str) -> &'static str {
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+    if mime_type.starts_with("image/") {
+        "sendPhoto"
+    } else if mime_type.starts_with("audio/") {
+        "sendAudio"
+    } else if mime_type.starts_with("video/") {
+        "sendVideo"
+    } else {
+        "sendDocument"
+    }
+}
+
+/// The multipart form field name carrying the media payload for a method.
+fn media_field_name(method: &str) -> &'static str {
+    match method {
+        "sendPhoto" => "photo",
+        "sendAudio" => "audio",
+        "sendVideo" => "video",
+        _ => "document",
+    }
+}
+
+/// Best-effort filename for attachments that carry none, derived from the
+/// common conventional extension of the MIME type.
+fn default_filename(mime_type: &str) -> String {
+    let extension = match mime_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/wav" => "wav",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        _ => "bin",
+    };
+    format!("attachment.{extension}")
+}
+
 fn dedupe_contacts(contacts: &mut Vec<Contact>) {
     let mut seen = HashMap::<String, usize>::new();
     contacts.retain(|contact| {
@@ -868,6 +1018,7 @@ fn unix_timestamp(timestamp: i64) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use iris_core::AttachmentRef;
+    use iris_core::outbound::OutboundAttachment;
     use std::sync::Mutex;
 
     /// In-memory attachment store for tests — captures every stored payload
@@ -1339,5 +1490,472 @@ mod tests {
             store.entries.lock().unwrap().is_empty(),
             "nothing should have been stored when download failed"
         );
+    }
+
+    // ===== T5: outbound multipart media sends =====
+
+    /// Recording audit sink for send-path assertions.
+    #[derive(Debug, Default)]
+    struct SendAudit {
+        events: Mutex<Vec<AuditEvent>>,
+    }
+
+    #[async_trait]
+    impl iris_core::AuditLog for SendAudit {
+        async fn record(&self, event: AuditEvent) -> iris_core::Result<iris_core::AuditEntry> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(iris_core::AuditEntry {
+                id: Uuid::new_v4(),
+                event,
+                prev_hash: None,
+                self_hash: "test".into(),
+            })
+        }
+
+        async fn query(
+            &self,
+            _filter: &iris_core::AuditFilter,
+        ) -> iris_core::Result<Vec<iris_core::AuditEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn verify_chain(&self) -> iris_core::Result<bool> {
+            Ok(true)
+        }
+
+        async fn record_once(
+            &self,
+            _provider: &str,
+            _source_id: &str,
+            event: AuditEvent,
+        ) -> iris_core::Result<iris_core::RecordOutcome> {
+            self.events.lock().unwrap().push(event);
+            Ok(iris_core::RecordOutcome::Inserted)
+        }
+    }
+
+    fn send_ok_body() -> serde_json::Value {
+        json!({
+            "ok": true,
+            "result": {
+                "message_id": 500,
+                "date": 1_700_000_100,
+                "chat": {"id": -100, "type": "group", "title": "Ops"},
+                "from": {"id": 7, "is_bot": true, "first_name": "Iris", "username": "iris_bot"},
+                "text": "sent"
+            }
+        })
+    }
+
+    /// Assert the multipart form posted to a Telegram media method: `chat_id`,
+    /// caption, media field name, filename, and that the body carries the
+    /// attachment bytes.
+    fn assert_media_form(
+        request: &wiremock::Request,
+        expected_path: &str,
+        expected_caption: &str,
+        expected_field: &str,
+        expected_filename: &str,
+        expected_bytes: &[u8],
+    ) {
+        assert_eq!(request.url.path(), expected_path);
+        let content_type = request
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "expected multipart form, got content-type {content_type}"
+        );
+        let body = request.body.as_slice();
+        let boundary = content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .expect("boundary present");
+        let text = String::from_utf8_lossy(body);
+        let parts: Vec<&str> = text.split(&format!("--{boundary}")).collect();
+        let field_names: Vec<String> = parts
+            .iter()
+            .filter_map(|part| {
+                let lowered = part.to_ascii_lowercase();
+                lowered.find("form-data; name=\"").map(|start| {
+                    let rest = &lowered[start + "form-data; name=\"".len()..];
+                    let end = rest.find('"').unwrap_or(rest.len());
+                    rest[..end].to_owned()
+                })
+            })
+            .collect();
+        let field_for = |name: &str| -> String {
+            parts
+                .iter()
+                .find(|part| {
+                    part.to_ascii_lowercase()
+                        .contains(&format!("form-data; name=\"{name}\""))
+                })
+                .map(|part| {
+                    let idx = part.find("\r\n\r\n").map_or(part.len(), |i| i + 4);
+                    part[idx..].trim_end_matches("\r\n").to_owned()
+                })
+                .unwrap_or_default()
+        };
+        // Every form should carry chat_id and caption text fields plus the
+        // media file part.
+        assert!(
+            field_names.contains(&"chat_id".to_owned()),
+            "chat_id field missing from form: {field_names:?}"
+        );
+        assert!(
+            field_names.contains(&expected_field.to_owned()),
+            "media field {expected_field} missing from form: {field_names:?}"
+        );
+        assert_eq!(field_for("chat_id"), "-100");
+        assert_eq!(field_for("caption"), expected_caption);
+        // The media part must carry the filename and the raw bytes.
+        let media_part = parts
+            .iter()
+            .find(|part| {
+                part.to_ascii_lowercase()
+                    .contains(&format!("form-data; name=\"{expected_field}\""))
+            })
+            .expect("media part present");
+        let lowered = media_part.to_ascii_lowercase();
+        assert!(
+            lowered.contains(&format!("filename=\"{expected_filename}\"")),
+            "filename {expected_filename} missing from media part headers"
+        );
+        assert!(
+            media_part
+                .as_bytes()
+                .windows(expected_bytes.len())
+                .any(|window| window == expected_bytes),
+            "media part body does not contain the attachment bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_photo_routes_to_send_photo_with_caption() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let provider = TelegramProvider::with_base_url("123:abc", server.uri(), test_store())
+            .expect("provider builds");
+
+        let mock = Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(send_ok_body()))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let sent = provider
+            .send_message(
+                "-100",
+                &OutboundMessage {
+                    body: "see this diagram".to_owned(),
+                    attachments: vec![OutboundAttachment::Bytes {
+                        mime_type: "image/png".to_owned(),
+                        filename: Some("diagram.png".to_owned()),
+                        bytes: vec![1, 2, 3, 4],
+                    }],
+                },
+            )
+            .await
+            .expect("photo send succeeds");
+
+        mock.wait_until_satisfied().await;
+        assert_eq!(
+            mock.received_requests().await.len(),
+            1,
+            "exactly one sendPhoto request"
+        );
+        assert_eq!(sent.source_id, "500");
+        assert_eq!(sent.kind, MessageKind::Text);
+        let requests = server.received_requests().await.unwrap();
+        assert_media_form(
+            &requests[0],
+            "/bot123:abc/sendPhoto",
+            "see this diagram",
+            "photo",
+            "diagram.png",
+            &[1, 2, 3, 4],
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_routes_by_mime_type() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let provider = TelegramProvider::with_base_url("123:abc", server.uri(), test_store())
+            .expect("provider builds");
+
+        for (mime, method_path) in [
+            ("image/png", "/bot123:abc/sendPhoto"),
+            ("audio/mpeg", "/bot123:abc/sendAudio"),
+            ("video/mp4", "/bot123:abc/sendVideo"),
+            ("application/pdf", "/bot123:abc/sendDocument"),
+            ("application/x-iris-unknown", "/bot123:abc/sendDocument"),
+        ] {
+            let mock = Mock::given(method("POST"))
+                .and(path(method_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(send_ok_body()))
+                .expect(1)
+                .mount_as_scoped(&server)
+                .await;
+
+            provider
+                .send_message(
+                    "-100",
+                    &OutboundMessage {
+                        body: "file".to_owned(),
+                        attachments: vec![OutboundAttachment::Bytes {
+                            mime_type: mime.to_owned(),
+                            filename: Some("file.bin".to_owned()),
+                            bytes: vec![9, 9, 9],
+                        }],
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("send for {mime} failed: {error}"));
+
+            mock.wait_until_satisfied().await;
+            assert_eq!(
+                mock.received_requests().await.len(),
+                1,
+                "exactly one request for {mime}"
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_owned()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/bot123:abc/sendPhoto",
+                "/bot123:abc/sendAudio",
+                "/bot123:abc/sendVideo",
+                "/bot123:abc/sendDocument",
+                "/bot123:abc/sendDocument",
+            ]
+        );
+        assert_media_form(
+            &requests[2],
+            "/bot123:abc/sendVideo",
+            "file",
+            "video",
+            "file.bin",
+            &[9, 9, 9],
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_first_attachment_carries_caption_followups_empty() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let provider = TelegramProvider::with_base_url("123:abc", server.uri(), test_store())
+            .expect("provider builds");
+
+        // First request: sendPhoto with caption.
+        let first = Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(send_ok_body()))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        // Second request: sendDocument, empty caption.
+        let second = Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendDocument"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(send_ok_body()))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let message = OutboundMessage {
+            body: "two files".to_owned(),
+            attachments: vec![
+                OutboundAttachment::Bytes {
+                    mime_type: "image/png".to_owned(),
+                    filename: Some("first.png".to_owned()),
+                    bytes: vec![1],
+                },
+                OutboundAttachment::Bytes {
+                    mime_type: "application/pdf".to_owned(),
+                    filename: Some("second.pdf".to_owned()),
+                    bytes: vec![2, 2],
+                },
+            ],
+        };
+        let sent = provider
+            .send_message("-100", &message)
+            .await
+            .expect("two-part send succeeds");
+
+        first.wait_until_satisfied().await;
+        second.wait_until_satisfied().await;
+        assert_eq!(first.received_requests().await.len(), 1);
+        assert_eq!(second.received_requests().await.len(), 1);
+        assert_eq!(sent.source_id, "500");
+        let requests = server.received_requests().await.unwrap();
+        // Order matters: photo (captioned) then document (empty caption).
+        let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_owned()).collect();
+        assert_eq!(
+            paths,
+            vec!["/bot123:abc/sendPhoto", "/bot123:abc/sendDocument"]
+        );
+        assert_media_form(
+            &requests[0],
+            "/bot123:abc/sendPhoto",
+            "two files",
+            "photo",
+            "first.png",
+            &[1],
+        );
+        assert_media_form(
+            &requests[1],
+            "/bot123:abc/sendDocument",
+            "",
+            "document",
+            "second.pdf",
+            &[2, 2],
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_partial_dispatch_failure_records_audit_and_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let audit = Arc::new(SendAudit::default());
+        let provider = TelegramProvider::with_base_url("123:abc", server.uri(), test_store())
+            .expect("provider builds")
+            .with_audit(audit.clone());
+
+        // First attachment succeeds...
+        let ok_mock = Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(send_ok_body()))
+            .up_to_n_times(1)
+            .mount_as_scoped(&server)
+            .await;
+        // ...second attachment fails.
+        let fail_mock = Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendDocument"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "description": "file is too large"
+            })))
+            .up_to_n_times(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let message = OutboundMessage {
+            body: "attempt".to_owned(),
+            attachments: vec![
+                OutboundAttachment::Bytes {
+                    mime_type: "image/png".to_owned(),
+                    filename: Some("ok.png".to_owned()),
+                    bytes: vec![1],
+                },
+                OutboundAttachment::Bytes {
+                    mime_type: "application/pdf".to_owned(),
+                    filename: Some("too-big.pdf".to_owned()),
+                    bytes: vec![2, 2, 2],
+                },
+            ],
+        };
+        let error = provider
+            .send_message("-100", &message)
+            .await
+            .expect_err("second request failure must error the send");
+
+        assert!(
+            error.to_string().contains("file is too large"),
+            "error should carry the failed request description: {error}"
+        );
+        assert_eq!(ok_mock.received_requests().await.len(), 1);
+        assert_eq!(fail_mock.received_requests().await.len(), 1);
+
+        let metadata_text = {
+            let mut events = audit.events.lock().unwrap();
+            assert_eq!(
+                events.len(),
+                1,
+                "exactly one audit event (partial dispatch)"
+            );
+            let event = events.remove(0);
+            drop(events);
+            assert_eq!(event.action, AuditAction::Send);
+            assert_eq!(event.source_id.as_deref(), Some("-100"));
+            assert_eq!(event.metadata["outcome"], "partial_dispatch");
+            assert_eq!(event.metadata["attachment_count"], 1);
+            let summaries = event.metadata["attachments"].as_array().unwrap();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0]["filename"], "ok.png");
+            event.metadata.to_string()
+        };
+        // Content-free: no raw bytes or base64 anywhere in the metadata.
+        assert!(
+            !metadata_text.contains("AQID"),
+            "no base64 of [1,2,3,4] in audit"
+        );
+        assert!(
+            !metadata_text.contains("base64"),
+            "audit metadata must not contain base64 payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_successful_attachment_send_audit_is_content_free() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let audit = Arc::new(SendAudit::default());
+        let provider = TelegramProvider::with_base_url("123:abc", server.uri(), test_store())
+            .expect("provider builds")
+            .with_audit(audit.clone());
+
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(send_ok_body()))
+            .mount(&server)
+            .await;
+
+        let message = OutboundMessage {
+            body: "audit me".to_owned(),
+            attachments: vec![OutboundAttachment::Bytes {
+                mime_type: "image/png".to_owned(),
+                filename: Some("a.png".to_owned()),
+                bytes: vec![7, 7, 7],
+            }],
+        };
+        provider
+            .send_message("-100", &message)
+            .await
+            .expect("send succeeds");
+
+        let metadata_text = {
+            let mut events = audit.events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            let event = events.remove(0);
+            drop(events);
+            assert_eq!(event.action, AuditAction::Send);
+            assert_eq!(event.metadata["attachment_count"], 1);
+            assert_eq!(event.metadata["attachments"][0]["filename"], "a.png");
+            assert_eq!(event.metadata["attachments"][0]["mime_type"], "image/png");
+            assert_eq!(event.metadata["attachments"][0]["byte_count"], 3);
+            assert!(event.metadata.get("message_id").is_some());
+            event.metadata.to_string()
+        };
+        assert!(
+            !metadata_text.contains("Bwc"),
+            "no base64 of [7,7,7] in audit"
+        );
+        assert!(!metadata_text.contains("base64"));
     }
 }

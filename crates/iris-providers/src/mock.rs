@@ -231,16 +231,7 @@ impl MessageProvider for MockProvider {
             is_outbound: true,
             metadata: serde_json::Value::Null,
         };
-        let attachment_summaries: Vec<serde_json::Value> = resolved
-            .iter()
-            .map(|attachment| {
-                json!({
-                    "mime_type": attachment.mime_type,
-                    "filename": attachment.filename,
-                    "byte_count": attachment.bytes.len(),
-                })
-            })
-            .collect();
+        let attachment_summaries = iris_core::outbound::audit_summaries(&resolved);
         self.outbound
             .lock()
             .map_err(|_| IrisError::Provider {
