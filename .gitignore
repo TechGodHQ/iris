@@ -21,3 +21,5 @@ Thumbs.db
 # Coverage
 tarpaulin-report.html
 cobertura.xml
+# spike scratch trees live on their own branches
+spikes/

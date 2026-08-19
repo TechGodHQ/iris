@@ -1,5 +1,5 @@
 //! Iris code generation — now a thin configuration layer over
-//! [hydra](https://github.com/TechGodHQ/hydra), TechGodHQ's shared
+//! [hydra](https://github.com/TechGodHQ/hydra), `TechGodHQ`'s shared
 //! projection layer.
 //!
 //! Iris keeps its `api/operations.yaml` contract and its committed
