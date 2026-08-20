@@ -33,7 +33,8 @@ fn get_providers_from_path(
     match config_path {
         None => providers_from_default_config(store, audit),
         Some(path) => {
-            let config = IrisConfig::from_path(path)?;
+            let mut config = IrisConfig::from_path(path)?;
+            config.apply_env_overrides()?;
             providers_from_config(&config, store, audit)
         }
     }

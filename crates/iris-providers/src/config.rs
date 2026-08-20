@@ -1,8 +1,9 @@
 //! Provider configuration loading and registry construction.
 //!
-//! Iris reads a TOML config file to decide which built-in providers to enable.
-//! Secrets may be provided inline for local development or by naming an
-//! environment variable. Env-backed secrets keep credentials out of config files.
+//! Iris reads TOML configuration and overlays environment configuration to
+//! decide which built-in providers to enable. Secrets may be provided inline
+//! for local development or by naming an environment variable. Env-backed
+//! secrets keep credentials out of config files.
 
 use std::{
     collections::BTreeMap,
@@ -21,6 +22,9 @@ use crate::telegram::TelegramProvider;
 
 /// Environment variable used to point Iris at a config file.
 pub const CONFIG_PATH_ENV: &str = "IRIS_CONFIG";
+
+/// Comma-separated provider ids enabled by environment configuration.
+pub const ENABLED_PROVIDERS_ENV: &str = "IRIS_ENABLED_PROVIDERS";
 
 /// Top-level Iris configuration.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -79,17 +83,23 @@ const fn default_enabled() -> bool {
 /// `./iris.toml` and then `$HOME/.config/iris/config.toml`; if neither exists,
 /// an empty config is returned.
 pub fn load_default_config() -> anyhow::Result<IrisConfig> {
-    if let Ok(path) = env::var(CONFIG_PATH_ENV) {
-        return IrisConfig::from_path(path);
-    }
-
-    for path in default_config_paths() {
+    let mut config = if let Ok(path) = env::var(CONFIG_PATH_ENV) {
+        let path = PathBuf::from(path);
         if path.exists() {
-            return IrisConfig::from_path(path);
+            IrisConfig::from_path(path)?
+        } else {
+            IrisConfig::default()
         }
-    }
-
-    Ok(IrisConfig::default())
+    } else {
+        default_config_paths()
+            .into_iter()
+            .find(|path| path.exists())
+            .map(IrisConfig::from_path)
+            .transpose()?
+            .unwrap_or_default()
+    };
+    config.apply_env_overrides()?;
+    Ok(config)
 }
 
 /// Default config file candidates when `IRIS_CONFIG` is not set.
@@ -113,6 +123,41 @@ impl IrisConfig {
         Self::from_toml(&input)
     }
 
+    /// Apply native Iris environment configuration over this file/default config.
+    pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
+        if let Ok(providers) = env::var(ENABLED_PROVIDERS_ENV) {
+            let ids: Vec<_> = providers
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .collect();
+            if ids.is_empty() {
+                anyhow::bail!("{ENABLED_PROVIDERS_ENV} must contain at least one provider id");
+            }
+            for provider in self.providers.values_mut() {
+                provider.enabled = false;
+            }
+            for id in ids {
+                self.providers.entry(id.to_owned()).or_default().enabled = true;
+            }
+        }
+        for (provider, fields) in provider_env_fields() {
+            if let Some(config) = self.providers.get_mut(*provider) {
+                for (field, variable) in *fields {
+                    if env::var_os(variable).is_some() {
+                        config.credentials.insert(
+                            (*field).to_owned(),
+                            SecretValue::FromEnv {
+                                env: (*variable).to_owned(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve enabled provider entries and their env-backed secrets.
     pub fn resolved_enabled_providers(&self) -> anyhow::Result<Vec<ResolvedProviderConfig>> {
         self.providers
@@ -133,6 +178,37 @@ impl IrisConfig {
     }
 }
 
+const fn provider_env_fields() -> &'static [(&'static str, &'static [(&'static str, &'static str)])]
+{
+    &[
+        ("mock", &[("mode", "IRIS_MOCK_MODE")]),
+        ("telegram", &[("bot_token", "IRIS_TELEGRAM_BOT_TOKEN")]),
+        (
+            "email",
+            &[
+                ("imap_host", "IRIS_EMAIL_IMAP_HOST"),
+                ("imap_port", "IRIS_EMAIL_IMAP_PORT"),
+                ("smtp_host", "IRIS_EMAIL_SMTP_HOST"),
+                ("smtp_port", "IRIS_EMAIL_SMTP_PORT"),
+                ("username", "IRIS_EMAIL_USERNAME"),
+                ("password", "IRIS_EMAIL_PASSWORD"),
+                ("mailbox", "IRIS_EMAIL_MAILBOX"),
+                ("from", "IRIS_EMAIL_FROM"),
+                ("page_size", "IRIS_EMAIL_PAGE_SIZE"),
+                ("max_messages", "IRIS_EMAIL_MAX_MESSAGES"),
+            ],
+        ),
+        (
+            "sms",
+            &[
+                ("ssh_host", "IRIS_SMS_SSH_HOST"),
+                ("ssh_command", "IRIS_SMS_SSH_COMMAND"),
+                ("self_number", "IRIS_SMS_SELF_NUMBER"),
+            ],
+        ),
+    ]
+}
+
 impl SecretValue {
     /// Resolve a secret value, reading from the environment when requested.
     pub fn resolve(&self) -> anyhow::Result<String> {
@@ -150,17 +226,17 @@ pub fn providers_from_default_config(
     attachments: &Arc<dyn AttachmentStore>,
     audit: &Arc<dyn AuditLog>,
 ) -> anyhow::Result<Vec<Arc<dyn MessageProvider>>> {
-    if let Ok(path) = env::var(CONFIG_PATH_ENV) {
-        return providers_from_config(&IrisConfig::from_path(path)?, attachments, audit);
+    let has_config_file = env::var(CONFIG_PATH_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .is_some_and(|path| path.exists())
+        || default_config_paths().into_iter().any(|path| path.exists());
+    let config = load_default_config()?;
+    if config.providers.is_empty() && !has_config_file {
+        Ok(vec![Arc::new(MockProvider::with_audit(audit.clone()))])
+    } else {
+        providers_from_config(&config, attachments, audit)
     }
-
-    for path in default_config_paths() {
-        if path.exists() {
-            return providers_from_config(&IrisConfig::from_path(path)?, attachments, audit);
-        }
-    }
-
-    Ok(vec![Arc::new(MockProvider::with_audit(audit.clone()))])
 }
 
 /// Build providers from a loaded config.
