@@ -1,0 +1,37 @@
+# Reference self-host deployment for Iris + Rite.
+# Copy `.env.example` values into your deployment environment; do not commit secrets.
+services:
+  iris:
+    image: ghcr.io/techgodhq/iris:latest
+    restart: unless-stopped
+    environment:
+      IRIS_ENABLED_PROVIDERS: ${IRIS_ENABLED_PROVIDERS:-telegram}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN}
+    volumes:
+      - iris-data:/data
+    ports:
+      # Iris currently has no authentication. Keep this bound to a private host
+      # or remove the mapping when only Rite/other private-network clients use it.
+      - "127.0.0.1:9876:9876"
+    networks:
+      - iris-rite
+
+  rite:
+    image: ghcr.io/techgodhq/rite:latest
+    restart: unless-stopped
+    depends_on:
+      iris:
+        condition: service_started
+    environment:
+      RITE_GITHUB_WEBHOOK_SECRET: ${RITE_GITHUB_WEBHOOK_SECRET:?set RITE_GITHUB_WEBHOOK_SECRET}
+      RITE_IRIS_BASE_URL: http://iris:9876
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - iris-rite
+
+networks:
+  iris-rite:
+
+volumes:
+  iris-data:

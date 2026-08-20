@@ -36,6 +36,33 @@ cargo run -- contacts
 cargo run -- serve
 ```
 
+## Self-hosting with Docker
+
+Published images are available from GitHub Container Registry after a release tag:
+`ghcr.io/techgodhq/iris:<version>` (or `:latest`). Iris currently has **no
+HTTP authentication** (tracked in COD-429), so bind it to localhost or place it
+only on a private network behind your own authenticated proxy.
+
+```bash
+docker run --rm \
+  --name iris \
+  --publish 127.0.0.1:9876:9876 \
+  --volume iris-data:/data \
+  --env IRIS_ENABLED_PROVIDERS=telegram \
+  --env TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}" \
+  ghcr.io/techgodhq/iris:latest
+```
+
+The image creates its provider configuration from `IRIS_ENABLED_PROVIDERS`.
+Set it to a comma-separated list such as `telegram,email`, supplying the
+provider credentials documented below, or mount a complete configuration at
+`/etc/iris/iris.mounted.toml`.
+
+For a reference Iris + Rite deployment, use
+[`deploy/docker-compose.yml`](deploy/docker-compose.yml). Set
+`TELEGRAM_BOT_TOKEN` and `RITE_GITHUB_WEBHOOK_SECRET` in its environment before
+running `docker compose -f deploy/docker-compose.yml up -d`.
+
 ## Configuration
 
 Iris reads provider configuration from TOML. Set `IRIS_CONFIG` to an explicit
