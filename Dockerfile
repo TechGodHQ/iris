@@ -22,7 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --system --home /data --shell /usr/sbin/nologin iris
 COPY --from=builder /usr/local/bin/iris /usr/local/bin/iris
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /etc/iris /data \
+    && chown -R iris:iris /etc/iris /data
 ENV IRIS_CONFIG=/etc/iris/iris.toml
 ENV IRIS_ATTACHMENT_DIR=/data/attachments
 ENV IRIS_AUDIT_DIR=/data/audit
