@@ -23,3 +23,6 @@ tarpaulin-report.html
 cobertura.xml
 # spike scratch trees live on their own branches
 spikes/
+
+# Creed sync state
+.creed/.outputs/
