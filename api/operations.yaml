@@ -78,6 +78,41 @@ operations:
         type: string
         required: false
         location: body
+      - name: attachments
+        description: >-
+          Attachments to send; each item is inline bytes (`mime_type` +
+          `data_base64`, optional `filename`) or a stored
+          `iris://attachment` reference (`stored_id`).
+        type: json
+        required: false
+        location: body
+        schema:
+          type: array
+          items:
+            oneOf:
+              - type: object
+                properties:
+                  mime_type:
+                    type: string
+                  filename:
+                    type: string
+                  data_base64:
+                    type: string
+                required: [mime_type, data_base64]
+                additionalProperties: false
+              - type: object
+                properties:
+                  stored_id:
+                    type: string
+                required: [stored_id]
+                additionalProperties: false
+        cli:
+          flag: attach
+          multiple: true
+          companions:
+            - flag: attach-mime
+              field: attach_mime
+              description: MIME type for the corresponding local-path --attach value.
   - name: audit_query
     description: Query tamper-evident provider audit events.
     method: GET

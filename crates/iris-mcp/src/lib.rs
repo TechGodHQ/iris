@@ -153,13 +153,16 @@ impl McpServer {
 
     async fn send_message(&self, arguments: &Value) -> anyhow::Result<Message> {
         let args: SendMessageArgs = serde_json::from_value(arguments.clone())?;
+        let attachments = iris_core::decode_attachments(args.attachments.as_ref())?;
+        let outbound = OutboundMessage {
+            body: args.body,
+            attachments,
+        };
         let provider = match args.provider.as_deref() {
             Some(provider_id) => self.provider_by_id(provider_id)?,
             None => self.provider_for_thread(&args.thread_id).await?,
         };
-        Ok(provider
-            .send_message(&args.thread_id, &OutboundMessage::text(&args.body))
-            .await?)
+        Ok(provider.send_message(&args.thread_id, &outbound).await?)
     }
 
     async fn audit_query(&self, arguments: &Value) -> anyhow::Result<Vec<AuditEntry>> {
@@ -332,6 +335,8 @@ struct SendMessageArgs {
     thread_id: String,
     body: String,
     provider: Option<String>,
+    #[serde(default)]
+    attachments: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -497,5 +502,131 @@ mod tests {
             5
         );
         assert_eq!(lines[1]["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn send_message_tool_accepts_inline_and_stored_attachments() {
+        use iris_core::AttachmentStore as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(iris_storage::LocalFsStore::new(tmp.path()));
+        let stored = store
+            .store(iris_core::AttachmentContent {
+                mime_type: "text/plain".to_string(),
+                filename: Some("stored.txt".to_string()),
+                bytes: b"stored-bytes".to_vec(),
+            })
+            .await
+            .unwrap();
+        let mock = std::sync::Arc::new(MockProvider::new().with_store(store));
+        let server = McpServer::new(
+            vec![mock.clone() as Arc<dyn MessageProvider>],
+            Arc::new(iris_audit::LocalFsAuditLog::new(tmp.path().join("audit"))),
+        );
+        // The mock mints a fresh thread UUID on every list_threads call, so
+        // thread-owner routing cannot match; route by explicit provider id.
+        let thread_id = "11111111-1111-1111-1111-111111111111".to_string();
+
+        let response = server
+            .handle_jsonrpc(json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": {
+                        "thread_id": thread_id,
+                        "body": "see files",
+                        "provider": "mock",
+                        "attachments": [
+                            {"mime_type": "image/png", "filename": "a.png", "data_base64": "aGk="},
+                            {"stored_id": stored.id.to_string()},
+                        ],
+                    }
+                }
+            }))
+            .await;
+
+        assert_eq!(response["error"], Value::Null, "{response}");
+        assert_eq!(response["result"]["isError"], false);
+        let sends = mock.recorded_sends().expect("records readable");
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].attachments.len(), 2);
+        assert_eq!(sends[0].attachments[0].bytes, b"hi".to_vec());
+        assert_eq!(
+            sends[0].attachments[1].filename.as_deref(),
+            Some("stored.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_tool_rejects_mixed_attachment_union() {
+        let response = server()
+            .handle_jsonrpc(json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": {
+                        "thread_id": "11111111-1111-1111-1111-111111111111",
+                        "body": "hello",
+                        "attachments": [{
+                            "mime_type": "image/png",
+                            "data_base64": "aGk=",
+                            "stored_id": "22222222-2222-2222-2222-222222222222",
+                        }],
+                    }
+                }
+            }))
+            .await;
+
+        assert_ne!(response["error"], Value::Null, "{response}");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("mixes"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn send_message_tool_rejects_invalid_stored_uuid() {
+        let response = server()
+            .handle_jsonrpc(json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": {
+                        "thread_id": "11111111-1111-1111-1111-111111111111",
+                        "body": "hello",
+                        "attachments": [{"stored_id": "not-a-uuid"}],
+                    }
+                }
+            }))
+            .await;
+
+        assert_ne!(response["error"], Value::Null, "{response}");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("invalid UUID"), "{message}");
+    }
+
+    #[test]
+    fn generated_send_message_schema_carries_declared_union() {
+        let tools = generated_tools().expect("generated tools parse");
+        let tool = tools["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == "send_message")
+            .expect("send_message tool");
+        let attachments = &tool["inputSchema"]["properties"]["attachments"];
+        assert_eq!(attachments["type"], "array");
+        let variants = attachments["items"]["oneOf"]
+            .as_array()
+            .expect("closed union variants");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0]["required"], json!(["mime_type", "data_base64"]));
+        assert_eq!(variants[0]["additionalProperties"], false);
+        assert_eq!(variants[1]["required"], json!(["stored_id"]));
+        assert_eq!(variants[1]["additionalProperties"], false);
     }
 }

@@ -11,6 +11,7 @@ pub mod outbound;
 pub mod provider;
 pub mod realtime;
 pub mod storage;
+pub mod wire;
 
 pub use audit::{AuditAction, AuditEntry, AuditEvent, AuditFilter, AuditLog, RecordOutcome};
 pub use error::{IrisError, Result};
@@ -22,3 +23,6 @@ pub use realtime::{
     RealtimeEventKind,
 };
 pub use storage::{AttachmentContent, AttachmentRef, AttachmentStore};
+pub use wire::{
+    FALLBACK_MIME_TYPE, PlannedAttachment, decode_attachments, infer_mime_type, plan_attachments,
+};

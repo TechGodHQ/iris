@@ -44,6 +44,10 @@ struct AuditQuery {
 pub struct SendMessageRequest {
     pub body: String,
     pub provider: Option<String>,
+    /// Optional attachments as the closed inline/stored union; decoded by
+    /// [`iris_core::decode_attachments`] before dispatch.
+    #[serde(default)]
+    pub attachments: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,7 +297,14 @@ async fn send_message(
 ) -> Result<Json<Message>, (StatusCode, Json<ErrorResponse>)> {
     let thread_id = required_path(&input, "thread_id")?;
     let request: SendMessageRequest = serde_json::from_value(input.body).map_err(bad_request)?;
-    let provider = match request.provider.as_deref() {
+    let attachments = iris_core::decode_attachments(request.attachments.as_ref())
+        .map_err(|error| bad_request(error.to_string()))?;
+    let provider_id = request.provider;
+    let outbound = OutboundMessage {
+        body: request.body,
+        attachments,
+    };
+    let provider = match provider_id.as_deref() {
         Some(provider_id) => {
             let provider = provider_by_id(state, provider_id)?;
             let owner = provider_for_thread(state, &thread_id).await?;
@@ -310,7 +321,7 @@ async fn send_message(
         None => provider_for_thread(state, &thread_id).await?,
     };
     let message = provider
-        .send_message(&thread_id, &OutboundMessage::text(&request.body))
+        .send_message(&thread_id, &outbound)
         .await
         .map_err(|error| provider_error(provider.id(), &error))?;
     Ok(Json(message))
@@ -619,6 +630,7 @@ mod tests {
         contacts: Vec<Contact>,
         messages: Vec<Message>,
         fail_operation: Option<&'static str>,
+        outbound: std::sync::Mutex<Vec<(String, iris_core::OutboundMessage)>>,
     }
 
     impl FakeProvider {
@@ -638,7 +650,12 @@ mod tests {
                 contacts: Vec::new(),
                 messages: Vec::new(),
                 fail_operation: None,
+                outbound: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn recorded_outbound(&self) -> Vec<(String, iris_core::OutboundMessage)> {
+            self.outbound.lock().expect("outbound lock").clone()
         }
 
         fn with_threads(mut self, threads: Vec<Thread>) -> Self {
@@ -726,6 +743,10 @@ mod tests {
             message: &iris_core::OutboundMessage,
         ) -> iris_core::Result<Message> {
             self.maybe_fail("send_message")?;
+            self.outbound
+                .lock()
+                .expect("outbound lock")
+                .push((thread_id.to_string(), message.clone()));
             let thread_id = Uuid::parse_str(thread_id).map_err(|error| IrisError::Provider {
                 provider: self.id().to_string(),
                 message: error.to_string(),
@@ -992,6 +1013,130 @@ mod tests {
 
         assert_eq!(message.source, "email");
         assert_eq!(message.body, "hello");
+    }
+
+    #[tokio::test]
+    async fn send_message_with_inline_and_stored_attachments_dispatches() {
+        // A real LocalFsStore resolves the stored reference end-to-end; the
+        // fake provider records the decoded OutboundMessage it received.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(iris_storage::LocalFsStore::new(tmp.path()));
+        let stored_ref = store
+            .store(AttachmentContent {
+                mime_type: "text/plain".to_string(),
+                filename: Some("stored.txt".to_string()),
+                bytes: b"stored-bytes".to_vec(),
+            })
+            .await
+            .unwrap();
+        let thread_id = Uuid::new_v4();
+        let fake = Arc::new(
+            FakeProvider::new("mock", "Mock").with_threads(vec![thread(thread_id, "mock", 16)]),
+        );
+        let state = AppState {
+            providers: vec![fake.clone() as Arc<dyn MessageProvider>],
+            thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            attachments: Arc::new(NullStore),
+            audit: Arc::new(iris_audit::LocalFsAuditLog::new(
+                "/tmp/iris-server-test-audit",
+            )),
+            sse: crate::sse::SseSettings::default(),
+        };
+        let mut input = input_with_thread(thread_id, &[]);
+        input.body = serde_json::json!({
+            "body": "see files",
+            "attachments": [
+                {"mime_type": "image/png", "filename": "a.png", "data_base64": "aGk="},
+                {"stored_id": stored_ref.id.to_string()},
+            ],
+        });
+
+        let Json(_message) = send_message(&state, input).await.unwrap();
+
+        let sends = fake.recorded_outbound();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].0, thread_id.to_string());
+        let outbound = &sends[0].1;
+        assert_eq!(outbound.body, "see files");
+        assert_eq!(outbound.attachments.len(), 2);
+        // Inline variant decoded with base64 bytes.
+        assert_eq!(
+            outbound.attachments[0],
+            iris_core::OutboundAttachment::Bytes {
+                mime_type: "image/png".to_owned(),
+                filename: Some("a.png".to_owned()),
+                bytes: b"hi".to_vec(),
+            }
+        );
+        // Stored variant decoded to its UUID.
+        assert_eq!(
+            outbound.attachments[1],
+            iris_core::OutboundAttachment::Stored(stored_ref.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_mixed_attachment_union_with_400() {
+        let thread_id = Uuid::new_v4();
+        let state = state(vec![
+            FakeProvider::new("mock", "Mock").with_threads(vec![thread(thread_id, "mock", 16)]),
+        ]);
+        let mut input = input_with_thread(thread_id, &[]);
+        input.body = serde_json::json!({
+            "body": "hello",
+            "attachments": [{
+                "mime_type": "image/png",
+                "data_base64": "aGk=",
+                "stored_id": Uuid::new_v4().to_string(),
+            }],
+        });
+
+        let (status, Json(error)) = send_message(&state, input).await.unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("mixes"), "{}", error.error);
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_unknown_attachment_fields_with_400() {
+        let thread_id = Uuid::new_v4();
+        let state = state(vec![
+            FakeProvider::new("mock", "Mock").with_threads(vec![thread(thread_id, "mock", 16)]),
+        ]);
+        let mut input = input_with_thread(thread_id, &[]);
+        input.body = serde_json::json!({
+            "body": "hello",
+            "attachments": [{
+                "stored_id": Uuid::new_v4().to_string(),
+                "filename": "nope.txt",
+            }],
+        });
+
+        let (status, Json(error)) = send_message(&state, input).await.unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("only stored_id"), "{}", error.error);
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_invalid_base64_with_400() {
+        let thread_id = Uuid::new_v4();
+        let state = state(vec![
+            FakeProvider::new("mock", "Mock").with_threads(vec![thread(thread_id, "mock", 16)]),
+        ]);
+        let mut input = input_with_thread(thread_id, &[]);
+        input.body = serde_json::json!({
+            "body": "hello",
+            "attachments": [{
+                "mime_type": "image/png",
+                "data_base64": "!!!not-base64!!!",
+            }],
+        });
+
+        let (status, Json(error)) = send_message(&state, input).await.unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("base64"), "{}", error.error);
     }
 
     #[tokio::test]

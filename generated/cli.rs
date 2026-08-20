@@ -37,7 +37,7 @@ impl GeneratedCommand {
             Self::ListMessages(args) => serde_json::json!({"thread_id": args.thread_id.clone(), "limit": args.limit.clone(), "before": args.before.clone()}),
             Self::ListThreads(args) => serde_json::json!({"limit": args.limit.clone(), "cursor": args.cursor.clone()}),
             Self::ListContacts(args) => serde_json::json!({"limit": args.limit.clone(), "cursor": args.cursor.clone()}),
-            Self::SendMessage(args) => serde_json::json!({"thread_id": args.thread_id.clone(), "body": args.body.clone(), "provider": args.provider.clone()}),
+            Self::SendMessage(args) => serde_json::json!({"thread_id": args.thread_id.clone(), "body": args.body.clone(), "provider": args.provider.clone(), "attachments": args.attachments.clone().unwrap_or_default(), "attach_mime": args.attach_mime.clone()}),
             Self::AuditQuery(args) => serde_json::json!({"provider": args.provider.clone(), "action": args.action.clone(), "since": args.since.clone(), "until": args.until.clone(), "source_id": args.source_id.clone(), "limit": args.limit.clone()}),
             Self::Watch(args) => serde_json::json!({"provider": args.provider.clone(), "thread_id": args.thread_id.clone()}),
         }
@@ -86,6 +86,12 @@ pub struct SendMessageArgs {
     /// Provider ID to route the send through when ownership is ambiguous.
     #[arg(long)]
     pub provider: Option<String>,
+    /// Attachments to send; each item is inline bytes (`mime_type` + `data_base64`, optional `filename`) or a stored `iris://attachment` reference (`stored_id`).
+    #[arg(long = "attach", action = clap::ArgAction::Append, required = false)]
+    pub attachments: Option<Vec<String>>,
+    /// MIME type for the corresponding local-path --attach value.
+    #[arg(long = "attach-mime", action = clap::ArgAction::Append)]
+    pub attach_mime: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]
