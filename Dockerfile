@@ -5,7 +5,7 @@
 # Pin builder to bookworm so glibc matches the bookworm runtime —
 # rust:1-slim now tracks trixie (glibc 2.39) and binaries fail on
 # bookworm-slim (glibc 2.36) with `GLIBC_2.39 not found`.
-FROM rust:1-bookworm-slim AS builder
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 # native-tls (lettre, email provider) needs OpenSSL headers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
