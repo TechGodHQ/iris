@@ -22,6 +22,7 @@
       "limit": "query"
     },
     "send_message": {
+      "attachments": "body",
       "body": "body",
       "provider": "body",
       "thread_id": "path"
@@ -96,6 +97,45 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "attachments": {
+            "description": "Attachments to send; each item is inline bytes (`mime_type` + `data_base64`, optional `filename`) or a stored `iris://attachment` reference (`stored_id`).",
+            "items": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data_base64": {
+                      "type": "string"
+                    },
+                    "filename": {
+                      "type": "string"
+                    },
+                    "mime_type": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "mime_type",
+                    "data_base64"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "stored_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "stored_id"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
           "body": {
             "description": "Message body to send.",
             "type": "string"

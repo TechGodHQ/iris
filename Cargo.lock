@@ -727,7 +727,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 [[package]]
 name = "hydra-codegen"
 version = "0.1.0"
-source = "git+https://github.com/TechGodHQ/hydra.git?tag=v0.1.1#7a13a51bd1f4a895423e6e4d919abc2846151e33"
+source = "git+https://github.com/TechGodHQ/hydra.git?tag=v0.2.0#c3923dca65acfca6f62a91afbaaaf2afad25da13"
 dependencies = [
  "anyhow",
  "hydra-core",
@@ -739,7 +739,7 @@ dependencies = [
 [[package]]
 name = "hydra-core"
 version = "0.1.0"
-source = "git+https://github.com/TechGodHQ/hydra.git?tag=v0.1.1#7a13a51bd1f4a895423e6e4d919abc2846151e33"
+source = "git+https://github.com/TechGodHQ/hydra.git?tag=v0.2.0#c3923dca65acfca6f62a91afbaaaf2afad25da13"
 dependencies = [
  "anyhow",
  "serde",
@@ -1035,6 +1035,7 @@ name = "iris-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "pretty_assertions",
  "serde",

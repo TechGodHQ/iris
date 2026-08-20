@@ -42,7 +42,7 @@ impl OutboundMessage {
 ///
 /// Either inline bytes supplied by the caller, or a stable reference to an
 /// attachment already persisted in the Iris attachment store.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundAttachment {
     /// Inline bytes supplied directly by the caller.
     Bytes {

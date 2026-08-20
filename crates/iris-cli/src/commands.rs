@@ -1,7 +1,9 @@
 //! CLI subcommands.
 
 use clap::Args;
-use iris_core::{AuditAction, AuditFilter, AuditLog, MessageProvider, OutboundMessage};
+use iris_core::{
+    AuditAction, AuditFilter, AuditLog, MessageProvider, OutboundAttachment, OutboundMessage,
+};
 use iris_providers::config::{IrisConfig, providers_from_config, providers_from_default_config};
 
 use crate::generated;
@@ -130,6 +132,11 @@ async fn list_contacts(args: generated::ListContactsArgs) -> anyhow::Result<()> 
 
 async fn send_message(args: generated::SendMessageArgs) -> anyhow::Result<()> {
     let providers = get_providers(&attachment_store())?;
+    let attachments = cli_attachments(args.attachments.as_deref(), args.attach_mime.as_deref())?;
+    let outbound = OutboundMessage {
+        body: args.body.clone(),
+        attachments,
+    };
     let matching_providers: Vec<_> = args.provider.as_deref().map_or_else(
         || providers.iter().collect(),
         |provider_id| {
@@ -148,14 +155,52 @@ async fn send_message(args: generated::SendMessageArgs) -> anyhow::Result<()> {
     }
 
     for provider in matching_providers {
-        if let Ok(message) = provider
-            .send_message(&args.thread_id, &OutboundMessage::text(&args.body))
-            .await
-        {
+        if let Ok(message) = provider.send_message(&args.thread_id, &outbound).await {
             return print_json(&message);
         }
     }
     anyhow::bail!("no provider accepted send_message")
+}
+
+/// Turn repeatable `--attach` / `--attach-mime` values into outbound
+/// attachments, reading local files at the CLI boundary.
+///
+/// Planning and validation (stored-reference parsing, `--attach-mime`
+/// cardinality and ordering, MIME inference) happen in
+/// [`iris_core::plan_attachments`]; this helper only reads the planned
+/// local files.
+fn cli_attachments(
+    attach: Option<&[String]>,
+    attach_mime: Option<&[String]>,
+) -> anyhow::Result<Vec<OutboundAttachment>> {
+    let attach = attach.unwrap_or_default();
+    let attach_mime = attach_mime.unwrap_or_default();
+    let planned = iris_core::plan_attachments(attach, attach_mime)?;
+    let mut attachments = Vec::with_capacity(planned.len());
+    for item in planned {
+        let attachment = match item {
+            iris_core::PlannedAttachment::LocalFile {
+                path,
+                mime_type,
+                filename,
+            } => {
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    anyhow::anyhow!("cannot read attachment {}: {error}", path.display())
+                })?;
+                if bytes.is_empty() {
+                    anyhow::bail!("attachment file is empty: {}", path.display());
+                }
+                OutboundAttachment::Bytes {
+                    mime_type,
+                    filename,
+                    bytes,
+                }
+            }
+            iris_core::PlannedAttachment::Stored(id) => OutboundAttachment::Stored(id),
+        };
+        attachments.push(attachment);
+    }
+    Ok(attachments)
 }
 
 async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
@@ -327,5 +372,147 @@ mod tests {
         .unwrap();
 
         assert_eq!(entries, vec![expected]);
+    }
+
+    #[test]
+    fn generated_cli_parses_repeatable_attach_flags_into_wire_shape() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: crate::generated::GeneratedCommand,
+        }
+
+        let cli = Cli::try_parse_from([
+            "iris",
+            "send-message",
+            "--body",
+            "see attachments",
+            "--attach",
+            "/tmp/a.png",
+            "--attach",
+            "iris://attachment/22222222-2222-2222-2222-222222222222",
+            "--attach-mime",
+            "image/png",
+            "11111111-1111-1111-1111-111111111111",
+        ])
+        .expect("repeatable flags parse");
+        let crate::generated::GeneratedCommand::SendMessage(args) = cli.command else {
+            panic!("expected send-message subcommand");
+        };
+        assert_eq!(
+            args.attachments,
+            Some(vec![
+                "/tmp/a.png".to_string(),
+                "iris://attachment/22222222-2222-2222-2222-222222222222".to_string(),
+            ])
+        );
+        assert_eq!(args.attach_mime, Some(vec!["image/png".to_string()]));
+        // parameters_json maps CLI shape back to the wire shape
+        let params = crate::generated::GeneratedCommand::SendMessage(args).parameters_json();
+        assert_eq!(
+            params["attachments"],
+            serde_json::json!([
+                "/tmp/a.png",
+                "iris://attachment/22222222-2222-2222-2222-222222222222"
+            ])
+        );
+        assert_eq!(params["attach_mime"], serde_json::json!(["image/png"]));
+    }
+
+    #[test]
+    fn cli_attachments_reads_local_files_and_infers_mime() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("photo.png");
+        std::fs::write(&png, b"png-bytes").unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        let attachments = cli_attachments(
+            Some(&[
+                png.to_string_lossy().into_owned(),
+                format!("iris://attachment/{id}"),
+            ]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            attachments,
+            vec![
+                OutboundAttachment::Bytes {
+                    mime_type: "image/png".to_owned(),
+                    filename: Some("photo.png".to_owned()),
+                    bytes: b"png-bytes".to_vec(),
+                },
+                OutboundAttachment::Stored(id),
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_attachments_applies_explicit_mime_overrides_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a.dat");
+        let second = dir.path().join("b.png");
+        std::fs::write(&first, b"one").unwrap();
+        std::fs::write(&second, b"two").unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        let attachments = cli_attachments(
+            Some(&[
+                first.to_string_lossy().into_owned(),
+                format!("iris://attachment/{id}"),
+                second.to_string_lossy().into_owned(),
+            ]),
+            Some(&["application/x-first".to_owned(), "image/tiff".to_owned()]),
+        )
+        .unwrap();
+
+        let mimes: Vec<_> = attachments
+            .iter()
+            .filter_map(|attachment| match attachment {
+                OutboundAttachment::Bytes { mime_type, .. } => Some(mime_type.clone()),
+                OutboundAttachment::Stored(_) => None,
+            })
+            .collect();
+        // The stored ref consumed no --attach-mime value: both overrides
+        // landed on the local files in order, the second overriding its
+        // .png inference.
+        assert_eq!(
+            mimes,
+            vec!["application/x-first".to_owned(), "image/tiff".to_owned(),]
+        );
+    }
+
+    #[test]
+    fn cli_attachments_rejects_mime_cardinality_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        std::fs::write(&a, b"x").unwrap();
+        let stored = format!("iris://attachment/{}", uuid::Uuid::new_v4());
+
+        // Two --attach-mime values for one local path + one stored ref.
+        let error = cli_attachments(
+            Some(&[a.to_string_lossy().into_owned(), stored]),
+            Some(&["image/png".to_owned(), "image/png".to_owned()]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must match"), "{error}");
+    }
+
+    #[test]
+    fn cli_attachments_rejects_missing_and_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.png");
+        let error =
+            cli_attachments(Some(&[missing.to_string_lossy().into_owned()]), None).unwrap_err();
+        assert!(error.to_string().contains("cannot read"), "{error}");
+
+        let empty = dir.path().join("empty.png");
+        std::fs::write(&empty, b"").unwrap();
+        let error =
+            cli_attachments(Some(&[empty.to_string_lossy().into_owned()]), None).unwrap_err();
+        assert!(error.to_string().contains("empty"), "{error}");
     }
 }
