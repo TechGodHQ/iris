@@ -15,10 +15,10 @@
 
 ## Generated surfaces
 
-- [ ] T8: Extend `api/operations.yaml` and codegen for inline/base64 and stored attachment inputs; regenerate HTTP/MCP/CLI artifacts.
-- [ ] T9: Implement HTTP/MCP input conversion and CLI `--attach` path/`iris://attachment` parsing.
-- [ ] T10: Add surface behavior tests and codegen freshness coverage.
+- [x] T8: Extend `api/operations.yaml` and codegen for inline/base64 and stored attachment inputs; regenerate HTTP/MCP/CLI artifacts.
+- [x] T9: Implement HTTP/MCP input conversion and CLI `--attach` path/`iris://attachment` parsing.
+- [x] T10: Add surface behavior tests and codegen freshness coverage.
 
 ## Verification
 
-- [ ] T11: Run `cargo build --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and the codegen check.
+- [x] T11: Run `cargo build --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and the codegen check.
