@@ -1,0 +1,6 @@
+target/
+.git/
+.github/
+.cargo/registry/
+docs/
+*.md
