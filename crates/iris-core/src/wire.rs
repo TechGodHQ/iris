@@ -97,7 +97,14 @@ fn decode_item(item: &serde_json::Value) -> Result<OutboundAttachment> {
         return Err(invalid("inline attachment requires non-empty bytes"));
     }
     let filename = match object.get("filename") {
-        None | Some(serde_json::Value::Null) => None,
+        None => None,
+        // The declared schema makes `filename` optional but not nullable:
+        // an explicit null is outside the closed union and must be rejected.
+        Some(serde_json::Value::Null) => {
+            return Err(invalid(
+                "inline attachment filename must be a string when present (null is not allowed)",
+            ));
+        }
         Some(value) => Some(
             value
                 .as_str()
@@ -179,6 +186,9 @@ pub fn plan_attachments(
         let mime_type = next_mime
             .next()
             .map_or_else(|| infer_mime_type(&path), Clone::clone);
+        if mime_type.trim().is_empty() {
+            return Err(invalid("--attach-mime values must be non-empty MIME types"));
+        }
         let filename = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
@@ -365,9 +375,32 @@ mod tests {
     }
 
     #[test]
+    fn null_filename_is_rejected() {
+        // `filename` is optional but not nullable in the declared union
+        // schema; an explicit null is outside the closed contract.
+        let mut item = inline("aGVsbG8=");
+        item.as_object_mut()
+            .expect("inline helper builds an object")
+            .insert("filename".to_owned(), serde_json::Value::Null);
+        let error = decode(&json!([item])).unwrap_err();
+        assert!(error.to_string().contains("null is not allowed"), "{error}");
+    }
+
+    #[test]
     fn non_object_items_are_rejected() {
         assert!(decode(&json!(["path.png"])).is_err());
         assert!(decode(&json!([7])).is_err());
+    }
+
+    #[test]
+    fn cli_blank_attach_mime_override_is_rejected() {
+        // --attach-mime overrides must be non-empty MIME types, matching the
+        // HTTP/MCP inline contract (which rejects blank mime_type values).
+        let error =
+            plan_attachments(&["/tmp/photo.png".to_owned()], &["   ".to_owned()]).unwrap_err();
+        assert!(error.to_string().contains("non-empty MIME"), "{error}");
+        let error = plan_attachments(&["/tmp/photo.png".to_owned()], &[String::new()]).unwrap_err();
+        assert!(error.to_string().contains("non-empty MIME"), "{error}");
     }
 
     #[test]
