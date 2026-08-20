@@ -122,6 +122,13 @@ impl TelegramProvider {
             .clone()
     }
 
+    /// Snapshot an existing realtime hub without creating one.
+    fn existing_realtime_status(&self) -> iris_core::RealtimeStatus {
+        self.realtime
+            .get()
+            .map_or_else(iris_core::RealtimeStatus::inactive, |hub| hub.status())
+    }
+
     async fn record(
         &self,
         action: AuditAction,
@@ -403,6 +410,10 @@ impl TelegramProvider {
 impl MessageProvider for TelegramProvider {
     fn metadata(&self) -> &ProviderMetadata {
         &METADATA
+    }
+
+    fn realtime_status(&self) -> iris_core::RealtimeStatus {
+        self.existing_realtime_status()
     }
 
     async fn list_threads(&self, limit: Option<u32>) -> Result<Vec<Thread>> {

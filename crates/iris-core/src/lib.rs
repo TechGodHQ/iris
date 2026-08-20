@@ -20,7 +20,7 @@ pub use outbound::{OutboundAttachment, OutboundMessage, ResolvedAttachment};
 pub use provider::{MessageProvider, ProviderCapability, ProviderMetadata};
 pub use realtime::{
     MessageStream, REALTIME_AUDIT_SCHEMA_VERSION, RealtimeAttachmentSummary, RealtimeAuditMetadata,
-    RealtimeEventKind,
+    RealtimeEventKind, RealtimeState, RealtimeStatus,
 };
 pub use storage::{AttachmentContent, AttachmentRef, AttachmentStore};
 pub use wire::{

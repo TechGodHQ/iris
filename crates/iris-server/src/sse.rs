@@ -103,7 +103,7 @@ pub(crate) async fn subscribe_events(
 
     let branches = match select_branches(&state, &query).await {
         Ok(branches) => branches,
-        Err(status) => return status,
+        Err(status) => return *status,
     };
 
     let body_stream = spawn_sse_pipeline(
@@ -128,7 +128,7 @@ pub(crate) async fn subscribe_events(
 async fn select_branches(
     state: &AppState,
     query: &SubscribeEventsQuery,
-) -> std::result::Result<Vec<ProviderBranch>, Response> {
+) -> std::result::Result<Vec<ProviderBranch>, Box<Response>> {
     match query.provider.as_deref() {
         Some(provider_id) => select_filtered(state, provider_id).await,
         None => select_aggregate(state).await,
@@ -139,14 +139,14 @@ async fn select_branches(
 async fn select_filtered(
     state: &AppState,
     provider_id: &str,
-) -> std::result::Result<Vec<ProviderBranch>, Response> {
+) -> std::result::Result<Vec<ProviderBranch>, Box<Response>> {
     let usable = state
         .providers
         .iter()
         .find(|provider| provider.id() == provider_id)
         .filter(|provider| provider.metadata().has_realtime());
     let Some(provider) = usable else {
-        return Err(unsupported_response(provider_id));
+        return Err(Box::new(unsupported_response(provider_id)));
     };
     let subscribed = provider.subscribe_realtime().await;
     subscribed
@@ -156,7 +156,7 @@ async fn select_filtered(
                 stream,
             }]
         })
-        .map_err(|_| unsupported_response(provider.id()))
+        .map_err(|_| Box::new(unsupported_response(provider.id())))
 }
 
 /// Establish every available branch of an unfiltered (aggregate) request.
@@ -164,7 +164,9 @@ async fn select_filtered(
 /// Capability-negative providers are skipped; capability-positive providers
 /// that fail runtime readiness are omitted (warned, not fatal). An empty
 /// result yields the 503 `no_realtime_provider` response.
-async fn select_aggregate(state: &AppState) -> std::result::Result<Vec<ProviderBranch>, Response> {
+async fn select_aggregate(
+    state: &AppState,
+) -> std::result::Result<Vec<ProviderBranch>, Box<Response>> {
     let mut branches = Vec::new();
     for provider in &state.providers {
         if !provider.metadata().has_realtime() {
@@ -185,10 +187,10 @@ async fn select_aggregate(state: &AppState) -> std::result::Result<Vec<ProviderB
         }
     }
     if branches.is_empty() {
-        return Err(json_status(
+        return Err(Box::new(json_status(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({ "error": "no_realtime_provider" }),
-        ));
+        )));
     }
     Ok(branches)
 }

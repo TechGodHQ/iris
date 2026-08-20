@@ -66,6 +66,7 @@ pub fn router(state: AppState) -> Router {
     debug_assert!(!generated::GENERATED_ROUTES.is_empty());
     let router = Router::new()
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/providers", get(list_providers))
         .route("/v1/attachments/{id}/content", get(get_attachment_content))
         .merge(generated::generated_router());
@@ -95,6 +96,25 @@ pub(crate) fn bind_runtime_sse_subscribe_events(
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
+}
+
+/// Return per-provider realtime status without performing provider I/O.
+async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let providers: Vec<_> = state
+        .providers
+        .iter()
+        .map(|provider| {
+            let realtime = provider.realtime_status();
+            serde_json::json!({
+                "id": provider.id(),
+                "realtime": realtime.realtime,
+                "last_error": realtime.last_error,
+                "last_error_at": realtime.last_error_at,
+                "subscribers": realtime.subscribers,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "providers": providers }))
 }
 
 async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderResponse>> {
@@ -601,7 +621,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use iris_core::{
         AttachmentContent, AttachmentRef, AttachmentStore, AuditAction, AuditEvent, AuditLog,
-        IrisError, MessageKind, ProviderMetadata,
+        IrisError, MessageKind, ProviderMetadata, RealtimeState, RealtimeStatus,
     };
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
@@ -630,6 +650,7 @@ mod tests {
         contacts: Vec<Contact>,
         messages: Vec<Message>,
         fail_operation: Option<&'static str>,
+        realtime_status: RealtimeStatus,
         outbound: std::sync::Mutex<Vec<(String, iris_core::OutboundMessage)>>,
     }
 
@@ -650,6 +671,7 @@ mod tests {
                 contacts: Vec::new(),
                 messages: Vec::new(),
                 fail_operation: None,
+                realtime_status: RealtimeStatus::inactive(),
                 outbound: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -678,6 +700,11 @@ mod tests {
             self
         }
 
+        fn with_realtime_status(mut self, realtime_status: RealtimeStatus) -> Self {
+            self.realtime_status = realtime_status;
+            self
+        }
+
         fn maybe_fail(&self, operation: &'static str) -> iris_core::Result<()> {
             if self.fail_operation == Some(operation) {
                 return Err(IrisError::Provider {
@@ -693,6 +720,10 @@ mod tests {
     impl MessageProvider for FakeProvider {
         fn metadata(&self) -> &ProviderMetadata {
             &self.metadata
+        }
+
+        fn realtime_status(&self) -> RealtimeStatus {
+            self.realtime_status.clone()
         }
 
         async fn list_threads(&self, limit: Option<u32>) -> iris_core::Result<Vec<Thread>> {
@@ -867,6 +898,49 @@ mod tests {
             sse: crate::sse::SseSettings::default(),
         };
         let _router = super::router(app_state);
+    }
+
+    #[tokio::test]
+    async fn status_reports_dead_and_polling_provider_snapshots() {
+        let dead_at = Utc.with_ymd_and_hms(2026, 8, 20, 16, 0, 0).unwrap();
+        let app_state = state(vec![
+            FakeProvider::new("telegram", "Telegram").with_realtime_status(RealtimeStatus {
+                realtime: RealtimeState::Dead,
+                last_error: Some("telegram getUpdates conflict (HTTP 409)".into()),
+                last_error_at: Some(dead_at),
+                subscribers: 0,
+            }),
+            FakeProvider::new("mock", "Mock").with_realtime_status(RealtimeStatus {
+                realtime: RealtimeState::Polling,
+                last_error: None,
+                last_error_at: None,
+                subscribers: 2,
+            }),
+        ]);
+
+        let Json(body) = status(State(app_state)).await;
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "providers": [
+                    {
+                        "id": "telegram",
+                        "realtime": "dead",
+                        "last_error": "telegram getUpdates conflict (HTTP 409)",
+                        "last_error_at": "2026-08-20T16:00:00Z",
+                        "subscribers": 0,
+                    },
+                    {
+                        "id": "mock",
+                        "realtime": "polling",
+                        "last_error": null,
+                        "last_error_at": null,
+                        "subscribers": 2,
+                    },
+                ],
+            })
+        );
     }
 
     #[tokio::test]
