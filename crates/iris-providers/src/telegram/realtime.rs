@@ -21,9 +21,11 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use iris_core::realtime::{RealtimeAuditMetadata, RealtimeEventKind};
 use iris_core::{
-    AuditAction, AuditEvent, IrisError, Message, MessageStream, RecordOutcome, Result,
+    AuditAction, AuditEvent, IrisError, Message, MessageStream, RealtimeState, RealtimeStatus,
+    RecordOutcome, Result,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -146,6 +148,8 @@ struct HubState {
     /// Set when the poller terminally stopped (409, audit failure,
     /// exhaustion). A later subscription clears it and restarts fresh.
     terminated: Option<IrisError>,
+    /// Timestamp recorded with a terminal poller error for status reporting.
+    terminated_at: Option<DateTime<Utc>>,
     /// Join handle of the running poller task, if any.
     poller: Option<tokio::task::JoinHandle<()>>,
     /// Cancellation token owned by the hub; aborts in-flight long polls.
@@ -220,6 +224,7 @@ impl HubState {
             subscribers: HashMap::new(),
             next_id: 0,
             terminated: None,
+            terminated_at: None,
             poller: None,
             cancel: CancellationToken::new(),
         }
@@ -300,6 +305,34 @@ impl RealtimeHub {
             .is_some_and(|handle| !handle.is_finished())
     }
 
+    /// Return a side-effect-free lifecycle snapshot for status reporting.
+    #[must_use]
+    pub fn status(&self) -> RealtimeStatus {
+        let state = self.lock();
+        if let Some(error) = &state.terminated {
+            return RealtimeStatus {
+                realtime: RealtimeState::Dead,
+                last_error: Some(error.to_string()),
+                last_error_at: state.terminated_at,
+                subscribers: state.subscribers.len(),
+            };
+        }
+        RealtimeStatus {
+            realtime: if state
+                .poller
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+            {
+                RealtimeState::Polling
+            } else {
+                RealtimeState::Inactive
+            },
+            last_error: None,
+            last_error_at: None,
+            subscribers: state.subscribers.len(),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HubState> {
         self.state.lock().expect("hub mutex poisoned")
     }
@@ -320,6 +353,7 @@ impl RealtimeHub {
             // hub restarts fresh from the in-memory cursor and the new
             // subscriber receives only events accepted after it joined.
             state.terminated = None;
+            state.terminated_at = None;
             // A cancelled token (from a prior shutdown) cannot be un-cancelled:
             // revive the hub with a fresh token so the new poller can run.
             if state.cancel.is_cancelled() {
@@ -376,6 +410,7 @@ impl RealtimeHub {
             subscriber.try_send_terminal(error.clone());
         }
         state.terminated = Some(error);
+        state.terminated_at = Some(Utc::now());
         if let Some(handle) = state.poller.take() {
             handle.abort();
         }
@@ -1075,6 +1110,27 @@ mod tests {
             retry_budget,
             long_poll_timeout_seconds: 1,
         }
+    }
+
+    #[test]
+    fn status_is_inactive_until_a_poller_starts_and_records_terminal_errors() {
+        let hub = RealtimeHub::new(test_settings(3)).expect("valid hub");
+
+        assert_eq!(hub.status(), RealtimeStatus::inactive());
+
+        hub.terminate_all(IrisError::Provider {
+            provider: PROVIDER_ID.into(),
+            message: "telegram getUpdates conflict (HTTP 409)".into(),
+        });
+        let status = hub.status();
+
+        assert_eq!(status.realtime, RealtimeState::Dead);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("provider 'telegram' error: telegram getUpdates conflict (HTTP 409)")
+        );
+        assert!(status.last_error_at.is_some());
+        assert_eq!(status.subscribers, 0);
     }
 
     fn provider_at(

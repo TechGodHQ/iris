@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::outbound::OutboundMessage;
-use crate::{Contact, Message, MessageStream, Result, Thread};
+use crate::{Contact, Message, MessageStream, RealtimeStatus, Result, Thread};
 
 /// Capabilities a provider may support. Not all providers support all operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,6 +112,13 @@ pub trait MessageProvider: Send + Sync {
             provider: self.metadata().id.to_string(),
             capability: "ReceiveRealtime".to_string(),
         })
+    }
+
+    /// Return a side-effect-free snapshot of realtime lifecycle state.
+    ///
+    /// This must not perform I/O or initialize polling infrastructure.
+    fn realtime_status(&self) -> RealtimeStatus {
+        RealtimeStatus::inactive()
     }
 
     /// Shut down realtime infrastructure owned by this provider.

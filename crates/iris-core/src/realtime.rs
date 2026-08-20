@@ -7,6 +7,7 @@
 //! I/O: pollers, hubs, and lifecycle plumbing live in provider crates.
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::{Attachment, Message, MessageKind};
@@ -20,6 +21,44 @@ use crate::{Attachment, Message, MessageKind};
 /// marks it recoverable.
 pub type MessageStream =
     std::pin::Pin<Box<dyn tokio_stream::Stream<Item = crate::Result<Message>> + Send>>;
+
+/// Observable lifecycle state for a provider's realtime ingress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeState {
+    /// A realtime poller is currently running.
+    Polling,
+    /// A poller terminally stopped.
+    Dead,
+    /// Realtime has not been started for this provider.
+    Inactive,
+}
+
+/// Side-effect-free realtime status snapshot exposed by providers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RealtimeStatus {
+    /// Current lifecycle state.
+    pub realtime: RealtimeState,
+    /// Sanitized terminal error, if the poller stopped.
+    pub last_error: Option<String>,
+    /// Time at which the terminal error was observed.
+    pub last_error_at: Option<DateTime<Utc>>,
+    /// Number of live subscribers.
+    pub subscribers: usize,
+}
+
+impl RealtimeStatus {
+    /// Construct an inactive snapshot.
+    #[must_use]
+    pub const fn inactive() -> Self {
+        Self {
+            realtime: RealtimeState::Inactive,
+            last_error: None,
+            last_error_at: None,
+            subscribers: 0,
+        }
+    }
+}
 
 /// Current version of the realtime audit metadata schema.
 pub const REALTIME_AUDIT_SCHEMA_VERSION: u32 = 1;
