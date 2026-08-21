@@ -49,14 +49,15 @@ docker run --rm \
   --publish 127.0.0.1:9876:9876 \
   --volume iris-data:/data \
   --env IRIS_ENABLED_PROVIDERS=telegram \
-  --env TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}" \
+  --env IRIS_TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}" \
   ghcr.io/techgodhq/iris:latest
 ```
 
-The image creates its provider configuration from `IRIS_ENABLED_PROVIDERS`.
-Set it to a comma-separated list such as `telegram,email`, supplying the
-provider credentials documented below, or mount a complete configuration at
-`/etc/iris/iris.mounted.toml`.
+The image reads native environment configuration directly; it does not create
+a TOML file at startup. Set `IRIS_ENABLED_PROVIDERS` to a comma-separated list
+such as `telegram,email`, supplying canonical `IRIS_<PROVIDER>_<FIELD>`
+variables. To keep the full-fidelity TOML path, mount a file and set
+`IRIS_CONFIG` to its path; native environment values override that file.
 
 For a reference Iris + Rite deployment, use
 [`deploy/docker-compose.yml`](deploy/docker-compose.yml). Set
@@ -65,9 +66,18 @@ running `docker compose -f deploy/docker-compose.yml up -d`.
 
 ## Configuration
 
-Iris reads provider configuration from TOML. Set `IRIS_CONFIG` to an explicit
-file, place `iris.toml` in the working directory, or use
-`~/.config/iris/config.toml`. The HTTP server also accepts `--config <path>`.
+Iris reads provider configuration from TOML, native environment variables, or
+both. Set `IRIS_CONFIG` to an explicit file, place `iris.toml` in the working
+directory, or use `~/.config/iris/config.toml`. The HTTP server also accepts
+`--config <path>`. Environment values override TOML, which overrides defaults.
+
+For file-free configuration, set `IRIS_ENABLED_PROVIDERS` and matching
+`IRIS_<PROVIDER>_<FIELD>` variables. Telegram uses
+`IRIS_TELEGRAM_BOT_TOKEN`. Email accepts `IRIS_EMAIL_IMAP_HOST`,
+`IRIS_EMAIL_IMAP_PORT`, `IRIS_EMAIL_SMTP_HOST`, `IRIS_EMAIL_SMTP_PORT`,
+`IRIS_EMAIL_USERNAME`, `IRIS_EMAIL_PASSWORD`, and optional `IRIS_EMAIL_MAILBOX`,
+`IRIS_EMAIL_FROM`, `IRIS_EMAIL_PAGE_SIZE`, and `IRIS_EMAIL_MAX_MESSAGES`.
+Enabled providers validate required credentials at startup.
 
 ```toml
 [providers.mock]

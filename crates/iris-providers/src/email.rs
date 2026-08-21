@@ -1115,9 +1115,15 @@ fn required(credentials: &BTreeMap<String, String>, key: &str) -> Result<String>
 
 fn optional_port(credentials: &BTreeMap<String, String>, key: &str, default: u16) -> Result<u16> {
     credentials.get(key).map_or(Ok(default), |value| {
-        value.parse().map_err(|error| {
+        let port: u16 = value.parse().map_err(|error| {
             IrisError::Config(format!("email credentials.{key} is invalid: {error}"))
-        })
+        })?;
+        if port == 0 {
+            return Err(IrisError::Config(format!(
+                "email credentials.{key} must be at least 1"
+            )));
+        }
+        Ok(port)
     })
 }
 
@@ -1544,6 +1550,21 @@ mod tests {
         let error =
             EmailProvider::from_credentials(&creds, test_store()).expect_err("invalid page_size");
         assert!(error.to_string().contains("page_size"));
+    }
+
+    #[test]
+    fn from_credentials_rejects_zero_ports() {
+        for key in ["imap_port", "smtp_port"] {
+            let mut creds = valid_creds();
+            creds.insert(key.into(), "0".into());
+            let error = EmailProvider::from_credentials(&creds, test_store())
+                .expect_err("zero is not a remote port");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{key} must be at least 1"))
+            );
+        }
     }
 
     #[test]

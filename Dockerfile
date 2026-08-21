@@ -28,7 +28,6 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
     && mkdir -p /etc/iris /data \
     && chown -R iris:iris /etc/iris /data
-ENV IRIS_CONFIG=/etc/iris/iris.toml
 ENV IRIS_ATTACHMENT_DIR=/data/attachments
 ENV IRIS_AUDIT_DIR=/data/audit
 USER iris
