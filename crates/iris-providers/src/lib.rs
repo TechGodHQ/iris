@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod email;
+pub mod herdr;
 pub mod mock;
 pub mod sms;
 pub mod telegram;
