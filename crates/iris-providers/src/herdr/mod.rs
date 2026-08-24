@@ -353,7 +353,7 @@ fn sorted_object(object: Option<&Map<String, Value>>) -> Map<String, Value> {
         .into_iter()
         .flat_map(|object| object.iter())
         .collect();
-    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_unstable_by_key(|(left, _)| *left);
     entries
         .into_iter()
         .map(|(key, value)| (key.clone(), value.clone()))
