@@ -1124,6 +1124,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "fs2",
  "iris-core",
  "pretty_assertions",
  "serde",
