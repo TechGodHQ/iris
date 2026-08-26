@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod error;
+pub mod ingest;
 pub mod model;
 pub mod outbound;
 pub mod provider;
@@ -15,6 +16,7 @@ pub mod wire;
 
 pub use audit::{AuditAction, AuditEntry, AuditEvent, AuditFilter, AuditLog, RecordOutcome};
 pub use error::{IrisError, Result};
+pub use ingest::{IngestBatch, IngestCursor, IngestMutation, IngestOutcome, IngestStore};
 pub use model::{Attachment, Contact, Message, MessageKind, Thread};
 pub use outbound::{OutboundAttachment, OutboundMessage, ResolvedAttachment};
 pub use provider::{MessageProvider, ProviderCapability, ProviderMetadata};
