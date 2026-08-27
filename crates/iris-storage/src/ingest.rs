@@ -174,13 +174,13 @@ fn write_state_atomically(path: &Path, state: &IngestState) -> Result<()> {
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| IrisError::Storage(format!("sync ingest snapshot: {error}")))?;
-    fs::rename(&tmp, path)
-        .map_err(|error| IrisError::Storage(format!("commit ingest snapshot: {error}")))?;
     let directory = File::open(
         path.parent()
             .ok_or_else(|| IrisError::Storage("ingest snapshot has no parent directory".into()))?,
     )
     .map_err(|error| IrisError::Storage(format!("open ingest directory: {error}")))?;
+    fs::rename(&tmp, path)
+        .map_err(|error| IrisError::Storage(format!("commit ingest snapshot: {error}")))?;
     // The rename has already made the transaction visible. A directory-sync
     // failure cannot honestly be reported as a failed transaction because a
     // caller may retry an already-applied batch; retain the successful result.
