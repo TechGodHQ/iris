@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+fs2 = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

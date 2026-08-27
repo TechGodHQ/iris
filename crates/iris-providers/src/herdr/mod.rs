@@ -5,7 +5,10 @@
 //! seam owns authentication, persistence, audit, and delivery.
 
 use chrono::{DateTime, Utc};
-use iris_core::{Contact, Message, MessageKind, Thread};
+use iris_core::{
+    AuditAction, AuditEvent, Contact, IngestBatch, IngestMutation, IrisError, Message, MessageKind,
+    Result, Thread,
+};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -170,6 +173,53 @@ pub fn map_event(event: &HerdrEvent<'_>) -> HerdrMapping {
         dedupe_key,
         intents,
     }
+}
+
+/// Maps one Herdr event into the source-agnostic transactional ingest batch.
+///
+/// The batch contains only normalized Iris mutations. Raw Herdr payloads stay
+/// at the bridge boundary and are not copied into Iris audit metadata.
+pub fn map_ingest_batch(event: &HerdrEvent<'_>) -> Result<IngestBatch> {
+    if event.event_id.trim().is_empty() {
+        return Err(IrisError::Config(
+            "Herdr ingest event requires a non-empty bridge event_id".into(),
+        ));
+    }
+    let mapping = map_event(event);
+    let dropped_count = mapping
+        .intents
+        .iter()
+        .filter(|intent| matches!(intent, HerdrIntent::Dropped { .. }))
+        .count();
+    let mutations = mapping
+        .intents
+        .into_iter()
+        .filter_map(|intent| match intent {
+            HerdrIntent::UpsertContact(contact) => Some(IngestMutation::UpsertContact(contact)),
+            HerdrIntent::UpsertThread(thread) => Some(IngestMutation::UpsertThread(thread)),
+            HerdrIntent::ArchiveThread { source_id, .. } => Some(IngestMutation::ArchiveThread {
+                source: SOURCE.to_owned(),
+                source_id,
+            }),
+            HerdrIntent::AppendMessage(message) => Some(IngestMutation::AppendMessage(message)),
+            HerdrIntent::Dropped { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let mutation_count = mutations.len();
+
+    Ok(IngestBatch {
+        source: SOURCE.to_owned(),
+        replay_key: mapping.dedupe_key.clone(),
+        mutations,
+        cursor: None,
+        audit: AuditEvent {
+            action: AuditAction::Normalize,
+            provider: SOURCE.to_owned(),
+            source_id: Some(mapping.dedupe_key),
+            timestamp: event.received_at,
+            metadata: json!({"mutation_count": mutation_count, "dropped_count": dropped_count}),
+        },
+    })
 }
 
 fn map_agent_status(
@@ -418,6 +468,74 @@ mod tests {
             payload: &json!({"event": event, "data": data}),
             received_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         })
+    }
+
+    #[test]
+    fn ingest_batch_converts_status_intents_and_uses_bridge_key_for_audit() {
+        let payload = json!({
+            "event": "pane_agent_status_changed",
+            "data": {
+                "workspace_id": "workspace-1",
+                "pane_id": "pane-1",
+                "agent": "codex",
+                "host": "endver",
+                "agent_status": "working"
+            }
+        });
+        let batch = map_ingest_batch(&HerdrEvent {
+            event_id: "bridge-event-1",
+            payload: &payload,
+            received_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        })
+        .unwrap();
+
+        assert_eq!(batch.source, "herdr");
+        assert_eq!(batch.replay_key, "herdr:bridge-event-1");
+        assert_eq!(
+            batch.audit.source_id.as_deref(),
+            Some("herdr:bridge-event-1")
+        );
+        assert_eq!(batch.mutations.len(), 3);
+        assert!(matches!(
+            batch.mutations[0],
+            IngestMutation::UpsertContact(_)
+        ));
+        assert!(matches!(
+            batch.mutations[1],
+            IngestMutation::UpsertThread(_)
+        ));
+        assert!(matches!(
+            batch.mutations[2],
+            IngestMutation::AppendMessage(_)
+        ));
+    }
+
+    #[test]
+    fn ingest_batch_audits_dropped_events_without_persisting_mutations() {
+        let payload = json!({"event": "pane_output_changed", "data": {}});
+        let batch = map_ingest_batch(&HerdrEvent {
+            event_id: "bridge-event-2",
+            payload: &payload,
+            received_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        })
+        .unwrap();
+
+        assert!(batch.mutations.is_empty());
+        assert_eq!(batch.audit.metadata["mutation_count"], 0);
+        assert_eq!(batch.audit.metadata["dropped_count"], 1);
+    }
+
+    #[test]
+    fn ingest_batch_rejects_missing_bridge_identity() {
+        let payload = json!({"event": "pane_output_changed", "data": {}});
+        assert!(matches!(
+            map_ingest_batch(&HerdrEvent {
+                event_id: " ",
+                payload: &payload,
+                received_at: Utc::now(),
+            }),
+            Err(IrisError::Config(_))
+        ));
     }
 
     #[test]

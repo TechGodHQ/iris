@@ -16,6 +16,10 @@
 
 use std::path::PathBuf;
 
+mod ingest;
+
+pub use ingest::LocalFsIngestStore;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use iris_core::{AttachmentContent, AttachmentRef, AttachmentStore, IrisError, Result};
