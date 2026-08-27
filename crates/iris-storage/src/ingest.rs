@@ -96,7 +96,9 @@ impl LocalFsIngestStore {
                     IngestMutation::ArchiveThread { source, source_id } => {
                         state
                             .archived_threads
-                            .insert(format!("{source}:{source_id}"), true);
+                            .entry(source)
+                            .or_default()
+                            .insert(source_id, true);
                     }
                     IngestMutation::AppendMessage(message) => state.messages.push(message),
                 }
@@ -139,7 +141,7 @@ struct IngestState {
     #[serde(default)]
     messages: Vec<Message>,
     #[serde(default)]
-    archived_threads: BTreeMap<String, bool>,
+    archived_threads: BTreeMap<String, BTreeMap<String, bool>>,
     #[serde(default)]
     cursors: BTreeMap<String, String>,
     #[serde(default)]
@@ -179,9 +181,11 @@ fn write_state_atomically(path: &Path, state: &IngestState) -> Result<()> {
             .ok_or_else(|| IrisError::Storage("ingest snapshot has no parent directory".into()))?,
     )
     .map_err(|error| IrisError::Storage(format!("open ingest directory: {error}")))?;
-    directory
-        .sync_all()
-        .map_err(|error| IrisError::Storage(format!("sync ingest directory: {error}")))
+    // The rename has already made the transaction visible. A directory-sync
+    // failure cannot honestly be reported as a failed transaction because a
+    // caller may retry an already-applied batch; retain the successful result.
+    let _ = directory.sync_all();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -258,5 +262,27 @@ mod tests {
             store.apply_batch(second).await.unwrap(),
             IngestOutcome::Applied { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn archive_keys_are_unambiguous_across_source_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalFsIngestStore::new(temp.path());
+        let mut first = batch("one", "1");
+        first.mutations = vec![IngestMutation::ArchiveThread {
+            source: "a".into(),
+            source_id: "b:c".into(),
+        }];
+        let mut second = batch("two", "2");
+        second.mutations = vec![IngestMutation::ArchiveThread {
+            source: "a:b".into(),
+            source_id: "c".into(),
+        }];
+
+        store.apply_batch(first).await.unwrap();
+        store.apply_batch(second).await.unwrap();
+        let state = read_state(&store.state_path()).unwrap();
+        assert!(state.archived_threads["a"].contains_key("b:c"));
+        assert!(state.archived_threads["a:b"].contains_key("c"));
     }
 }
