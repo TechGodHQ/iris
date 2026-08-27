@@ -71,8 +71,11 @@ impl LocalFsIngestStore {
         let result = (|| {
             let mut state = read_state(&self.state_path())?;
             let hash = batch.canonical_hash()?;
-            let replay_id = format!("{}:{}", batch.source, batch.replay_key);
-            if let Some(existing) = state.replays.get(&replay_id) {
+            if let Some(existing) = state
+                .replays
+                .get(&batch.source)
+                .and_then(|replays| replays.get(&batch.replay_key))
+            {
                 return Ok(if existing.hash == hash {
                     IngestOutcome::AlreadyApplied {
                         committed_at: existing.committed_at,
@@ -105,13 +108,17 @@ impl LocalFsIngestStore {
             state.audit.push(batch.audit);
             state
                 .replays
-                .insert(replay_id, ReplayRecord { hash, committed_at });
+                .entry(batch.source)
+                .or_default()
+                .insert(batch.replay_key, ReplayRecord { hash, committed_at });
             write_state_atomically(&self.state_path(), &state)?;
             Ok(IngestOutcome::Applied { committed_at })
         })();
 
-        lock.unlock()
-            .map_err(|error| IrisError::Storage(format!("unlock ingest state: {error}")))?;
+        // A successful rename is already committed. Dropping the lock will
+        // release it even if explicit unlock reports an I/O error, so do not
+        // misreport a committed batch as failed.
+        let _ = lock.unlock();
         result
     }
 }
@@ -136,7 +143,7 @@ struct IngestState {
     #[serde(default)]
     cursors: BTreeMap<String, String>,
     #[serde(default)]
-    replays: BTreeMap<String, ReplayRecord>,
+    replays: BTreeMap<String, BTreeMap<String, ReplayRecord>>,
     #[serde(default)]
     audit: Vec<AuditEvent>,
 }
@@ -166,7 +173,15 @@ fn write_state_atomically(path: &Path, state: &IngestState) -> Result<()> {
         .and_then(|()| file.sync_all())
         .map_err(|error| IrisError::Storage(format!("sync ingest snapshot: {error}")))?;
     fs::rename(&tmp, path)
-        .map_err(|error| IrisError::Storage(format!("commit ingest snapshot: {error}")))
+        .map_err(|error| IrisError::Storage(format!("commit ingest snapshot: {error}")))?;
+    let directory = File::open(
+        path.parent()
+            .ok_or_else(|| IrisError::Storage("ingest snapshot has no parent directory".into()))?,
+    )
+    .map_err(|error| IrisError::Storage(format!("open ingest directory: {error}")))?;
+    directory
+        .sync_all()
+        .map_err(|error| IrisError::Storage(format!("sync ingest directory: {error}")))
 }
 
 #[cfg(test)]
@@ -216,5 +231,32 @@ mod tests {
         let state = read_state(&store.state_path()).unwrap();
         assert_eq!(state.audit.len(), 1);
         assert_eq!(state.cursors.get("herdr").map(String::as_str), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn replay_keys_are_unambiguous_across_source_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalFsIngestStore::new(temp.path());
+        let mut first = batch("b:c", "1");
+        first.source = "a".into();
+        first.cursor = Some(IngestCursor {
+            source: "a".into(),
+            value: "1".into(),
+        });
+        let mut second = batch("c", "2");
+        second.source = "a:b".into();
+        second.cursor = Some(IngestCursor {
+            source: "a:b".into(),
+            value: "2".into(),
+        });
+
+        assert!(matches!(
+            store.apply_batch(first).await.unwrap(),
+            IngestOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            store.apply_batch(second).await.unwrap(),
+            IngestOutcome::Applied { .. }
+        ));
     }
 }
