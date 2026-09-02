@@ -212,13 +212,13 @@ pub fn map_ingest_batch(event: &HerdrEvent<'_>) -> Result<IngestBatch> {
         replay_key: mapping.dedupe_key.clone(),
         mutations,
         cursor: None,
-        audit: AuditEvent {
+        audit: Some(AuditEvent {
             action: AuditAction::Normalize,
             provider: SOURCE.to_owned(),
             source_id: Some(mapping.dedupe_key),
             timestamp: event.received_at,
             metadata: json!({"mutation_count": mutation_count, "dropped_count": dropped_count}),
-        },
+        }),
     })
 }
 
@@ -492,7 +492,10 @@ mod tests {
         assert_eq!(batch.source, "herdr");
         assert_eq!(batch.replay_key, "herdr:bridge-event-1");
         assert_eq!(
-            batch.audit.source_id.as_deref(),
+            batch
+                .audit
+                .as_ref()
+                .and_then(|audit| audit.source_id.as_deref()),
             Some("herdr:bridge-event-1")
         );
         assert_eq!(batch.mutations.len(), 3);
@@ -521,8 +524,12 @@ mod tests {
         .unwrap();
 
         assert!(batch.mutations.is_empty());
-        assert_eq!(batch.audit.metadata["mutation_count"], 0);
-        assert_eq!(batch.audit.metadata["dropped_count"], 1);
+        let audit = batch
+            .audit
+            .as_ref()
+            .expect("Herdr mapper emits audit metadata");
+        assert_eq!(audit.metadata["mutation_count"], 0);
+        assert_eq!(audit.metadata["dropped_count"], 1);
     }
 
     #[test]

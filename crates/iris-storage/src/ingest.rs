@@ -107,7 +107,9 @@ impl LocalFsIngestStore {
                 state.cursors.insert(cursor.source, cursor.value);
             }
             let committed_at = Utc::now();
-            state.audit.push(batch.audit);
+            if let Some(audit) = batch.audit {
+                state.audit.push(audit);
+            }
             state
                 .replays
                 .entry(batch.source)
@@ -205,13 +207,13 @@ mod tests {
                 source: "herdr".into(),
                 value: cursor.into(),
             }),
-            audit: AuditEvent {
+            audit: Some(AuditEvent {
                 action: AuditAction::Normalize,
                 provider: "herdr".into(),
                 source_id: Some(key.into()),
                 timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                 metadata: json!({"count": 0}),
-            },
+            }),
         }
     }
 

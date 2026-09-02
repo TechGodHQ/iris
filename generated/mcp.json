@@ -8,6 +8,9 @@
       "source_id": "query",
       "until": "query"
     },
+    "ingest_herdr": {
+      "batch": "body"
+    },
     "list_contacts": {
       "cursor": "query",
       "limit": "query"
@@ -191,6 +194,49 @@
         "type": "object"
       },
       "name": "audit_query"
+    },
+    {
+      "description": "Transactionally ingest a normalized, replayable Herdr batch.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "batch": {
+            "additionalProperties": false,
+            "description": "Serialized normalized `IngestBatch`. The server computes its canonical hash; `batch_hash` is forbidden.",
+            "properties": {
+              "audit": {
+                "type": "object"
+              },
+              "cursor": {
+                "type": "object"
+              },
+              "mutations": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "replay_key": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "source",
+              "replay_key",
+              "mutations"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "batch"
+        ],
+        "type": "object"
+      },
+      "name": "ingest_herdr"
     }
   ]
 }
