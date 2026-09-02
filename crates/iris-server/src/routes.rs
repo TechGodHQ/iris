@@ -431,6 +431,11 @@ async fn ingest_herdr(state: &AppState, input: generated::GeneratedOperationInpu
             }),
         )
             .into_response(),
+        Err(IrisError::Storage(error) | IrisError::Transport(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error }),
+        )
+            .into_response(),
         Err(error) => bad_request(error.to_string()).into_response(),
     }
 }
