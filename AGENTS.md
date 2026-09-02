@@ -93,6 +93,22 @@ cargo fmt --all -- --check
 - Auto-merge is permitted per the standing gate policy: CI green and gate confidence >= 0.80.
 - Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`.
 
+## Provider Agnosticism (blocking review rule)
+
+Iris core is source-agnostic by doctrine; providers are libraries, not routes.
+
+- Public operations are named for the noun (`ingest_batch`), never the source.
+  A provider name must never appear in generated-operation names, HTTP paths,
+  core crates, or hardcoded source-string checks outside `iris-providers/`.
+- Adding a provider = new mapper in `iris-providers` + one config entry
+  (source allowlist / per-source secret). If a change would touch
+  `iris-server`, `iris-mcp`, `iris-cli`, or `api/operations.yaml` to add a
+  provider, it is wrong — block in review and redesign.
+- Tickets inherit rulings: a direction comment supersedes the ticket body;
+  update the ticket to match instead of implementing stale text.
+- Origin: the `ingest_herdr` leak in PR #36 (merged 1124f69), refactored in
+  COD-453.
+
 ## OpenSpec
 
 OpenSpec CLI is available via `openspec` (pnpm global). Edit files under
