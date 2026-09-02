@@ -709,10 +709,12 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use iris_core::{
         AttachmentContent, AttachmentRef, AttachmentStore, AuditAction, AuditEvent, AuditLog,
-        IrisError, MessageKind, ProviderMetadata, RealtimeState, RealtimeStatus,
+        IngestBatch, IngestCursor, IngestOutcome, IngestStore, IrisError, MessageKind,
+        ProviderMetadata, RealtimeState, RealtimeStatus,
     };
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
+    use tower::ServiceExt;
     use uuid::Uuid;
 
     /// A no-op attachment store for tests that don't exercise attachment logic.
@@ -963,6 +965,101 @@ mod tests {
             is_outbound: false,
             metadata: serde_json::Value::Null,
         }
+    }
+
+    fn ingest_batch(replay_key: &str) -> IngestBatch {
+        IngestBatch {
+            source: "herdr".to_owned(),
+            replay_key: replay_key.to_owned(),
+            mutations: Vec::new(),
+            cursor: Some(IngestCursor {
+                source: "herdr".to_owned(),
+                value: "42".to_owned(),
+            }),
+            audit: AuditEvent {
+                action: AuditAction::Normalize,
+                provider: "herdr".to_owned(),
+                source_id: Some(replay_key.to_owned()),
+                timestamp: Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap(),
+                metadata: serde_json::json!({"event": "bridge_heartbeat"}),
+            },
+        }
+    }
+
+    fn ingest_state(store: Arc<dyn IngestStore>, secret: &str) -> AppState {
+        let mut state = state(Vec::new());
+        state.ingest = Some(store);
+        state.ingest_secret = Some(Arc::from(secret));
+        state
+    }
+
+    #[tokio::test]
+    async fn ingest_route_authenticates_before_writing_and_preserves_replay_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn IngestStore> =
+            Arc::new(iris_storage::LocalFsIngestStore::new(temp.path()));
+        let batch = ingest_batch("event-1");
+        let body = serde_json::to_vec(&batch).unwrap();
+
+        let unauthorized = router(ingest_state(store.clone(), "secret"))
+            .oneshot(
+                Request::post("/ingest/herdr")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(matches!(
+            store.apply_batch(batch.clone()).await.unwrap(),
+            IngestOutcome::Applied { .. }
+        ));
+
+        let idempotent = router(ingest_state(store.clone(), "secret"))
+            .oneshot(
+                Request::post("/ingest/herdr")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(axum::body::Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(idempotent.status(), StatusCode::OK);
+
+        let malformed = router(ingest_state(store.clone(), "secret"))
+            .oneshot(
+                Request::post("/ingest/herdr")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"batch_hash":"caller-supplied"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        let mut conflict = batch;
+        conflict.cursor = Some(IngestCursor {
+            source: "herdr".to_owned(),
+            value: "different".to_owned(),
+        });
+        let conflict_response = router(ingest_state(store, "secret"))
+            .oneshot(
+                Request::post("/ingest/herdr")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&conflict).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict_response.status(), StatusCode::CONFLICT);
     }
 
     #[test]

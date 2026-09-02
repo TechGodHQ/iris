@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use iris_core::{
-    AuditAction, AuditEntry, AuditFilter, AuditLog, Contact, IrisError, Message, MessageProvider,
-    OutboundMessage, Thread,
+    AuditAction, AuditEntry, AuditFilter, AuditLog, Contact, IngestBatch, IngestOutcome,
+    IngestStore, IrisError, Message, MessageProvider, OutboundMessage, Thread,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -35,13 +35,25 @@ pub fn generated_tools() -> serde_json::Result<Value> {
 pub struct McpServer {
     providers: Vec<Arc<dyn MessageProvider>>,
     audit: Arc<dyn AuditLog>,
+    ingest: Option<Arc<dyn IngestStore>>,
 }
 
 impl McpServer {
     /// Create an MCP server backed by the given providers and audit log.
     #[must_use]
     pub fn new(providers: Vec<Arc<dyn MessageProvider>>, audit: Arc<dyn AuditLog>) -> Self {
-        Self { providers, audit }
+        Self {
+            providers,
+            audit,
+            ingest: None,
+        }
+    }
+
+    /// Attach the local transactional ingest backend for the generated ingest tool.
+    #[must_use]
+    pub fn with_ingest(mut self, ingest: Arc<dyn IngestStore>) -> Self {
+        self.ingest = Some(ingest);
+        self
     }
 
     /// Handle a single JSON-RPC request value and return a JSON-RPC response.
@@ -80,6 +92,7 @@ impl McpServer {
             "list_messages" => serde_json::to_value(self.list_messages(&request.arguments).await?)?,
             "send_message" => serde_json::to_value(self.send_message(&request.arguments).await?)?,
             "audit_query" => serde_json::to_value(self.audit_query(&request.arguments).await?)?,
+            "ingest_herdr" => serde_json::to_value(self.ingest_herdr(&request.arguments).await?)?,
             other => anyhow::bail!("unknown Iris MCP tool: {other}"),
         };
 
@@ -163,6 +176,33 @@ impl McpServer {
             None => self.provider_for_thread(&args.thread_id).await?,
         };
         Ok(provider.send_message(&args.thread_id, &outbound).await?)
+    }
+
+    async fn ingest_herdr(&self, arguments: &Value) -> anyhow::Result<Value> {
+        let batch: IngestBatch = serde_json::from_value(
+            arguments
+                .get("batch")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing ingest batch"))?,
+        )?;
+        if batch.source != "herdr" {
+            anyhow::bail!("ingest_herdr requires batch.source to be herdr");
+        }
+        let store = self
+            .ingest
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Herdr ingest is not configured"))?;
+        Ok(match store.apply_batch(batch).await? {
+            IngestOutcome::Applied { committed_at } => {
+                json!({"outcome": "applied", "committed_at": committed_at})
+            }
+            IngestOutcome::AlreadyApplied { committed_at } => {
+                json!({"outcome": "already_applied", "committed_at": committed_at})
+            }
+            IngestOutcome::ReplayConflict => {
+                anyhow::bail!("replay key conflicts with an existing batch")
+            }
+        })
     }
 
     async fn audit_query(&self, arguments: &Value) -> anyhow::Result<Vec<AuditEntry>> {
@@ -499,7 +539,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0]["result"]["tools"].as_array().expect("tools").len(),
-            5
+            6
         );
         assert_eq!(lines[1]["result"]["isError"], false);
     }

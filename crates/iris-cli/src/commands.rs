@@ -2,7 +2,8 @@
 
 use clap::Args;
 use iris_core::{
-    AuditAction, AuditFilter, AuditLog, MessageProvider, OutboundAttachment, OutboundMessage,
+    AuditAction, AuditFilter, AuditLog, IngestBatch, IngestOutcome, MessageProvider,
+    OutboundAttachment, OutboundMessage,
 };
 use iris_providers::config::{IrisConfig, providers_from_config, providers_from_default_config};
 
@@ -55,6 +56,7 @@ async fn execute_generated_operation(
         "list_contacts" => list_contacts(serde_json::from_value(parameters)?).await,
         "send_message" => send_message(serde_json::from_value(parameters)?).await,
         "audit_query" => audit_query(serde_json::from_value(parameters)?).await,
+        "ingest_herdr" => ingest_herdr(serde_json::from_value(parameters)?).await,
         "subscribe_events" => subscribe_events(serde_json::from_value(parameters)?).await,
         other => {
             anyhow::bail!("generated operation is not implemented by the CLI runtime: {other}")
@@ -86,6 +88,31 @@ fn audit_log() -> std::sync::Arc<dyn AuditLog> {
         path.to_string_lossy().into_owned()
     });
     std::sync::Arc::new(iris_audit::LocalFsAuditLog::new(audit_dir))
+}
+
+fn ingest_configuration() -> (
+    Option<std::sync::Arc<dyn iris_core::IngestStore>>,
+    Option<std::sync::Arc<str>>,
+) {
+    let secret = std::env::var("IRIS_HERDR_INGEST_SECRET")
+        .ok()
+        .filter(|secret| !secret.trim().is_empty());
+    let Some(secret) = secret else {
+        return (None, None);
+    };
+    let ingest_dir = std::env::var("IRIS_INGEST_DIR").unwrap_or_else(|_| {
+        let mut path =
+            dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("./.iris"));
+        path.push("iris");
+        path.push("ingest");
+        path.to_string_lossy().into_owned()
+    });
+    (
+        Some(std::sync::Arc::new(iris_storage::LocalFsIngestStore::new(
+            ingest_dir,
+        ))),
+        Some(std::sync::Arc::from(secret)),
+    )
 }
 
 async fn list_threads(args: generated::ListThreadsArgs) -> anyhow::Result<()> {
@@ -208,6 +235,30 @@ async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
     print_json(&query_audit_entries(&audit_log(), args).await?)
 }
 
+async fn ingest_herdr(args: generated::IngestHerdrArgs) -> anyhow::Result<()> {
+    let (store, _) = ingest_configuration();
+    let Some(store) = store else {
+        anyhow::bail!("IRIS_HERDR_INGEST_SECRET must be configured before local ingest");
+    };
+    let batch: IngestBatch = serde_json::from_value(args.batch)?;
+    if batch.source != "herdr" {
+        anyhow::bail!("ingest_herdr requires batch.source to be herdr");
+    }
+    let outcome = match store.apply_batch(batch).await? {
+        IngestOutcome::Applied { committed_at } => {
+            serde_json::json!({"outcome": "applied", "committed_at": committed_at})
+        }
+        IngestOutcome::AlreadyApplied { committed_at } => {
+            serde_json::json!({"outcome": "already_applied", "committed_at": committed_at})
+        }
+        IngestOutcome::ReplayConflict => {
+            anyhow::bail!("replay key conflicts with an existing batch")
+        }
+    };
+    println!("{}", serde_json::to_string(&outcome)?);
+    Ok(())
+}
+
 /// `subscribe_events` — the generated `iris watch` surface.
 ///
 /// Streams `GET /v1/events` from `IRIS_SERVER_URL` (default
@@ -267,7 +318,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let store = attachment_store();
     let audit = audit_log();
     let providers = get_providers_from_path(args.config.as_deref(), &store, &audit)?;
-    let app = iris_server::create_app(providers.clone(), store, audit);
+    let (ingest, ingest_secret) = ingest_configuration();
+    let app =
+        iris_server::create_app_with_ingest(providers.clone(), store, audit, ingest, ingest_secret);
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
     tracing::info!("Iris server listening on {}", args.addr);
