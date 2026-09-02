@@ -49,8 +49,8 @@ pub struct IngestBatch {
     pub mutations: Vec<IngestMutation>,
     /// Cursor to commit with the mutations, if the source provides one.
     pub cursor: Option<IngestCursor>,
-    /// Audit event to commit with the normalized writes.
-    pub audit: AuditEvent,
+    /// Optional audit event to commit with the normalized writes.
+    pub audit: Option<AuditEvent>,
 }
 
 impl IngestBatch {
@@ -79,7 +79,7 @@ struct CanonicalBatch<'a> {
     source: &'a str,
     mutations: &'a [IngestMutation],
     cursor: &'a Option<IngestCursor>,
-    audit: &'a AuditEvent,
+    audit: &'a Option<AuditEvent>,
 }
 
 /// Result of applying a replayable batch.
@@ -137,13 +137,13 @@ mod tests {
                 source: "herdr".into(),
                 value: "42".into(),
             }),
-            audit: AuditEvent {
+            audit: Some(AuditEvent {
                 action: crate::AuditAction::Normalize,
                 provider: "herdr".into(),
                 source_id: Some("event-1".into()),
                 timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
                 metadata: json!({"nested": {"z": 2, "a": 1}}),
-            },
+            }),
         }
     }
 
@@ -151,7 +151,7 @@ mod tests {
     fn canonical_hash_is_stable_across_object_key_order() {
         let mut first = batch(vec![]);
         let second = batch(vec![]);
-        first.audit.metadata = json!({"nested": {"a": 1, "z": 2}});
+        first.audit.as_mut().unwrap().metadata = json!({"nested": {"a": 1, "z": 2}});
         assert_eq!(
             first.canonical_hash().unwrap(),
             second.canonical_hash().unwrap()

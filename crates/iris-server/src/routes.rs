@@ -981,13 +981,13 @@ mod tests {
                 source: "herdr".to_owned(),
                 value: "42".to_owned(),
             }),
-            audit: AuditEvent {
+            audit: Some(AuditEvent {
                 action: AuditAction::Normalize,
                 provider: "herdr".to_owned(),
                 source_id: Some(replay_key.to_owned()),
                 timestamp: Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap(),
                 metadata: serde_json::json!({"event": "bridge_heartbeat"}),
-            },
+            }),
         }
     }
 

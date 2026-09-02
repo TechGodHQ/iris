@@ -177,7 +177,7 @@ operations:
               type: object
             audit:
               type: object
-          required: [source, replay_key, mutations, audit]
+          required: [source, replay_key, mutations]
           additionalProperties: false
         cli:
           flag: batch

@@ -226,8 +226,7 @@
             "required": [
               "source",
               "replay_key",
-              "mutations",
-              "audit"
+              "mutations"
             ],
             "type": "object"
           }

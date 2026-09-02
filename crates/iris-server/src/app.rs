@@ -81,6 +81,8 @@ pub fn create_app_with_ingest_and_sse(
     ingest_secret: Option<Arc<str>>,
     sse: SseSettings,
 ) -> Router {
+    // A blank environment value must never turn into a valid empty bearer token.
+    let ingest_secret = ingest_secret.filter(|secret| !secret.trim().is_empty());
     let state = AppState {
         providers,
         thread_owners: Arc::new(RwLock::new(HashMap::new())),
