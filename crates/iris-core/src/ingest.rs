@@ -39,6 +39,7 @@ pub struct IngestCursor {
 
 /// A fully normalized, source-scoped batch ready for durable ingestion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct IngestBatch {
     /// Source namespace, for example `herdr`.
     pub source: String,

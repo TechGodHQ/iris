@@ -1028,14 +1028,14 @@ mod tests {
             .unwrap();
         assert_eq!(idempotent.status(), StatusCode::OK);
 
+        let mut malformed_batch = serde_json::to_value(&batch).unwrap();
+        malformed_batch["batch_hash"] = serde_json::json!("caller-supplied");
         let malformed = router(ingest_state(store.clone(), "secret"))
             .oneshot(
                 Request::post("/ingest/herdr")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, "Bearer secret")
-                    .body(axum::body::Body::from(
-                        serde_json::json!({"batch_hash":"caller-supplied"}).to_string(),
-                    ))
+                    .body(axum::body::Body::from(malformed_batch.to_string()))
                     .unwrap(),
             )
             .await

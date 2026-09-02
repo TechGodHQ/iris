@@ -240,7 +240,10 @@ async fn ingest_herdr(args: generated::IngestHerdrArgs) -> anyhow::Result<()> {
     let Some(store) = store else {
         anyhow::bail!("IRIS_HERDR_INGEST_SECRET must be configured before local ingest");
     };
-    let batch: IngestBatch = serde_json::from_value(args.batch)?;
+    let batch: IngestBatch = match args.batch {
+        serde_json::Value::String(encoded) => serde_json::from_str(&encoded)?,
+        value => serde_json::from_value(value)?,
+    };
     if batch.source != "herdr" {
         anyhow::bail!("ingest_herdr requires batch.source to be herdr");
     }
