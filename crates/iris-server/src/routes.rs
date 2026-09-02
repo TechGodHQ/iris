@@ -10,15 +10,17 @@ mod generated {
 use axum::{
     Router,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::{Request, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::get,
 };
 use iris_core::{
-    AuditAction, AuditEntry, AuditFilter, Contact, IrisError, Message, MessageProvider,
-    OutboundMessage, ProviderCapability, Thread,
+    AuditAction, AuditEntry, AuditFilter, Contact, IngestBatch, IngestOutcome, IrisError, Message,
+    MessageProvider, OutboundMessage, ProviderCapability, Thread,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::app::AppState;
@@ -64,12 +66,14 @@ pub struct ProviderResponse {
 
 pub fn router(state: AppState) -> Router {
     debug_assert!(!generated::GENERATED_ROUTES.is_empty());
+    let generated = generated::generated_router()
+        .layer(middleware::from_fn_with_state(state.clone(), ingest_auth));
     let router = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/providers", get(list_providers))
         .route("/v1/attachments/{id}/content", get(get_attachment_content))
-        .merge(generated::generated_router());
+        .merge(generated);
     // Bind generated SSE operations before applying state (the generated
     // binding hook is typed over `Router<AppState>`).
     let router = generated::bind_subscribe_events(router);
@@ -81,6 +85,56 @@ pub fn router(state: AppState) -> Router {
         "generated SSE metadata must cover the runtime-bound subscribe_events route"
     );
     router.with_state(state)
+}
+
+/// Reject unauthenticated Herdr ingest requests before JSON extraction or any
+/// durable-store access. Other generated operations remain unaffected.
+async fn ingest_auth(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if request.uri().path() != "/ingest/herdr" {
+        return next.run(request).await;
+    }
+    let Some(secret) = state.ingest_secret.as_deref() else {
+        return unavailable("Herdr ingest is not configured");
+    };
+    let authorization = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if authorization.is_none_or(|provided| !constant_time_secret_eq(secret, provided)) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid or missing bearer authorization".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn constant_time_secret_eq(expected: &str, provided: &str) -> bool {
+    let expected = Sha256::digest(expected.as_bytes());
+    let provided = Sha256::digest(provided.as_bytes());
+    let mut difference = 0_u8;
+    for (left, right) in expected.iter().zip(provided.iter()) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+fn unavailable(error: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: error.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 /// Runtime binding for the generated `subscribe_events` SSE operation.
@@ -228,6 +282,7 @@ pub(crate) async fn execute_generated_operation(
             Ok(response) => response.into_response(),
             Err(response) => response.into_response(),
         },
+        "ingest_herdr" => ingest_herdr(state, input).await,
         other => (
             StatusCode::NOT_IMPLEMENTED,
             Json(ErrorResponse {
@@ -345,6 +400,39 @@ async fn send_message(
         .await
         .map_err(|error| provider_error(provider.id(), &error))?;
     Ok(Json(message))
+}
+
+async fn ingest_herdr(state: &AppState, input: generated::GeneratedOperationInput) -> Response {
+    let Some(store) = state.ingest.as_ref() else {
+        return unavailable("Herdr ingest is not configured");
+    };
+    let batch: IngestBatch = match serde_json::from_value(input.body) {
+        Ok(batch) => batch,
+        Err(error) => return bad_request(error.to_string()).into_response(),
+    };
+    if batch.source != "herdr" {
+        return bad_request("ingest_herdr requires batch.source to be herdr").into_response();
+    }
+    match store.apply_batch(batch).await {
+        Ok(IngestOutcome::Applied { committed_at }) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"outcome": "applied", "committed_at": committed_at})),
+        )
+            .into_response(),
+        Ok(IngestOutcome::AlreadyApplied { committed_at }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"outcome": "already_applied", "committed_at": committed_at})),
+        )
+            .into_response(),
+        Ok(IngestOutcome::ReplayConflict) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "replay key conflicts with an existing batch".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => bad_request(error.to_string()).into_response(),
+    }
 }
 
 async fn audit_query(
@@ -809,6 +897,8 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            ingest: None,
+            ingest_secret: None,
             sse: crate::sse::SseSettings::default(),
         }
     }
@@ -895,6 +985,8 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            ingest: None,
+            ingest_secret: None,
             sse: crate::sse::SseSettings::default(),
         };
         let _router = super::router(app_state);
@@ -1114,6 +1206,8 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            ingest: None,
+            ingest_secret: None,
             sse: crate::sse::SseSettings::default(),
         };
         let mut input = input_with_thread(thread_id, &[]);
@@ -1239,6 +1333,8 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            ingest: None,
+            ingest_secret: None,
             sse: crate::sse::SseSettings::default(),
         };
 
@@ -1272,6 +1368,8 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            ingest: None,
+            ingest_secret: None,
             sse: crate::sse::SseSettings::default(),
         };
 
@@ -1294,6 +1392,8 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            ingest: None,
+            ingest_secret: None,
             sse: crate::sse::SseSettings::default(),
         };
 
@@ -1327,6 +1427,8 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            ingest: None,
+            ingest_secret: None,
             sse: crate::sse::SseSettings::default(),
         };
 
@@ -1367,6 +1469,8 @@ mod tests {
             audit: Arc::new(iris_audit::LocalFsAuditLog::new(
                 "/tmp/iris-server-test-audit",
             )),
+            ingest: None,
+            ingest_secret: None,
             sse: crate::sse::SseSettings::default(),
         };
 

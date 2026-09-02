@@ -150,6 +150,37 @@ operations:
         type: u32
         required: false
         location: query
+  - name: ingest_herdr
+    description: Transactionally ingest a normalized, replayable Herdr batch.
+    method: POST
+    path: /ingest/herdr
+    read: false
+    output_type: json
+    parameters:
+      - name: batch
+        description: Serialized normalized `IngestBatch`. The server computes its canonical hash; `batch_hash` is forbidden.
+        type: json
+        required: true
+        location: body
+        schema:
+          type: object
+          properties:
+            source:
+              type: string
+            replay_key:
+              type: string
+            mutations:
+              type: array
+              items:
+                type: object
+            cursor:
+              type: object
+            audit:
+              type: object
+          required: [source, replay_key, mutations, audit]
+          additionalProperties: false
+        cli:
+          flag: batch
   - name: subscribe_events
     description: Subscribe to a fallible realtime event stream over SSE.
     method: GET
