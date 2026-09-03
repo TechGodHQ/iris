@@ -10,7 +10,7 @@
 pub mod realtime;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -42,6 +42,35 @@ const METADATA: ProviderMetadata = ProviderMetadata {
 };
 const UUID_NAMESPACE: Uuid = Uuid::from_u128(0x6e6c_4e12_1a7d_4a3c_8b53_8914_42f3_0001);
 
+/// Runtime state shared by every provider instance for one Telegram endpoint.
+///
+/// The registry key is the process-local `(base URL, bot token)` pair. This is
+/// deliberately broader than a single provider value: independently constructed
+/// providers for the same bot must not create competing `getUpdates` pollers.
+#[derive(Debug, Default)]
+struct TelegramRuntime {
+    realtime: OnceLock<Arc<RealtimeHub>>,
+}
+
+fn runtime_registry() -> &'static Mutex<HashMap<String, Weak<TelegramRuntime>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Weak<TelegramRuntime>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn shared_runtime(base_url: &str, bot_token: &str) -> Arc<TelegramRuntime> {
+    let key = format!("{base_url}\u{0}{bot_token}");
+    let mut registry = runtime_registry()
+        .lock()
+        .expect("runtime registry mutex poisoned");
+    registry.retain(|_, runtime| runtime.strong_count() > 0);
+    if let Some(runtime) = registry.get(&key).and_then(Weak::upgrade) {
+        return runtime;
+    }
+    let runtime = Arc::new(TelegramRuntime::default());
+    registry.insert(key, Arc::downgrade(&runtime));
+    runtime
+}
+
 /// Telegram provider backed by the Bot API.
 #[derive(Debug, Clone)]
 pub struct TelegramProvider {
@@ -53,10 +82,9 @@ pub struct TelegramProvider {
     /// instead of transient Telegram `file_id` references that expire after ~1h.
     attachments: Arc<dyn AttachmentStore>,
     audit: Option<Arc<dyn AuditLog>>,
-    /// Lazily-created realtime hub. Interior mutability without `Clone`
-    /// breakage: the hub is created on the first `subscribe_realtime` call
-    /// and shared between provider clones via `Arc`.
-    realtime: std::sync::OnceLock<Arc<RealtimeHub>>,
+    /// Clone-shared realtime hub holder. The hub is created on the first HTTP
+    /// read or realtime subscription and is the sole `getUpdates` owner.
+    runtime: Arc<TelegramRuntime>,
     /// Optional realtime poller settings override (validated on hub creation).
     realtime_settings: Option<RealtimeSettings>,
 }
@@ -80,14 +108,16 @@ impl TelegramProvider {
         if bot_token.trim().is_empty() {
             return Err(IrisError::Config("telegram bot_token is required".into()));
         }
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        let runtime = shared_runtime(&base_url, &bot_token);
 
         Ok(Self {
             client: reqwest::Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            base_url,
             bot_token,
             attachments,
             audit: None,
-            realtime: std::sync::OnceLock::new(),
+            runtime,
             realtime_settings: None,
         })
     }
@@ -109,22 +139,23 @@ impl TelegramProvider {
         self
     }
 
-    /// The lazily-created realtime hub shared by this provider instance.
-    fn realtime_hub(&self) -> Arc<RealtimeHub> {
+    /// The lazily-created realtime hub shared by this Telegram endpoint.
+    fn realtime_hub(&self) -> Result<Arc<RealtimeHub>> {
         let settings = self.realtime_settings.clone().unwrap_or_default();
-        self.realtime
-            .get_or_init(|| match RealtimeHub::new(settings) {
-                Ok(hub) => Arc::new(hub),
-                // Settings were validated by construction here; unreachable
-                // in practice.
-                Err(error) => panic!("invalid realtime settings: {error}"),
+        settings.validate()?;
+        Ok(self
+            .runtime
+            .realtime
+            .get_or_init(|| {
+                Arc::new(RealtimeHub::new(settings).expect("validated realtime settings"))
             })
-            .clone()
+            .clone())
     }
 
     /// Snapshot an existing realtime hub without creating one.
     fn existing_realtime_status(&self) -> iris_core::RealtimeStatus {
-        self.realtime
+        self.runtime
+            .realtime
             .get()
             .map_or_else(iris_core::RealtimeStatus::inactive, |hub| hub.status())
     }
@@ -163,24 +194,22 @@ impl TelegramProvider {
         Self::new(token.clone(), attachments)
     }
 
-    /// Poll Telegram updates once, suitable for callers that want to drive
-    /// realtime reception with their own cursor storage.
+    /// Read normalized updates retained by the single realtime owner.
+    ///
+    /// This intentionally does not issue `getUpdates`: the realtime hub is
+    /// the sole Telegram update consumer. Calling this method admits the
+    /// caller to hub polling and returns the currently retained snapshot.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn poll_updates(
         &self,
         offset: Option<i64>,
-        timeout_seconds: Option<u32>,
+        _timeout_seconds: Option<u32>,
     ) -> Result<Vec<TelegramPolledMessage>> {
         Ok(self
-            .get_updates(offset, timeout_seconds)
-            .await?
+            .realtime_hub()?
+            .snapshot_updates(self.clone())
             .into_iter()
-            .filter_map(|update| {
-                update.message.map(|message| TelegramPolledMessage {
-                    update_id: update.update_id,
-                    next_offset: update.update_id + 1,
-                    message: message.to_message(),
-                })
-            })
+            .filter(|update| offset.is_none_or(|cursor| update.update_id >= cursor))
             .collect())
     }
 
@@ -225,46 +254,20 @@ impl TelegramProvider {
         Ok(envelope.into_result()?.to_message())
     }
 
-    async fn get_updates(
-        &self,
-        offset: Option<i64>,
-        timeout_seconds: Option<u32>,
-    ) -> Result<Vec<TelegramUpdate>> {
-        let mut query = vec![("allowed_updates".to_owned(), "[\"message\"]".to_owned())];
-        if let Some(offset) = offset {
-            query.push(("offset".to_owned(), offset.to_string()));
-        }
-        if let Some(timeout) = timeout_seconds {
-            query.push(("timeout".to_owned(), timeout.to_string()));
-        }
-
-        let response = self
-            .client
-            .get(self.method_url("getUpdates"))
-            .query(&query)
-            .send()
-            .await
-            .map_err(|error| IrisError::Transport(error.to_string()))?;
-        let envelope: TelegramResponse<Vec<TelegramUpdate>> = response
-            .json()
-            .await
-            .map_err(|error| IrisError::Serialization(error.to_string()))?;
-        envelope.into_result()
-    }
-
-    async fn resolve_chat_id(&self, thread_id: &str) -> Result<i64> {
+    fn resolve_chat_id(&self, thread_id: &str) -> Result<i64> {
         if let Ok(chat_id) = thread_id.parse::<i64>() {
             return Ok(chat_id);
         }
         let requested = Uuid::parse_str(thread_id).map_err(|_| {
             IrisError::Config("telegram thread id must be an Iris UUID or numeric chat id".into())
         })?;
-        self.get_updates(None, None)
-            .await?
+        self.realtime_hub()?
+            .snapshot_messages(self.clone())
             .into_iter()
-            .filter_map(|update| update.message)
             .find_map(|message| {
-                (thread_uuid(message.chat.id) == requested).then_some(message.chat.id)
+                (message.thread_id == requested)
+                    .then(|| message.metadata.get("chat_id").and_then(Value::as_i64))
+                    .flatten()
             })
             .ok_or_else(|| IrisError::NotFound(format!("telegram thread not found: {thread_id}")))
     }
@@ -358,6 +361,7 @@ impl TelegramProvider {
     /// If an individual download fails (e.g. file expired), the attachment
     /// keeps its original pseudo-URL so the message is still visible to
     /// consumers — one expired file should not block the whole listing.
+    #[allow(dead_code)]
     async fn store_message_attachments(&self, messages: &mut [Message]) -> Result<()> {
         for message in messages.iter_mut() {
             let message_source_id = message.source_id.clone();
@@ -418,20 +422,20 @@ impl MessageProvider for TelegramProvider {
 
     async fn list_threads(&self, limit: Option<u32>) -> Result<Vec<Thread>> {
         let mut by_chat = BTreeMap::<i64, Thread>::new();
-        for update in self.get_updates(None, None).await? {
-            if let Some(message) = update.message {
-                let thread = message.to_thread();
-                by_chat
-                    .entry(message.chat.id)
-                    .and_modify(|existing| {
-                        if thread.last_message_at > existing.last_message_at {
-                            existing.last_message_at = thread.last_message_at;
-                        }
-                        existing.participants.extend(thread.participants.clone());
-                        dedupe_contacts(&mut existing.participants);
-                    })
-                    .or_insert(thread);
-            }
+        for thread in self.realtime_hub()?.snapshot_threads(self.clone()) {
+            let chat_id = thread.source_id.parse::<i64>().map_err(|_| {
+                IrisError::Serialization("retained Telegram thread has invalid chat id".into())
+            })?;
+            by_chat
+                .entry(chat_id)
+                .and_modify(|existing| {
+                    if thread.last_message_at > existing.last_message_at {
+                        existing.last_message_at = thread.last_message_at;
+                    }
+                    existing.participants.extend(thread.participants.clone());
+                    dedupe_contacts(&mut existing.participants);
+                })
+                .or_insert(thread);
         }
 
         let mut threads: Vec<_> = by_chat.into_values().collect();
@@ -453,18 +457,19 @@ impl MessageProvider for TelegramProvider {
         limit: Option<u32>,
     ) -> Result<Vec<Message>> {
         let mut messages: Vec<_> = self
-            .get_updates(None, None)
-            .await?
+            .realtime_hub()?
+            .snapshot_messages(self.clone())
             .into_iter()
-            .filter_map(|update| update.message)
-            .filter(|message| message.chat_matches_thread(thread_id))
-            .map(|message| message.to_message())
+            .filter(|message| {
+                message.thread_id.to_string() == thread_id
+                    || message
+                        .metadata
+                        .get("chat_id")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|chat_id| chat_id.to_string() == thread_id)
+            })
             .filter(|message| before.is_none_or(|cursor| message.timestamp < cursor))
             .collect();
-
-        // Eagerly download and store attachment bytes, rewriting pseudo-URLs
-        // to stable Iris URLs. Failures are per-attachment, not fatal.
-        self.store_message_attachments(&mut messages).await?;
 
         messages.sort_by_key(|m| m.timestamp);
         messages.truncate(limit.unwrap_or(50) as usize);
@@ -478,20 +483,7 @@ impl MessageProvider for TelegramProvider {
     }
 
     async fn list_contacts(&self, limit: Option<u32>) -> Result<Vec<Contact>> {
-        let mut contacts = Vec::new();
-        for update in self.get_updates(None, None).await? {
-            if let Some(message) = update.message {
-                if let Some(from) = message.from {
-                    contacts.push(from.to_contact());
-                }
-                contacts.extend(
-                    message
-                        .new_chat_members
-                        .iter()
-                        .map(TelegramUser::to_contact),
-                );
-            }
-        }
+        let mut contacts = self.realtime_hub()?.snapshot_contacts(self.clone());
         dedupe_contacts(&mut contacts);
         contacts.truncate(limit.unwrap_or(50) as usize);
         self.record(
@@ -517,7 +509,7 @@ impl MessageProvider for TelegramProvider {
             iris_core::outbound::resolve_attachments(message, Some(&self.attachments)).await?
         };
 
-        let chat_id = self.resolve_chat_id(thread_id).await?;
+        let chat_id = self.resolve_chat_id(thread_id)?;
 
         if message.is_text_only() {
             let response = self
@@ -625,13 +617,7 @@ impl MessageProvider for TelegramProvider {
                 code: "audit sink required for realtime ingress".into(),
             });
         }
-        // Validate settings here (not inside hub construction) so invalid
-        // config surfaces as `IrisError::Config` rather than a panic from
-        // `get_or_init`, which cannot return an error.
-        if let Some(settings) = &self.realtime_settings {
-            settings.validate()?;
-        }
-        let hub = self.realtime_hub();
+        let hub = self.realtime_hub()?;
         hub.subscribe(self.clone())
     }
 
@@ -640,7 +626,7 @@ impl MessageProvider for TelegramProvider {
     /// Cancels any in-flight long poll, joins the poller task, and ends
     /// every subscriber stream. Idempotent.
     async fn shutdown_realtime(&self) -> Result<()> {
-        if let Some(hub) = self.realtime.get() {
+        if let Some(hub) = self.runtime.realtime.get() {
             hub.shutdown().await;
         }
         Ok(())
@@ -677,12 +663,6 @@ pub struct TelegramPolledMessage {
     pub next_offset: i64,
     /// Normalized Iris message.
     pub message: Message,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct TelegramUpdate {
-    update_id: i64,
-    message: Option<TelegramMessage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -767,10 +747,6 @@ struct TelegramFilePayload {
 }
 
 impl TelegramMessage {
-    fn chat_matches_thread(&self, thread_id: &str) -> bool {
-        self.chat.id.to_string() == thread_id || thread_uuid(self.chat.id).to_string() == thread_id
-    }
-
     fn to_thread(&self) -> Thread {
         let mut participants = Vec::new();
         if let Some(from) = &self.from {
@@ -860,6 +836,7 @@ impl TelegramMessage {
         let mut metadata = serde_json::Map::new();
         metadata.insert("chat_id".into(), json!(self.chat.id));
         metadata.insert("chat_type".into(), json!(self.chat.kind));
+        metadata.insert("chat_title".into(), json!(self.chat.title()));
         if let Some(photo) = &self.photo {
             metadata.insert("photo".into(), json!(photo));
         }
