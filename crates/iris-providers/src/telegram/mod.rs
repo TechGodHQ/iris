@@ -199,18 +199,19 @@ impl TelegramProvider {
     /// This intentionally does not issue `getUpdates`: the realtime hub is
     /// the sole Telegram update consumer. Calling this method admits the
     /// caller to hub polling and returns the currently retained snapshot.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn poll_updates(
+    pub fn poll_updates(
         &self,
         offset: Option<i64>,
         _timeout_seconds: Option<u32>,
-    ) -> Result<Vec<TelegramPolledMessage>> {
-        Ok(self
-            .realtime_hub()?
-            .snapshot_updates(self.clone())
-            .into_iter()
-            .filter(|update| offset.is_none_or(|cursor| update.update_id >= cursor))
-            .collect())
+    ) -> impl std::future::Future<Output = Result<Vec<TelegramPolledMessage>>> {
+        match self.realtime_hub() {
+            Ok(hub) => std::future::ready(Ok(hub
+                .snapshot_updates(self.clone())
+                .into_iter()
+                .filter(|update| offset.is_none_or(|cursor| update.update_id >= cursor))
+                .collect())),
+            Err(error) => std::future::ready(Err(error)),
+        }
     }
 
     /// Send one media request for a resolved attachment, selecting the
