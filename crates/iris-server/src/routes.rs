@@ -9,6 +9,7 @@ mod generated {
 
 use axum::{
     Router,
+    body::{Body, to_bytes},
     extract::{Path, State},
     http::{Request, StatusCode, header},
     middleware::{self, Next},
@@ -87,21 +88,42 @@ pub fn router(state: AppState) -> Router {
     router.with_state(state)
 }
 
-/// Reject unauthenticated Herdr ingest requests before JSON extraction or any
-/// durable-store access. Other generated operations remain unaffected.
+const MAX_INGEST_BODY_BYTES: usize = 1024 * 1024;
+
+#[derive(Deserialize)]
+struct IngestSource {
+    source: String,
+}
+
+/// Select and authenticate a configured ingest source before JSON extraction
+/// reaches the generated operation handler or durable store.
 async fn ingest_auth(
     State(state): State<AppState>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if request.uri().path() != "/ingest/herdr" {
+    if request.uri().path() != "/ingest" {
         return next.run(request).await;
     }
-    let Some(secret) = state.ingest_secret.as_deref() else {
-        return unavailable("Herdr ingest is not configured");
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = to_bytes(body, MAX_INGEST_BODY_BYTES).await else {
+        return bad_request("ingest request body exceeds the configured limit").into_response();
     };
-    let authorization = request
-        .headers()
+    let source = match serde_json::from_slice::<IngestSource>(&bytes) {
+        Ok(batch) => batch.source,
+        Err(error) => return bad_request(error.to_string()).into_response(),
+    };
+    if !state.ingest_sources.contains(&source) {
+        return bad_request(format!("ingest source is not configured: {source}")).into_response();
+    }
+    let Some(secret) = state.ingest_secrets.get(&source) else {
+        return unavailable("ingest source secret is not configured");
+    };
+    if state.ingest.is_none() {
+        return unavailable("ingest service is not configured");
+    }
+    let authorization = parts
+        .headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
@@ -114,7 +136,8 @@ async fn ingest_auth(
         )
             .into_response();
     }
-    next.run(request).await
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
 
 fn constant_time_secret_eq(expected: &str, provided: &str) -> bool {
@@ -282,7 +305,7 @@ pub(crate) async fn execute_generated_operation(
             Ok(response) => response.into_response(),
             Err(response) => response.into_response(),
         },
-        "ingest_herdr" => ingest_herdr(state, input).await,
+        "ingest_batch" => ingest_batch(state, input).await,
         other => (
             StatusCode::NOT_IMPLEMENTED,
             Json(ErrorResponse {
@@ -402,16 +425,17 @@ async fn send_message(
     Ok(Json(message))
 }
 
-async fn ingest_herdr(state: &AppState, input: generated::GeneratedOperationInput) -> Response {
+async fn ingest_batch(state: &AppState, input: generated::GeneratedOperationInput) -> Response {
     let Some(store) = state.ingest.as_ref() else {
-        return unavailable("Herdr ingest is not configured");
+        return unavailable("ingest service is not configured");
     };
     let batch: IngestBatch = match serde_json::from_value(input.body) {
         Ok(batch) => batch,
         Err(error) => return bad_request(error.to_string()).into_response(),
     };
-    if batch.source != "herdr" {
-        return bad_request("ingest_herdr requires batch.source to be herdr").into_response();
+    if !state.ingest_sources.contains(&batch.source) {
+        return bad_request(format!("ingest source is not configured: {}", batch.source))
+            .into_response();
     }
     match store.apply_batch(batch).await {
         Ok(IngestOutcome::Applied { committed_at }) => (
@@ -905,7 +929,8 @@ mod tests {
                 "/tmp/iris-server-test-audit",
             )),
             ingest: None,
-            ingest_secret: None,
+            ingest_sources: std::collections::BTreeSet::new(),
+            ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
         }
     }
@@ -974,16 +999,16 @@ mod tests {
 
     fn ingest_batch(replay_key: &str) -> IngestBatch {
         IngestBatch {
-            source: "herdr".to_owned(),
+            source: "alpha".to_owned(),
             replay_key: replay_key.to_owned(),
             mutations: Vec::new(),
             cursor: Some(IngestCursor {
-                source: "herdr".to_owned(),
+                source: "alpha".to_owned(),
                 value: "42".to_owned(),
             }),
             audit: Some(AuditEvent {
                 action: AuditAction::Normalize,
-                provider: "herdr".to_owned(),
+                provider: "alpha".to_owned(),
                 source_id: Some(replay_key.to_owned()),
                 timestamp: Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap(),
                 metadata: serde_json::json!({"event": "bridge_heartbeat"}),
@@ -994,7 +1019,10 @@ mod tests {
     fn ingest_state(store: Arc<dyn IngestStore>, secret: &str) -> AppState {
         let mut state = state(Vec::new());
         state.ingest = Some(store);
-        state.ingest_secret = Some(Arc::from(secret));
+        state.ingest_sources.insert("alpha".to_owned());
+        state
+            .ingest_secrets
+            .insert("alpha".to_owned(), Arc::from(secret));
         state
     }
 
@@ -1008,7 +1036,7 @@ mod tests {
 
         let unauthorized = router(ingest_state(store.clone(), "secret"))
             .oneshot(
-                Request::post("/ingest/herdr")
+                Request::post("/ingest")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(axum::body::Body::from(body.clone()))
                     .unwrap(),
@@ -1023,7 +1051,7 @@ mod tests {
 
         let idempotent = router(ingest_state(store.clone(), "secret"))
             .oneshot(
-                Request::post("/ingest/herdr")
+                Request::post("/ingest")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, "Bearer secret")
                     .body(axum::body::Body::from(body.clone()))
@@ -1037,7 +1065,7 @@ mod tests {
         malformed_batch["batch_hash"] = serde_json::json!("caller-supplied");
         let malformed = router(ingest_state(store.clone(), "secret"))
             .oneshot(
-                Request::post("/ingest/herdr")
+                Request::post("/ingest")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, "Bearer secret")
                     .body(axum::body::Body::from(malformed_batch.to_string()))
@@ -1049,12 +1077,12 @@ mod tests {
 
         let mut conflict = batch;
         conflict.cursor = Some(IngestCursor {
-            source: "herdr".to_owned(),
+            source: "alpha".to_owned(),
             value: "different".to_owned(),
         });
         let conflict_response = router(ingest_state(store, "secret"))
             .oneshot(
-                Request::post("/ingest/herdr")
+                Request::post("/ingest")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, "Bearer secret")
                     .body(axum::body::Body::from(
@@ -1065,6 +1093,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conflict_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn ingest_route_rejects_unknown_sources_and_unavailable_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn IngestStore> =
+            Arc::new(iris_storage::LocalFsIngestStore::new(temp.path()));
+        let body = serde_json::to_vec(&ingest_batch("event-2")).unwrap();
+        let mut unknown = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        unknown["source"] = serde_json::json!("unknown");
+        let response = router(ingest_state(store.clone(), "secret"))
+            .oneshot(
+                Request::post("/ingest")
+                    .body(Body::from(unknown.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let mut no_secret = ingest_state(store.clone(), "secret");
+        no_secret.ingest_secrets.clear();
+        let response = router(no_secret)
+            .oneshot(
+                Request::post("/ingest")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let mut no_store = ingest_state(store, "secret");
+        no_store.ingest = None;
+        let response = router(no_store)
+            .oneshot(Request::post("/ingest").body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -1088,7 +1155,8 @@ mod tests {
                 "/tmp/iris-server-test-audit",
             )),
             ingest: None,
-            ingest_secret: None,
+            ingest_sources: std::collections::BTreeSet::new(),
+            ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
         };
         let _router = super::router(app_state);
@@ -1309,7 +1377,8 @@ mod tests {
                 "/tmp/iris-server-test-audit",
             )),
             ingest: None,
-            ingest_secret: None,
+            ingest_sources: std::collections::BTreeSet::new(),
+            ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
         };
         let mut input = input_with_thread(thread_id, &[]);
@@ -1436,7 +1505,8 @@ mod tests {
                 "/tmp/iris-server-test-audit",
             )),
             ingest: None,
-            ingest_secret: None,
+            ingest_sources: std::collections::BTreeSet::new(),
+            ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
         };
 
@@ -1471,7 +1541,8 @@ mod tests {
                 "/tmp/iris-server-test-audit",
             )),
             ingest: None,
-            ingest_secret: None,
+            ingest_sources: std::collections::BTreeSet::new(),
+            ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
         };
 
@@ -1495,7 +1566,8 @@ mod tests {
                 "/tmp/iris-server-test-audit",
             )),
             ingest: None,
-            ingest_secret: None,
+            ingest_sources: std::collections::BTreeSet::new(),
+            ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
         };
 
@@ -1530,7 +1602,8 @@ mod tests {
                 "/tmp/iris-server-test-audit",
             )),
             ingest: None,
-            ingest_secret: None,
+            ingest_sources: std::collections::BTreeSet::new(),
+            ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
         };
 
@@ -1572,7 +1645,8 @@ mod tests {
                 "/tmp/iris-server-test-audit",
             )),
             ingest: None,
-            ingest_secret: None,
+            ingest_sources: std::collections::BTreeSet::new(),
+            ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
         };
 

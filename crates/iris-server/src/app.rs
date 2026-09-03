@@ -1,7 +1,7 @@
 //! Application builder — wires providers into the Axum router.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, RwLock},
 };
 
@@ -23,8 +23,10 @@ pub struct AppState {
     pub audit: Arc<dyn AuditLog>,
     /// Durable normalized-batch backend, configured only for ingestion deployments.
     pub ingest: Option<Arc<dyn IngestStore>>,
-    /// Dedicated bridge secret. `None` disables the authenticated ingest route.
-    pub ingest_secret: Option<Arc<str>>,
+    /// Sources permitted to submit normalized batches.
+    pub ingest_sources: BTreeSet<String>,
+    /// Per-source bearer secrets for normalized batch ingestion.
+    pub ingest_secrets: BTreeMap<String, Arc<str>>,
     /// SSE delivery settings (wire-idle heartbeat interval).
     pub sse: SseSettings,
 }
@@ -35,31 +37,33 @@ pub fn create_app(
     attachments: Arc<dyn AttachmentStore>,
     audit: Arc<dyn AuditLog>,
 ) -> Router {
-    create_app_with_ingest(providers, attachments, audit, None, None)
+    create_app_with_ingest(providers, attachments, audit, None, [], BTreeMap::new())
 }
 
-/// Creates the application with the optional dedicated Herdr ingest boundary.
+/// Creates the application with the optional configured ingest boundary.
 ///
 /// The route remains generated in every build, but returns unavailable until both
-/// the transactional store and a non-empty shared secret are configured.
+/// the transactional store and a source-specific secret are configured.
 pub fn create_app_with_ingest(
     providers: Vec<Arc<dyn MessageProvider>>,
     attachments: Arc<dyn AttachmentStore>,
     audit: Arc<dyn AuditLog>,
     ingest: Option<Arc<dyn IngestStore>>,
-    ingest_secret: Option<Arc<str>>,
+    ingest_sources: impl IntoIterator<Item = String>,
+    ingest_secrets: BTreeMap<String, String>,
 ) -> Router {
     create_app_with_ingest_and_sse(
         providers,
         attachments,
         audit,
         ingest,
-        ingest_secret,
+        ingest_sources,
+        ingest_secrets,
         SseSettings::default(),
     )
 }
 
-/// Creates the Axum application with explicit SSE settings.
+/// Creates the application with explicit SSE settings.
 ///
 /// [`create_app`] uses the design defaults (15s heartbeat); tests use this
 /// constructor to shrink the heartbeat interval deterministically.
@@ -69,7 +73,15 @@ pub fn create_app_with_sse(
     audit: Arc<dyn AuditLog>,
     sse: SseSettings,
 ) -> Router {
-    create_app_with_ingest_and_sse(providers, attachments, audit, None, None, sse)
+    create_app_with_ingest_and_sse(
+        providers,
+        attachments,
+        audit,
+        None,
+        [],
+        BTreeMap::new(),
+        sse,
+    )
 }
 
 /// Creates the application with explicit ingest and SSE settings.
@@ -78,18 +90,25 @@ pub fn create_app_with_ingest_and_sse(
     attachments: Arc<dyn AttachmentStore>,
     audit: Arc<dyn AuditLog>,
     ingest: Option<Arc<dyn IngestStore>>,
-    ingest_secret: Option<Arc<str>>,
+    ingest_sources: impl IntoIterator<Item = String>,
+    ingest_secrets: BTreeMap<String, String>,
     sse: SseSettings,
 ) -> Router {
-    // A blank environment value must never turn into a valid empty bearer token.
-    let ingest_secret = ingest_secret.filter(|secret| !secret.trim().is_empty());
+    let ingest_sources = ingest_sources.into_iter().collect();
+    // A blank configuration value must never turn into a valid empty bearer token.
+    let ingest_secrets = ingest_secrets
+        .into_iter()
+        .filter(|(_, secret)| !secret.trim().is_empty())
+        .map(|(source, secret)| (source, Arc::from(secret)))
+        .collect();
     let state = AppState {
         providers,
         thread_owners: Arc::new(RwLock::new(HashMap::new())),
         attachments,
         audit,
         ingest,
-        ingest_secret,
+        ingest_sources,
+        ingest_secrets,
         sse,
     };
     routes::router(state)

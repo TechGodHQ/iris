@@ -4,7 +4,7 @@
 //! The runtime speaks newline-delimited JSON-RPC over stdio, which is the
 //! transport agents expect for local MCP servers.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use iris_core::{
     AuditAction, AuditEntry, AuditFilter, AuditLog, Contact, IngestBatch, IngestOutcome,
@@ -36,6 +36,8 @@ pub struct McpServer {
     providers: Vec<Arc<dyn MessageProvider>>,
     audit: Arc<dyn AuditLog>,
     ingest: Option<Arc<dyn IngestStore>>,
+    ingest_sources: BTreeSet<String>,
+    ingest_secret_sources: BTreeSet<String>,
 }
 
 impl McpServer {
@@ -46,13 +48,22 @@ impl McpServer {
             providers,
             audit,
             ingest: None,
+            ingest_sources: BTreeSet::new(),
+            ingest_secret_sources: BTreeSet::new(),
         }
     }
 
     /// Attach the local transactional ingest backend for the generated ingest tool.
     #[must_use]
-    pub fn with_ingest(mut self, ingest: Arc<dyn IngestStore>) -> Self {
+    pub fn with_ingest(
+        mut self,
+        ingest: Arc<dyn IngestStore>,
+        sources: impl IntoIterator<Item = String>,
+        secret_sources: impl IntoIterator<Item = String>,
+    ) -> Self {
         self.ingest = Some(ingest);
+        self.ingest_sources = sources.into_iter().collect();
+        self.ingest_secret_sources = secret_sources.into_iter().collect();
         self
     }
 
@@ -92,7 +103,7 @@ impl McpServer {
             "list_messages" => serde_json::to_value(self.list_messages(&request.arguments).await?)?,
             "send_message" => serde_json::to_value(self.send_message(&request.arguments).await?)?,
             "audit_query" => serde_json::to_value(self.audit_query(&request.arguments).await?)?,
-            "ingest_herdr" => serde_json::to_value(self.ingest_herdr(&request.arguments).await?)?,
+            "ingest_batch" => serde_json::to_value(self.ingest_batch(&request.arguments).await?)?,
             other => anyhow::bail!("unknown Iris MCP tool: {other}"),
         };
 
@@ -178,20 +189,23 @@ impl McpServer {
         Ok(provider.send_message(&args.thread_id, &outbound).await?)
     }
 
-    async fn ingest_herdr(&self, arguments: &Value) -> anyhow::Result<Value> {
+    async fn ingest_batch(&self, arguments: &Value) -> anyhow::Result<Value> {
         let batch: IngestBatch = serde_json::from_value(
             arguments
                 .get("batch")
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing ingest batch"))?,
         )?;
-        if batch.source != "herdr" {
-            anyhow::bail!("ingest_herdr requires batch.source to be herdr");
+        if !self.ingest_sources.contains(&batch.source) {
+            anyhow::bail!("ingest source is not configured: {}", batch.source);
+        }
+        if !self.ingest_secret_sources.contains(&batch.source) {
+            anyhow::bail!("ingest source secret is not configured: {}", batch.source);
         }
         let store = self
             .ingest
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Herdr ingest is not configured"))?;
+            .ok_or_else(|| anyhow::anyhow!("ingest service is not configured"))?;
         Ok(match store.apply_batch(batch).await? {
             IngestOutcome::Applied { committed_at } => {
                 json!({"outcome": "applied", "committed_at": committed_at})

@@ -5,7 +5,9 @@ use iris_core::{
     AuditAction, AuditFilter, AuditLog, IngestBatch, IngestOutcome, MessageProvider,
     OutboundAttachment, OutboundMessage,
 };
-use iris_providers::config::{IrisConfig, providers_from_config, providers_from_default_config};
+use iris_providers::config::{
+    IrisConfig, load_default_config, providers_from_config, providers_from_default_config,
+};
 
 use crate::generated;
 
@@ -56,7 +58,7 @@ async fn execute_generated_operation(
         "list_contacts" => list_contacts(serde_json::from_value(parameters)?).await,
         "send_message" => send_message(serde_json::from_value(parameters)?).await,
         "audit_query" => audit_query(serde_json::from_value(parameters)?).await,
-        "ingest_herdr" => ingest_herdr(serde_json::from_value(parameters)?).await,
+        "ingest_batch" => ingest_batch(serde_json::from_value(parameters)?).await,
         "subscribe_events" => subscribe_events(serde_json::from_value(parameters)?).await,
         other => {
             anyhow::bail!("generated operation is not implemented by the CLI runtime: {other}")
@@ -90,16 +92,17 @@ fn audit_log() -> std::sync::Arc<dyn AuditLog> {
     std::sync::Arc::new(iris_audit::LocalFsAuditLog::new(audit_dir))
 }
 
-fn ingest_configuration() -> (
+type IngestConfiguration = (
     Option<std::sync::Arc<dyn iris_core::IngestStore>>,
-    Option<std::sync::Arc<str>>,
-) {
-    let secret = std::env::var("IRIS_HERDR_INGEST_SECRET")
-        .ok()
-        .filter(|secret| !secret.trim().is_empty());
-    let Some(secret) = secret else {
-        return (None, None);
-    };
+    Vec<String>,
+    std::collections::BTreeMap<String, String>,
+);
+
+fn ingest_configuration(config: &IrisConfig) -> IngestConfiguration {
+    let sources = config.ingest.sources.clone();
+    if sources.is_empty() {
+        return (None, sources, config.resolved_ingest_secrets());
+    }
     let ingest_dir = std::env::var("IRIS_INGEST_DIR").unwrap_or_else(|_| {
         let mut path =
             dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("./.iris"));
@@ -111,7 +114,8 @@ fn ingest_configuration() -> (
         Some(std::sync::Arc::new(iris_storage::LocalFsIngestStore::new(
             ingest_dir,
         ))),
-        Some(std::sync::Arc::from(secret)),
+        sources,
+        config.resolved_ingest_secrets(),
     )
 }
 
@@ -235,17 +239,21 @@ async fn audit_query(args: generated::AuditQueryArgs) -> anyhow::Result<()> {
     print_json(&query_audit_entries(&audit_log(), args).await?)
 }
 
-async fn ingest_herdr(args: generated::IngestHerdrArgs) -> anyhow::Result<()> {
-    let (store, _) = ingest_configuration();
+async fn ingest_batch(args: generated::IngestBatchArgs) -> anyhow::Result<()> {
+    let config = load_default_config()?;
+    let (store, sources, secrets) = ingest_configuration(&config);
     let Some(store) = store else {
-        anyhow::bail!("IRIS_HERDR_INGEST_SECRET must be configured before local ingest");
+        anyhow::bail!("ingest service is not configured");
     };
     let batch: IngestBatch = match args.batch {
         serde_json::Value::String(encoded) => serde_json::from_str(&encoded)?,
         value => serde_json::from_value(value)?,
     };
-    if batch.source != "herdr" {
-        anyhow::bail!("ingest_herdr requires batch.source to be herdr");
+    if !sources.contains(&batch.source) {
+        anyhow::bail!("ingest source is not configured: {}", batch.source);
+    }
+    if !secrets.contains_key(&batch.source) {
+        anyhow::bail!("ingest source secret is not configured: {}", batch.source);
     }
     let outcome = match store.apply_batch(batch).await? {
         IngestOutcome::Applied { committed_at } => {
@@ -321,9 +329,23 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let store = attachment_store();
     let audit = audit_log();
     let providers = get_providers_from_path(args.config.as_deref(), &store, &audit)?;
-    let (ingest, ingest_secret) = ingest_configuration();
-    let app =
-        iris_server::create_app_with_ingest(providers.clone(), store, audit, ingest, ingest_secret);
+    let config = match args.config.as_deref() {
+        Some(path) => {
+            let mut config = IrisConfig::from_path(path)?;
+            config.apply_env_overrides()?;
+            config
+        }
+        None => load_default_config()?,
+    };
+    let (ingest, ingest_sources, ingest_secrets) = ingest_configuration(&config);
+    let app = iris_server::create_app_with_ingest(
+        providers.clone(),
+        store,
+        audit,
+        ingest,
+        ingest_sources,
+        ingest_secrets,
+    );
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
     tracing::info!("Iris server listening on {}", args.addr);
