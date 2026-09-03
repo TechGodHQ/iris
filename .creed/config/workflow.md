@@ -1,10 +1,4 @@
-# Git / PR Rules
-
-
-- Commits should use Shiv's global git identity.
-- Runner-generated commits may include `Co-authored-by: Archon <archon@purelymail.com>`.
-- Auto-merge is permitted per the standing gate policy: CI green and gate confidence >= 0.80.
-- Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`.
+# Iris Workflow Rules
 
 ## Provider Agnosticism (blocking review rule)
 
