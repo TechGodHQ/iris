@@ -16,7 +16,7 @@
 //! transport/decode/429/5xx errors retry within a validated budget before
 //! emitting [`IrisError::RealtimeRetryExhausted`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,8 +24,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use iris_core::realtime::{RealtimeAuditMetadata, RealtimeEventKind};
 use iris_core::{
-    AuditAction, AuditEvent, IrisError, Message, MessageStream, RealtimeState, RealtimeStatus,
-    RecordOutcome, Result,
+    AuditAction, AuditEvent, Contact, IrisError, Message, MessageStream, RealtimeState,
+    RealtimeStatus, RecordOutcome, Result, Thread,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +34,10 @@ use super::{PROVIDER_ID, TelegramMessage, TelegramProvider, TelegramResponse};
 
 /// Bounded message slots per subscriber queue (design-frozen at 128).
 pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 128;
+
+/// Number of normalized updates retained for internal HTTP snapshots and the
+/// future COD-427 sequence API. This is deliberately not a catch-up API.
+pub const EVENT_BUFFER_CAPACITY: usize = 512;
 
 /// Default transient retry budget (design-frozen at 3, minimum 1).
 pub const DEFAULT_REALTIME_RETRY_BUDGET: u32 = 3;
@@ -156,6 +160,24 @@ struct HubState {
     /// Replaced with a fresh token when a later subscription revives a hub
     /// whose token was cancelled by `shutdown`.
     cancel: CancellationToken,
+    /// Bounded normalized event history. Subscribers are admitted only to
+    /// future fan-out and never replay this buffer.
+    events: VecDeque<RetainedEvent>,
+    next_sequence: u64,
+}
+
+/// A normalized update retained by the sole `getUpdates` owner.
+#[derive(Debug, Clone)]
+pub(crate) struct RetainedEvent {
+    /// Monotonic internal sequence reserved for COD-427; not exposed yet.
+    #[allow(dead_code)]
+    pub(crate) sequence: u64,
+    pub(crate) update_id: i64,
+    pub(crate) message: Message,
+    /// Preserved source normalization data used by HTTP thread snapshots.
+    pub(crate) thread: Thread,
+    /// Preserved source normalization data used by HTTP contact snapshots.
+    pub(crate) contacts: Vec<Contact>,
 }
 
 /// What the poller should do after handling an error arm.
@@ -227,6 +249,8 @@ impl HubState {
             terminated_at: None,
             poller: None,
             cancel: CancellationToken::new(),
+            events: VecDeque::with_capacity(EVENT_BUFFER_CAPACITY),
+            next_sequence: 0,
         }
     }
 }
@@ -294,6 +318,46 @@ impl RealtimeHub {
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.lock().subscribers.len()
+    }
+
+    /// Atomically ensure hub polling has an owner and read retained messages.
+    /// HTTP callers use this instead of issuing their own `getUpdates` call.
+    pub(crate) fn snapshot_messages(&self, provider: TelegramProvider) -> Vec<Message> {
+        self.snapshot_events(provider)
+            .into_iter()
+            .map(|event| event.message)
+            .collect()
+    }
+
+    /// Atomically ensure hub polling has an owner and read retained threads.
+    pub(crate) fn snapshot_threads(&self, provider: TelegramProvider) -> Vec<Thread> {
+        self.snapshot_events(provider)
+            .into_iter()
+            .map(|event| event.thread)
+            .collect()
+    }
+
+    /// Atomically ensure hub polling has an owner and read retained contacts.
+    pub(crate) fn snapshot_contacts(&self, provider: TelegramProvider) -> Vec<Contact> {
+        self.snapshot_events(provider)
+            .into_iter()
+            .flat_map(|event| event.contacts)
+            .collect()
+    }
+
+    /// Atomically ensure hub polling has an owner and read retained updates.
+    pub(crate) fn snapshot_updates(
+        &self,
+        provider: TelegramProvider,
+    ) -> Vec<super::TelegramPolledMessage> {
+        self.snapshot_events(provider)
+            .into_iter()
+            .map(|event| super::TelegramPolledMessage {
+                update_id: event.update_id,
+                next_offset: event.update_id + 1,
+                message: event.message,
+            })
+            .collect()
     }
 
     /// Whether a poller task is currently registered.
@@ -368,13 +432,8 @@ impl RealtimeHub {
                     terminal: terminal_tx,
                 },
             );
-            if state.poller.is_none() {
-                let hub = Arc::new(self.clone());
-                let handle = tokio::spawn(async move {
-                    hub.run_poller(provider).await;
-                });
-                state.poller = Some(handle);
-            }
+            self.ensure_poller_locked(&mut state, provider);
+            drop(state);
         }
 
         Ok(Box::pin(SubscriberStream {
@@ -382,6 +441,33 @@ impl RealtimeHub {
             terminal: terminal_rx,
             buffered_terminal: None,
         }))
+    }
+
+    /// Read the event buffer and claim poll ownership under the same mutex.
+    fn snapshot_events(&self, provider: TelegramProvider) -> Vec<RetainedEvent> {
+        let mut state = self.lock();
+        if state.cancel.is_cancelled() {
+            state.cancel = CancellationToken::new();
+        }
+        state.terminated = None;
+        state.terminated_at = None;
+        self.ensure_poller_locked(&mut state, provider);
+        state.events.iter().cloned().collect()
+    }
+
+    fn ensure_poller_locked(&self, state: &mut HubState, provider: TelegramProvider) {
+        if state
+            .poller
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return;
+        }
+        state.poller = None;
+        let hub = Arc::new(self.clone());
+        state.poller = Some(tokio::spawn(async move {
+            hub.run_poller(provider).await;
+        }));
     }
 
     /// Stop the poller, abort any in-flight long poll, join the task, and
@@ -421,27 +507,15 @@ impl RealtimeHub {
     async fn run_poller(self: Arc<Self>, provider: TelegramProvider) {
         let mut attempt: u32 = 0;
         loop {
-            // Decide under one lock: prune disconnected subscribers, detect
-            // exit conditions, and (on natural exit) clear our own handle
-            // atomically with the decision. This closes the race where a
-            // subscription arriving mid-exit would see a stale handle and
-            // never spawn a replacement poller.
+            // Polling is hub-owned rather than subscriber-owned: an HTTP
+            // snapshot starts it and it remains the sole Telegram consumer
+            // even when no SSE client is connected.
             let cancel = {
                 let mut state = self.lock();
                 state
                     .subscribers
                     .retain(|_, subscriber| !subscriber.messages.is_closed());
-                if state.cancel.is_cancelled()
-                    || state.terminated.is_some()
-                    || state.subscribers.is_empty()
-                {
-                    // Natural (last-subscriber) exit clears the handle so a
-                    // later subscription spawns fresh. Cancelled/terminated
-                    // exits leave cleanup to `shutdown`/`terminate_all`,
-                    // which already took the handle.
-                    if state.terminated.is_none() && state.poller.is_some() {
-                        state.poller = None;
-                    }
+                if state.cancel.is_cancelled() || state.terminated.is_some() {
                     break;
                 }
                 state.cancel.clone()
@@ -537,7 +611,6 @@ impl RealtimeHub {
                     "telegram update missing update_id".into(),
                 )));
             };
-
             // Snapshot the registry before normalization: fan-out targets
             // exactly the subscribers that existed when the update arrived.
             let snapshot = self.subscriber_snapshot();
@@ -548,7 +621,12 @@ impl RealtimeHub {
                 .map_err(ProcessError::Terminal)?;
 
             match classified {
-                Classified::Message(message, metadata) => {
+                Classified::Message {
+                    message,
+                    thread,
+                    contacts,
+                    metadata,
+                } => {
                     // Commit point: record_once must succeed before fan-out.
                     // AlreadyRecorded proceeds to fan-out without a second
                     // audit record.
@@ -557,6 +635,7 @@ impl RealtimeHub {
                         .await
                         .map_err(ProcessError::Terminal)?;
                     self.fan_out(snapshot, &message);
+                    self.retain_event(update_id, message.as_ref(), thread, contacts);
                     self.cursor.store(update_id + 1, Ordering::SeqCst);
                 }
                 Classified::Ignored(metadata) => {
@@ -613,6 +692,28 @@ impl RealtimeHub {
             }
         }
     }
+
+    fn retain_event(
+        &self,
+        update_id: i64,
+        message: &Message,
+        thread: Thread,
+        contacts: Vec<Contact>,
+    ) {
+        let mut state = self.lock();
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.wrapping_add(1);
+        if state.events.len() == EVENT_BUFFER_CAPACITY {
+            state.events.pop_front();
+        }
+        state.events.push_back(RetainedEvent {
+            sequence,
+            update_id,
+            message: message.clone(),
+            thread,
+            contacts,
+        });
+    }
 }
 
 impl HubState {
@@ -627,8 +728,8 @@ impl HubState {
 /// Whether an error is transient (retryable), returning a sanitized
 /// description for the exhaustion report.
 ///
-/// Transient: transport errors, response decode errors, HTTP 429, HTTP 5xx.
-/// Terminal: everything else (HTTP 409 and other 4xx, config, storage).
+/// Transient: transport errors, response decode errors, HTTP 409, HTTP 429,
+/// and HTTP 5xx. Terminal: other 4xx, config, and storage errors.
 fn classify_transient(error: &IrisError) -> Option<String> {
     match error {
         IrisError::Transport(message) | IrisError::Serialization(message) => Some(message.clone()),
@@ -638,8 +739,13 @@ fn classify_transient(error: &IrisError) -> Option<String> {
 
 /// The classification of one raw Telegram update.
 enum Classified {
-    /// A normalizable message plus its fixed audit metadata.
-    Message(Box<Message>, RealtimeAuditMetadata),
+    /// A normalizable message plus source-normalized query data and fixed audit metadata.
+    Message {
+        message: Box<Message>,
+        thread: Thread,
+        contacts: Vec<Contact>,
+        metadata: RealtimeAuditMetadata,
+    },
     /// No usable message shape (audited + acknowledged, no fan-out).
     Ignored(RealtimeAuditMetadata),
     /// Decode/normalization failure with a known ID (audited + acknowledged).
@@ -744,9 +850,9 @@ enum ProcessError {
 impl TelegramProvider {
     /// Long-poll `getUpdates` for the realtime hub.
     ///
-    /// Unlike the backlog helper, this requests ALL update types (no
-    /// `allowed_updates` filter) and surfaces HTTP status semantics:
-    /// 409 and other 4xx are terminal; 429 and 5xx are transient.
+    /// This requests all update types (no `allowed_updates` filter). HTTP 409
+    /// is a transient competing-poller conflict; 429 and 5xx are transient.
+    /// Other 4xx responses are terminal.
     async fn get_updates_realtime(
         &self,
         offset: i64,
@@ -768,12 +874,9 @@ impl TelegramProvider {
 
         let status = response.status();
         if status.as_u16() == 409 {
-            // HTTP 409: terminal to every subscriber, stop without retrying,
-            // do not advance.
-            return Err(IrisError::Provider {
-                provider: PROVIDER_ID.into(),
-                message: "telegram getUpdates conflict (HTTP 409)".into(),
-            });
+            return Err(IrisError::Transport(
+                "telegram getUpdates conflict (HTTP 409)".into(),
+            ));
         }
         if status.as_u16() == 429 || status.is_server_error() {
             return Err(IrisError::Transport(format!(
@@ -824,6 +927,8 @@ impl TelegramProvider {
         };
 
         if let Ok(parsed) = serde_json::from_value::<TelegramMessage>(message_value.clone()) {
+            let thread = parsed.to_thread();
+            let contacts = thread.participants.clone();
             let mut normalized = parsed.to_message();
             // Eager attachment persistence is part of normalization; a
             // storage-backend failure here is terminal to all subscribers.
@@ -851,7 +956,12 @@ impl TelegramProvider {
                     )
                     .collect(),
             );
-            Ok(Classified::Message(Box::new(normalized), metadata))
+            Ok(Classified::Message {
+                message: Box::new(normalized),
+                thread,
+                contacts,
+                metadata,
+            })
         } else {
             // Decode failure with a known update ID: audited as
             // invalid_update, acknowledged.
@@ -930,13 +1040,11 @@ impl TelegramProvider {
         update_id: i64,
         metadata: RealtimeAuditMetadata,
     ) -> Result<RecordOutcome> {
+        // HTTP snapshot admission can start the sole poller before an SSE
+        // subscriber exists. Preserve historic non-realtime reads without an
+        // audit sink; SSE admission still rejects that configuration.
         let Some(audit) = &self.audit else {
-            // subscribe_realtime rejects this up front; hitting it here means
-            // the sink vanished mid-flight.
-            return Err(IrisError::RealtimeUnavailable {
-                provider: PROVIDER_ID.into(),
-                code: "audit sink required for realtime ingress".into(),
-            });
+            return Ok(RecordOutcome::Inserted);
         };
         let key = update_id.to_string();
         let event = AuditEvent {
@@ -1167,6 +1275,57 @@ mod tests {
     // --- Readiness / settings -------------------------------------------------
 
     #[tokio::test]
+    async fn http_snapshot_starts_the_single_owner_and_reads_retained_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bot123:abc/getUpdates"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ok_body(&[text_update(100, 1, "http")])),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_empty(&server).await;
+
+        // No audit sink: this models ordinary HTTP list/read use, not SSE.
+        let provider =
+            TelegramProvider::with_base_url("123:abc", server.uri(), Arc::new(InMemoryStore))
+                .expect("provider builds");
+        let hub = provider.realtime_hub().expect("valid realtime settings");
+        assert!(hub.snapshot_messages(provider.clone()).is_empty());
+
+        for _ in 0..200 {
+            if hub.cursor() == 101 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snapshot = hub.snapshot_messages(provider.clone());
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].body, "http");
+        assert!(hub.is_poller_running());
+        hub.shutdown().await;
+    }
+
+    #[test]
+    fn independently_constructed_providers_share_one_endpoint_runtime() {
+        let first = TelegramProvider::with_base_url(
+            "shared:token",
+            "https://telegram.invalid",
+            Arc::new(InMemoryStore),
+        )
+        .expect("first provider builds");
+        let second = TelegramProvider::with_base_url(
+            "shared:token",
+            "https://telegram.invalid",
+            Arc::new(InMemoryStore),
+        )
+        .expect("second provider builds");
+
+        assert!(Arc::ptr_eq(&first.runtime, &second.runtime));
+    }
+
+    #[tokio::test]
     async fn subscription_requires_an_audit_sink() {
         let provider = TelegramProvider::with_base_url(
             "123:abc",
@@ -1226,6 +1385,11 @@ mod tests {
             matches!(error, IrisError::Config(ref message) if message.contains("realtime")),
             "unexpected error: {error:?}"
         );
+        let error = provider
+            .poll_updates(None, None)
+            .await
+            .expect_err("HTTP snapshot also rejects invalid settings rather than panicking");
+        assert!(matches!(error, IrisError::Config(_)));
     }
 
     // --- Fan-out / ordering ---------------------------------------------------
@@ -1253,7 +1417,7 @@ mod tests {
         let mut stream_a = provider.subscribe_realtime().await.expect("subscribes");
         let mut stream_b = provider.subscribe_realtime().await.expect("subscribes");
 
-        let hub = provider.realtime_hub();
+        let hub = provider.realtime_hub().expect("valid realtime settings");
         assert_eq!(hub.subscriber_count(), 2);
         assert!(hub.is_poller_running());
 
@@ -1340,7 +1504,7 @@ mod tests {
 
         // Wait until the healthy reader has consumed the full burst and the
         // poller has acknowledged every update.
-        let hub = provider.realtime_hub();
+        let hub = provider.realtime_hub().expect("valid realtime settings");
         let mut spins = 0;
         while collected.lock().expect("collected").len() < 130 || hub.cursor() < 131 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1384,7 +1548,7 @@ mod tests {
     // --- Lifecycle ------------------------------------------------------------
 
     #[tokio::test]
-    async fn last_disconnect_stops_poller_and_resubscription_restarts_from_cursor() {
+    async fn hub_keeps_single_poller_after_disconnect_and_resubscription_reads_future_updates() {
         let server = MockServer::start().await;
         // wiremock matches mocks in insertion order: mount the scoped
         // one-shot response BEFORE the standing empty fallback.
@@ -1408,21 +1572,20 @@ mod tests {
         assert_eq!(next_message(&mut first).await.expect("message").body, "two");
         drop(first);
         drop(scoped);
+        // A request may have entered the old scoped mock immediately after
+        // delivering "two". Let that in-flight response drain while no
+        // subscriber is registered before admitting the later subscriber.
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let hub = provider.realtime_hub();
-        let mut stopped = false;
-        for _ in 0..200 {
-            if !hub.is_poller_running() {
-                stopped = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(stopped, "poller stops after last disconnect");
+        let hub = provider.realtime_hub().expect("valid realtime settings");
+        assert!(
+            hub.is_poller_running(),
+            "the hub remains the sole getUpdates owner after SSE disconnect"
+        );
         assert_eq!(hub.cursor(), 102);
 
-        // A later subscription starts a fresh poller from the cursor and
-        // receives only events accepted after it joined.
+        // A later subscriber is admitted to future fan-out only; it does not
+        // receive the retained backlog.
         let scoped_late = server
             .register_as_scoped(
                 Mock::given(method("GET"))
@@ -1462,7 +1625,7 @@ mod tests {
         let provider = provider_at(&server, audit, test_settings(3));
         let mut stream = provider.subscribe_realtime().await.expect("subscribes");
 
-        let hub = provider.realtime_hub();
+        let hub = provider.realtime_hub().expect("valid realtime settings");
         let mut request_seen = false;
         for _ in 0..200 {
             if server
@@ -1523,7 +1686,7 @@ mod tests {
             .expect("only the real message");
         assert_eq!(message.body, "real");
 
-        let hub = provider.realtime_hub();
+        let hub = provider.realtime_hub().expect("valid realtime settings");
         // All three updates acknowledged: offset past the highest ID.
         assert_eq!(hub.cursor(), 6);
         assert_eq!(
@@ -1581,35 +1744,43 @@ mod tests {
     // --- Terminal semantics ----------------------------------------------------
 
     #[tokio::test]
-    async fn http_409_is_terminal_to_every_subscriber_without_advancing() {
+    async fn http_409_retries_then_preserves_subscribers_on_success() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/bot123:abc/getUpdates"))
             .respond_with(ResponseTemplate::new(409))
+            .up_to_n_times(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/bot123:abc/getUpdates"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ok_body(&[text_update(
+                    100,
+                    1,
+                    "after conflict",
+                )])),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_empty(&server).await;
 
         let audit = Arc::new(RecordingAudit::default());
-        let provider = provider_at(&server, audit.clone(), test_settings(3));
+        let provider = provider_at(&server, audit, test_settings(3));
         let mut stream_a = provider.subscribe_realtime().await.expect("subscribes");
         let mut stream_b = provider.subscribe_realtime().await.expect("subscribes");
 
         for stream in [&mut stream_a, &mut stream_b] {
-            let error = tokio::time::timeout(Duration::from_secs(5), stream.next())
-                .await
-                .expect("terminal within timeout")
-                .expect("stream open")
-                .expect_err("terminal error");
-            assert!(
-                error.to_string().contains("409"),
-                "error should mention HTTP 409: {error}"
-            );
-            assert!(stream.next().await.is_none());
+            let message = next_message(stream).await.expect("subscriber survives 409");
+            assert_eq!(message.body, "after conflict");
         }
 
-        let hub = provider.realtime_hub();
-        assert_eq!(hub.cursor(), 0, "409 must not advance the offset");
-        assert!(!hub.is_poller_running());
+        let hub = provider.realtime_hub().expect("valid realtime settings");
+        assert_eq!(hub.cursor(), 101, "successful retry advances the offset");
+        assert_eq!(hub.subscriber_count(), 2, "409 must not evict subscribers");
+        assert!(hub.is_poller_running());
+        provider.shutdown_realtime().await.expect("shutdown");
     }
 
     #[tokio::test]
@@ -1634,7 +1805,7 @@ mod tests {
             .expect_err("terminal error");
         assert!(error.to_string().contains("audit write failed"));
 
-        let hub = provider.realtime_hub();
+        let hub = provider.realtime_hub().expect("valid realtime settings");
         assert_eq!(hub.cursor(), 0, "audit failure must not advance the offset");
         assert_eq!(hub.subscriber_count(), 0);
         assert!(!hub.is_poller_running());
@@ -1687,7 +1858,7 @@ mod tests {
             .expect_err("terminal error");
         assert!(error.to_string().contains("disk full"));
 
-        let hub = provider.realtime_hub();
+        let hub = provider.realtime_hub().expect("valid realtime settings");
         assert_eq!(
             hub.cursor(),
             0,
