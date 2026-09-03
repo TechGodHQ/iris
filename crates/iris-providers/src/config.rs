@@ -32,6 +32,33 @@ pub struct IrisConfig {
     /// Provider declarations keyed by provider id.
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// Source-authorized normalized batch ingestion configuration.
+    #[serde(default)]
+    pub ingest: IngestConfig,
+}
+
+/// Configuration for normalized batch ingestion.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct IngestConfig {
+    /// Sources permitted to submit normalized batches.
+    #[serde(default = "default_ingest_sources")]
+    pub sources: Vec<String>,
+    /// Per-source bearer secrets.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretValue>,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            sources: default_ingest_sources(),
+            secrets: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_ingest_sources() -> Vec<String> {
+    vec!["herdr".to_owned()]
 }
 
 /// Configuration for one provider.
@@ -174,6 +201,19 @@ impl IrisConfig {
                     credentials,
                 })
             })
+            .collect()
+    }
+
+    /// Resolve configured batch-ingest secrets. Missing environment-backed
+    /// values remain absent so transports can report an unavailable service.
+    pub fn resolved_ingest_secrets(&self) -> BTreeMap<String, String> {
+        self.ingest
+            .secrets
+            .iter()
+            .filter_map(|(source, secret)| {
+                secret.resolve().ok().map(|value| (source.clone(), value))
+            })
+            .filter(|(_, secret)| !secret.trim().is_empty())
             .collect()
     }
 }
@@ -383,6 +423,24 @@ enabled = false
         let providers = providers_from_config(&IrisConfig::default(), &test_store(), &test_audit())
             .expect("registry builds");
         assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn ingest_configuration_defaults_and_resolves_per_source_secrets() {
+        let config = IrisConfig::from_toml(
+            r#"
+[ingest]
+sources = ["alpha", "beta"]
+
+[ingest.secrets]
+alpha = "alpha-secret"
+beta = "beta-secret"
+"#,
+        )
+        .expect("valid config");
+        assert_eq!(config.ingest.sources, ["alpha", "beta"]);
+        assert_eq!(config.resolved_ingest_secrets().len(), 2);
+        assert_eq!(IrisConfig::default().ingest.sources, ["herdr"]);
     }
 
     #[test]

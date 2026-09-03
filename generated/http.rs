@@ -27,7 +27,7 @@ pub const GENERATED_ROUTES: &[GeneratedRoute] = &[
     GeneratedRoute { name: "list_contacts", method: "GET", path: "/contacts" },
     GeneratedRoute { name: "send_message", method: "POST", path: "/messages/{thread_id}" },
     GeneratedRoute { name: "audit_query", method: "GET", path: "/audit" },
-    GeneratedRoute { name: "ingest_herdr", method: "POST", path: "/ingest/herdr" },
+    GeneratedRoute { name: "ingest_batch", method: "POST", path: "/ingest" },
 ];
 
 pub fn generated_router() -> Router<crate::app::AppState> {
@@ -37,7 +37,7 @@ pub fn generated_router() -> Router<crate::app::AppState> {
         .route("/contacts", get(list_contacts))
         .route("/messages/{thread_id}", post(send_message))
         .route("/audit", get(audit_query))
-        .route("/ingest/herdr", post(ingest_herdr))
+        .route("/ingest", post(ingest_batch))
 }
 
 /// Streaming (SSE) operations declared in the API definition. The
@@ -142,13 +142,13 @@ async fn audit_query(
     .await
 }
 
-async fn ingest_herdr(
+async fn ingest_batch(
     State(state): State<crate::app::AppState>,
     Json(body): Json<Value>,
 ) -> Response {
     super::execute_generated_operation(
         &state,
-        "ingest_herdr",
+        "ingest_batch",
         GeneratedOperationInput {
             path: BTreeMap::new(),
             query: BTreeMap::new(),

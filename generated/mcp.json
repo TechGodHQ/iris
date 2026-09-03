@@ -8,7 +8,7 @@
       "source_id": "query",
       "until": "query"
     },
-    "ingest_herdr": {
+    "ingest_batch": {
       "batch": "body"
     },
     "list_contacts": {
@@ -196,7 +196,7 @@
       "name": "audit_query"
     },
     {
-      "description": "Transactionally ingest a normalized, replayable Herdr batch.",
+      "description": "Transactionally ingest a normalized, replayable source batch.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -236,7 +236,7 @@
         ],
         "type": "object"
       },
-      "name": "ingest_herdr"
+      "name": "ingest_batch"
     }
   ]
 }

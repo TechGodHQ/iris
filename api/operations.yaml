@@ -150,10 +150,10 @@ operations:
         type: u32
         required: false
         location: query
-  - name: ingest_herdr
-    description: Transactionally ingest a normalized, replayable Herdr batch.
+  - name: ingest_batch
+    description: Transactionally ingest a normalized, replayable source batch.
     method: POST
-    path: /ingest/herdr
+    path: /ingest
     read: false
     output_type: json
     parameters:

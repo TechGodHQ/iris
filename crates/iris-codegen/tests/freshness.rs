@@ -29,3 +29,26 @@ fn committed_generated_artifacts_are_fresh() {
         "generated/mcp.json is stale — run `cargo run -p iris-codegen --bin iris-codegen -- write`"
     );
 }
+
+#[test]
+fn public_ingest_surfaces_do_not_name_a_provider() {
+    for path in [
+        "../../api/operations.yaml",
+        "../../generated/cli.rs",
+        "../../generated/http.rs",
+        "../../generated/mcp.json",
+        "../../crates/iris-server/src",
+        "../../crates/iris-mcp/src",
+        "../../crates/iris-cli/src",
+    ] {
+        let output = std::process::Command::new("grep")
+            .args(["-R", "-i", "herdr", path])
+            .output()
+            .expect("grep provider leak guard paths");
+        assert!(
+            output.stdout.is_empty(),
+            "provider name leaked into public ingest surface {path}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}

@@ -16,8 +16,8 @@ pub enum GeneratedCommand {
     SendMessage(SendMessageArgs),
     /// Query tamper-evident provider audit events.
     AuditQuery(AuditQueryArgs),
-    /// Transactionally ingest a normalized, replayable Herdr batch.
-    IngestHerdr(IngestHerdrArgs),
+    /// Transactionally ingest a normalized, replayable source batch.
+    IngestBatch(IngestBatchArgs),
     /// Subscribe to a fallible realtime event stream over SSE.
     Watch(WatchArgs),
 }
@@ -30,7 +30,7 @@ impl GeneratedCommand {
             Self::ListContacts(_) => "list_contacts",
             Self::SendMessage(_) => "send_message",
             Self::AuditQuery(_) => "audit_query",
-            Self::IngestHerdr(_) => "ingest_herdr",
+            Self::IngestBatch(_) => "ingest_batch",
             Self::Watch(_) => "subscribe_events",
         }
     }
@@ -42,7 +42,7 @@ impl GeneratedCommand {
             Self::ListContacts(args) => serde_json::json!({"limit": args.limit.clone(), "cursor": args.cursor.clone()}),
             Self::SendMessage(args) => serde_json::json!({"thread_id": args.thread_id.clone(), "body": args.body.clone(), "provider": args.provider.clone(), "attachments": args.attachments.clone().unwrap_or_default(), "attach_mime": args.attach_mime.clone()}),
             Self::AuditQuery(args) => serde_json::json!({"provider": args.provider.clone(), "action": args.action.clone(), "since": args.since.clone(), "until": args.until.clone(), "source_id": args.source_id.clone(), "limit": args.limit.clone()}),
-            Self::IngestHerdr(args) => serde_json::json!({"batch": args.batch.clone()}),
+            Self::IngestBatch(args) => serde_json::json!({"batch": args.batch.clone()}),
             Self::Watch(args) => serde_json::json!({"provider": args.provider.clone(), "thread_id": args.thread_id.clone()}),
         }
     }
@@ -121,7 +121,7 @@ pub struct AuditQueryArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Args)]
-pub struct IngestHerdrArgs {
+pub struct IngestBatchArgs {
     /// Serialized normalized `IngestBatch`. The server computes its canonical hash; `batch_hash` is forbidden.
     #[arg(long = "batch")]
     pub batch: serde_json::Value,
