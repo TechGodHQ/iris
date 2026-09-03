@@ -199,7 +199,7 @@ impl TelegramProvider {
     /// This intentionally does not issue `getUpdates`: the realtime hub is
     /// the sole Telegram update consumer. Calling this method admits the
     /// caller to hub polling and returns the currently retained snapshot.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn poll_updates(
         &self,
         offset: Option<i64>,
