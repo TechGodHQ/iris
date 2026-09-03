@@ -1,7 +1,13 @@
 version: 1
 source:
-  type: local
+  type: layered
   path: .creed
+  layers:
+    - name: org
+      type: git
+      remote: https://github.com/TechGodHQ/agent-context.git
+      path: .creed
+      ref: d678bf718664cd2f894279350f6a2010015c8af2
 targets:
   - name: agents
     enabled: true

@@ -100,7 +100,7 @@ jobs:
           go-version: stable
 
       - name: Install creed
-        run: go install github.com/techgodhq/creed@v0.3.0
+        run: go install github.com/techgodhq/creed@v0.4.1
 
       - name: Emitted agent context must match .creed source
         run: creed diff
