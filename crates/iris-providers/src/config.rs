@@ -12,7 +12,13 @@ use std::{
     sync::Arc,
 };
 
-use iris_core::{AttachmentStore, AuditLog, MessageProvider};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use iris_core::{
+    AttachmentStore, AuditEntry, AuditEvent, AuditFilter, AuditLog, Contact, Message,
+    MessageProvider, MessageStream, OutboundMessage, RealtimeStatus, RecordOutcome,
+    Result as IrisResult, Thread,
+};
 use serde::Deserialize;
 
 use crate::email::EmailProvider;
@@ -70,6 +76,10 @@ pub struct ProviderConfig {
     /// Provider credentials and options.
     #[serde(default)]
     pub credentials: BTreeMap<String, SecretValue>,
+    /// Named instances of this provider type. The enclosing declaration is the
+    /// backwards-compatible default instance (for example `[providers.email]`).
+    #[serde(default)]
+    pub instances: BTreeMap<String, Self>,
 }
 
 impl Default for ProviderConfig {
@@ -77,6 +87,7 @@ impl Default for ProviderConfig {
         Self {
             enabled: true,
             credentials: BTreeMap::new(),
+            instances: BTreeMap::new(),
         }
     }
 }
@@ -94,8 +105,10 @@ pub enum SecretValue {
 /// A provider entry with credentials resolved from the environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProviderConfig {
-    /// Provider id.
+    /// Stable configured instance id (`email` or `email.ops-codefold`).
     pub id: String,
+    /// Static provider type used for construction (`email`, never inferred from `id`).
+    pub provider_type: String,
     /// Resolved credentials and options.
     pub credentials: BTreeMap<String, String>,
 }
@@ -141,7 +154,9 @@ pub fn default_config_paths() -> Vec<PathBuf> {
 impl IrisConfig {
     /// Parse Iris config from TOML text.
     pub fn from_toml(input: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(input)?)
+        let config: Self = toml::from_str(input)?;
+        config.validate_provider_identifiers()?;
+        Ok(config)
     }
 
     /// Load Iris config from a TOML file.
@@ -163,22 +178,60 @@ impl IrisConfig {
             }
             for provider in self.providers.values_mut() {
                 provider.enabled = false;
+                for instance in provider.instances.values_mut() {
+                    instance.enabled = false;
+                }
             }
             for id in ids {
-                self.providers.entry(id.to_owned()).or_default().enabled = true;
-            }
-        }
-        for (provider, fields) in provider_env_fields() {
-            if let Some(config) = self.providers.get_mut(*provider) {
-                for (field, variable) in *fields {
-                    if env::var_os(variable).is_some() {
-                        config.credentials.insert(
-                            (*field).to_owned(),
-                            SecretValue::FromEnv {
-                                env: (*variable).to_owned(),
-                            },
+                let (provider_type, instance) = id.split_once('.').unwrap_or((id, ""));
+                if provider_type.is_empty() || !valid_identifier(provider_type) {
+                    anyhow::bail!("invalid provider id `{id}` in {ENABLED_PROVIDERS_ENV}");
+                }
+                let provider = self
+                    .providers
+                    .entry(provider_type.to_owned())
+                    .or_insert_with(|| ProviderConfig {
+                        enabled: false,
+                        ..ProviderConfig::default()
+                    });
+                if instance.is_empty() {
+                    provider.enabled = true;
+                } else {
+                    if !valid_identifier(instance) {
+                        anyhow::bail!(
+                            "invalid provider instance `{id}` in {ENABLED_PROVIDERS_ENV}"
                         );
                     }
+                    provider
+                        .instances
+                        .entry(instance.to_owned())
+                        .or_default()
+                        .enabled = true;
+                }
+            }
+        }
+        self.validate_provider_identifiers()?;
+        for (provider_type, config) in &mut self.providers {
+            apply_provider_env(config, provider_type, None);
+            for (instance, instance_config) in &mut config.instances {
+                apply_provider_env(instance_config, provider_type, Some(instance));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_provider_identifiers(&self) -> anyhow::Result<()> {
+        for (provider_type, config) in &self.providers {
+            if provider_type.contains('.') || !valid_identifier(provider_type) {
+                anyhow::bail!(
+                    "invalid provider type `{provider_type}`; use a lowercase identifier without dots"
+                );
+            }
+            for instance in config.instances.keys() {
+                if !valid_identifier(instance) {
+                    anyhow::bail!(
+                        "invalid provider instance `{provider_type}.{instance}`; use lowercase letters, digits, and hyphens"
+                    );
                 }
             }
         }
@@ -187,21 +240,29 @@ impl IrisConfig {
 
     /// Resolve enabled provider entries and their env-backed secrets.
     pub fn resolved_enabled_providers(&self) -> anyhow::Result<Vec<ResolvedProviderConfig>> {
-        self.providers
-            .iter()
-            .filter(|(_, provider)| provider.enabled)
-            .map(|(id, provider)| {
-                let credentials = provider
-                    .credentials
-                    .iter()
-                    .map(|(key, value)| value.resolve().map(|resolved| (key.clone(), resolved)))
-                    .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-                Ok(ResolvedProviderConfig {
-                    id: id.clone(),
-                    credentials,
-                })
-            })
-            .collect()
+        self.validate_provider_identifiers()?;
+        let mut resolved = Vec::new();
+        for (provider_type, provider) in &self.providers {
+            // A TOML parent table is synthesized when only named children are
+            // declared. Do not turn that structural parent into a credentialless
+            // default provider; an explicit/default-only declaration has no
+            // instances and remains enabled as before.
+            if provider.enabled
+                && (provider.instances.is_empty() || !provider.credentials.is_empty())
+            {
+                resolved.push(resolve_provider(provider_type, provider_type, provider)?);
+            }
+            for (instance, instance_config) in &provider.instances {
+                if instance_config.enabled {
+                    resolved.push(resolve_provider(
+                        &format!("{provider_type}.{instance}"),
+                        provider_type,
+                        instance_config,
+                    )?);
+                }
+            }
+        }
+        Ok(resolved)
     }
 
     /// Resolve configured batch-ingest secrets. Missing environment-backed
@@ -247,6 +308,55 @@ const fn provider_env_fields() -> &'static [(&'static str, &'static [(&'static s
             ],
         ),
     ]
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn resolve_provider(
+    id: &str,
+    provider_type: &str,
+    provider: &ProviderConfig,
+) -> anyhow::Result<ResolvedProviderConfig> {
+    let credentials = provider
+        .credentials
+        .iter()
+        .map(|(key, value)| value.resolve().map(|resolved| (key.clone(), resolved)))
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    Ok(ResolvedProviderConfig {
+        id: id.to_owned(),
+        provider_type: provider_type.to_owned(),
+        credentials,
+    })
+}
+
+fn apply_provider_env(config: &mut ProviderConfig, provider_type: &str, instance: Option<&str>) {
+    let fields: &[(&str, &str)] = provider_env_fields()
+        .iter()
+        .find(|(name, _)| *name == provider_type)
+        .map_or(&[], |(_, fields)| *fields);
+    for (field, default_variable) in fields {
+        let variable = instance.map_or_else(
+            || (*default_variable).to_owned(),
+            |instance| {
+                format!(
+                    "IRIS_{}__{}__{}",
+                    provider_type.to_ascii_uppercase(),
+                    instance.replace('-', "_").to_ascii_uppercase(),
+                    field.to_ascii_uppercase(),
+                )
+            },
+        );
+        if env::var_os(&variable).is_some() {
+            config
+                .credentials
+                .insert((*field).to_owned(), SecretValue::FromEnv { env: variable });
+        }
+    }
 }
 
 impl SecretValue {
@@ -301,28 +411,134 @@ fn build_provider(
     attachments: &Arc<dyn AttachmentStore>,
     audit: &Arc<dyn AuditLog>,
 ) -> anyhow::Result<Arc<dyn MessageProvider>> {
-    match provider.id.as_str() {
-        "mock" => Ok(Arc::new(MockProvider::with_audit(audit.clone()))),
-        "telegram" => Ok(Arc::new(
+    let audit: Arc<dyn AuditLog> = Arc::new(InstanceAuditLog {
+        provider_id: provider.id.clone(),
+        inner: audit.clone(),
+    });
+    let built: Arc<dyn MessageProvider> = match provider.provider_type.as_str() {
+        "mock" => Arc::new(MockProvider::with_audit(audit.clone())),
+        "telegram" => Arc::new(
             TelegramProvider::from_credentials(&provider.credentials, attachments.clone())?
                 .with_audit(audit.clone()),
-        )),
-        "email" => Ok(Arc::new(
+        ),
+        "email" => Arc::new(
             EmailProvider::from_credentials(&provider.credentials, attachments.clone())?
                 .with_audit(audit.clone()),
-        )),
-        "sms" => Ok(Arc::new(
+        ),
+        "sms" => Arc::new(
             SmsProvider::from_credentials(&provider.credentials)?.with_audit(audit.clone()),
-        )),
+        ),
         other => anyhow::bail!("provider is configured but not available in this build: {other}"),
+    };
+    Ok(Arc::new(InstanceProvider {
+        id: provider.id.clone(),
+        inner: built,
+    }))
+}
+
+/// Scopes provider-originated audit entries and idempotency keys to a configured
+/// instance, so same-type providers do not share provenance.
+#[derive(Debug)]
+struct InstanceAuditLog {
+    provider_id: String,
+    inner: Arc<dyn AuditLog>,
+}
+
+#[async_trait]
+impl AuditLog for InstanceAuditLog {
+    async fn record(&self, mut event: AuditEvent) -> IrisResult<AuditEntry> {
+        event.provider.clone_from(&self.provider_id);
+        self.inner.record(event).await
+    }
+
+    async fn query(&self, filter: &AuditFilter) -> IrisResult<Vec<AuditEntry>> {
+        self.inner.query(filter).await
+    }
+
+    async fn verify_chain(&self) -> IrisResult<bool> {
+        self.inner.verify_chain().await
+    }
+
+    async fn record_once(
+        &self,
+        _provider: &str,
+        source_id: &str,
+        mut event: AuditEvent,
+    ) -> IrisResult<RecordOutcome> {
+        event.provider.clone_from(&self.provider_id);
+        self.inner
+            .record_once(&self.provider_id, source_id, event)
+            .await
+    }
+}
+
+/// Makes a concrete provider addressable by its configured instance id while
+/// retaining its provider-type metadata and implementation.
+struct InstanceProvider {
+    id: String,
+    inner: Arc<dyn MessageProvider>,
+}
+
+#[async_trait]
+impl MessageProvider for InstanceProvider {
+    fn metadata(&self) -> &iris_core::ProviderMetadata {
+        self.inner.metadata()
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn list_threads(&self, limit: Option<u32>) -> IrisResult<Vec<Thread>> {
+        self.inner.list_threads(limit).await
+    }
+
+    async fn list_messages(
+        &self,
+        thread_id: &str,
+        before: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+    ) -> IrisResult<Vec<Message>> {
+        self.inner.list_messages(thread_id, before, limit).await
+    }
+
+    async fn list_contacts(&self, limit: Option<u32>) -> IrisResult<Vec<Contact>> {
+        self.inner.list_contacts(limit).await
+    }
+
+    async fn send_message(
+        &self,
+        thread_id: &str,
+        message: &OutboundMessage,
+    ) -> IrisResult<Message> {
+        self.inner.send_message(thread_id, message).await
+    }
+
+    async fn subscribe_realtime(&self) -> IrisResult<MessageStream> {
+        self.inner.subscribe_realtime().await
+    }
+
+    fn realtime_status(&self) -> RealtimeStatus {
+        self.inner.realtime_status()
+    }
+
+    async fn shutdown_realtime(&self) -> IrisResult<()> {
+        self.inner.shutdown_realtime().await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
     use async_trait::async_trait;
     use iris_core::{AttachmentContent, AttachmentRef, IrisError};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// No-op attachment store for config tests — these tests only verify
     /// provider construction, not attachment persistence.
@@ -498,6 +714,149 @@ from = "alice@example.com"
             providers_from_config(&config, &test_store(), &test_audit()).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "email");
+    }
+
+    #[test]
+    fn resolves_default_and_named_email_instances_without_type_inference() {
+        let config = IrisConfig::from_toml(
+            r#"
+[providers.email]
+enabled = true
+[providers.email.credentials]
+username = "default@example.com"
+
+[providers.email.instances.ops-codefold]
+enabled = true
+[providers.email.instances.ops-codefold.credentials]
+username = "ops@example.com"
+"#,
+        )
+        .expect("valid config");
+
+        let resolved = config
+            .resolved_enabled_providers()
+            .expect("providers resolve");
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].id, "email");
+        assert_eq!(resolved[0].provider_type, "email");
+        assert_eq!(resolved[1].id, "email.ops-codefold");
+        assert_eq!(resolved[1].provider_type, "email");
+        assert_eq!(resolved[1].credentials["username"], "ops@example.com");
+    }
+
+    #[test]
+    fn rejects_invalid_instance_identifiers() {
+        let error = IrisConfig::from_toml(
+            r#"
+[providers.email.instances."ops_codefold"]
+enabled = true
+"#,
+        )
+        .expect_err("underscore must be rejected during TOML parsing");
+        assert!(error.to_string().contains("invalid provider instance"));
+    }
+
+    #[test]
+    fn builds_named_instances_with_distinct_runtime_ids() {
+        let config = IrisConfig::from_toml(
+            r#"
+[providers.email.instances.ops-codefold.credentials]
+imap_host = "imap.ops.example.com"
+smtp_host = "smtp.ops.example.com"
+username = "ops@example.com"
+password = "app-password"
+from = "ops@example.com"
+
+[providers.email.instances.support-codefold.credentials]
+imap_host = "imap.support.example.com"
+smtp_host = "smtp.support.example.com"
+username = "support@example.com"
+password = "app-password"
+from = "support@example.com"
+"#,
+        )
+        .expect("valid config");
+
+        let providers =
+            providers_from_config(&config, &test_store(), &test_audit()).expect("registry builds");
+        let ids: Vec<_> = providers.iter().map(|provider| provider.id()).collect();
+        assert_eq!(ids, ["email.ops-codefold", "email.support-codefold"]);
+        assert!(
+            providers
+                .iter()
+                .all(|provider| provider.metadata().id == "email")
+        );
+    }
+
+    #[test]
+    fn named_env_selection_disables_default_and_unselected_instances() {
+        let _guard = env_lock().lock().expect("environment lock");
+        temp_env::with_vars(
+            [
+                (ENABLED_PROVIDERS_ENV, Some("email.ops-codefold")),
+                (
+                    "IRIS_EMAIL__OPS_CODEFOLD__USERNAME",
+                    Some("ops@example.com"),
+                ),
+            ],
+            || {
+                let mut config = IrisConfig::from_toml(
+                    r#"
+[providers.email.credentials]
+username = "default@example.com"
+[providers.email.instances.ops-codefold.credentials]
+username = "configured-ops@example.com"
+[providers.email.instances.support-codefold.credentials]
+username = "support@example.com"
+"#,
+                )
+                .expect("valid config");
+                config.apply_env_overrides().expect("env applies");
+                let resolved = config
+                    .resolved_enabled_providers()
+                    .expect("providers resolve");
+                assert_eq!(resolved.len(), 1);
+                assert_eq!(resolved[0].id, "email.ops-codefold");
+                assert_eq!(resolved[0].credentials["username"], "ops@example.com");
+            },
+        );
+    }
+
+    #[test]
+    fn named_env_selection_creates_no_default_instance() {
+        let _guard = env_lock().lock().expect("environment lock");
+        temp_env::with_vars(
+            [
+                (ENABLED_PROVIDERS_ENV, Some("email.ops-codefold")),
+                ("IRIS_EMAIL_USERNAME", Some("legacy-default@example.com")),
+                (
+                    "IRIS_EMAIL__OPS_CODEFOLD__USERNAME",
+                    Some("ops@example.com"),
+                ),
+            ],
+            || {
+                let mut config = IrisConfig::default();
+                config.apply_env_overrides().expect("env applies");
+                let resolved = config
+                    .resolved_enabled_providers()
+                    .expect("providers resolve");
+                assert_eq!(resolved.len(), 1);
+                assert_eq!(resolved[0].id, "email.ops-codefold");
+                assert_eq!(resolved[0].credentials["username"], "ops@example.com");
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_identifiers_without_env_overlays() {
+        let error = IrisConfig::from_toml(
+            r#"
+[providers.email.instances."ops_codefold"]
+enabled = true
+"#,
+        )
+        .expect_err("TOML loading must validate identifiers");
+        assert!(error.to_string().contains("invalid provider instance"));
     }
 
     #[test]
