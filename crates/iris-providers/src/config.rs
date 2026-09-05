@@ -490,7 +490,14 @@ impl MessageProvider for InstanceProvider {
     }
 
     async fn list_threads(&self, limit: Option<u32>) -> IrisResult<Vec<Thread>> {
-        self.inner.list_threads(limit).await
+        let mut threads = self.inner.list_threads(limit).await?;
+        for thread in &mut threads {
+            thread.provider_instance = Some(self.id.clone());
+            for contact in &mut thread.participants {
+                contact.provider_instance = Some(self.id.clone());
+            }
+        }
+        Ok(threads)
     }
 
     async fn list_messages(
@@ -503,7 +510,11 @@ impl MessageProvider for InstanceProvider {
     }
 
     async fn list_contacts(&self, limit: Option<u32>) -> IrisResult<Vec<Contact>> {
-        self.inner.list_contacts(limit).await
+        let mut contacts = self.inner.list_contacts(limit).await?;
+        for contact in &mut contacts {
+            contact.provider_instance = Some(self.id.clone());
+        }
+        Ok(contacts)
     }
 
     async fn send_message(
@@ -569,9 +580,14 @@ mod tests {
     impl AuditLog for NullAudit {
         async fn record(
             &self,
-            _event: iris_core::AuditEvent,
+            event: iris_core::AuditEvent,
         ) -> iris_core::Result<iris_core::AuditEntry> {
-            unreachable!("config tests never record audit events")
+            Ok(iris_core::AuditEntry {
+                id: uuid::Uuid::nil(),
+                event,
+                prev_hash: None,
+                self_hash: "test".into(),
+            })
         }
         async fn record_once(
             &self,
@@ -786,6 +802,36 @@ from = "support@example.com"
                 .iter()
                 .all(|provider| provider.metadata().id == "email")
         );
+    }
+
+    #[tokio::test]
+    async fn named_mock_instances_attribute_threads_and_contacts() {
+        let config = IrisConfig::from_toml(
+            r"
+[providers.mock.instances.alpha]
+[providers.mock.instances.beta]
+",
+        )
+        .expect("valid config");
+        let providers =
+            providers_from_config(&config, &test_store(), &test_audit()).expect("registry builds");
+        assert_eq!(providers.len(), 2);
+        for provider in providers {
+            let instance = provider.id().to_owned();
+            let threads = provider.list_threads(Some(1)).await.expect("list threads");
+            let contacts = provider
+                .list_contacts(Some(1))
+                .await
+                .expect("list contacts");
+            assert_eq!(
+                threads[0].provider_instance.as_deref(),
+                Some(instance.as_str())
+            );
+            assert_eq!(
+                contacts[0].provider_instance.as_deref(),
+                Some(instance.as_str())
+            );
+        }
     }
 
     #[test]

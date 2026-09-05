@@ -122,6 +122,7 @@ impl MessageProvider for MockProvider {
         let threads = vec![Thread {
             id: Uuid::new_v4(),
             source: "mock".into(),
+            provider_instance: None,
             source_id: "thread-1".into(),
             title: Some("Test Conversation".into()),
             participants: vec![],
@@ -156,6 +157,7 @@ impl MessageProvider for MockProvider {
             sender: Contact {
                 id: Uuid::new_v4(),
                 source: "mock".into(),
+                provider_instance: None,
                 source_id: "user-1".into(),
                 display_name: Some("Test User".into()),
                 avatar_url: None,
@@ -185,6 +187,7 @@ impl MessageProvider for MockProvider {
         let contacts = vec![Contact {
             id: Uuid::new_v4(),
             source: "mock".into(),
+            provider_instance: None,
             source_id: "user-1".into(),
             display_name: Some("Test User".into()),
             avatar_url: None,
@@ -210,6 +213,7 @@ impl MessageProvider for MockProvider {
             sender: Contact {
                 id: Uuid::new_v4(),
                 source: "mock".into(),
+                provider_instance: None,
                 source_id: "self".into(),
                 display_name: Some("You".into()),
                 avatar_url: None,

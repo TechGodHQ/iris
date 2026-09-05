@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 pub enum GeneratedCommand {
     /// List normalized messages in a thread.
     ListMessages(ListMessagesArgs),
-    /// List conversation threads across providers.
+    /// List conversation threads across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.
     ListThreads(ListThreadsArgs),
-    /// List contacts across providers.
+    /// List contacts across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.
     ListContacts(ListContactsArgs),
     /// Send a message to a thread through the owning provider.
     SendMessage(SendMessageArgs),
@@ -87,7 +87,7 @@ pub struct SendMessageArgs {
     /// Message body to send.
     #[arg(long)]
     pub body: String,
-    /// Provider ID to route the send through when ownership is ambiguous.
+    /// Configured provider instance ID to route the send through when ownership is ambiguous. Discover exact IDs via `GET /providers`; an explicit instance is authoritative.
     #[arg(long)]
     pub provider: Option<String>,
     /// Attachments to send; each item is inline bytes (`mime_type` + `data_base64`, optional `filename`) or a stored `iris://attachment` reference (`stored_id`).

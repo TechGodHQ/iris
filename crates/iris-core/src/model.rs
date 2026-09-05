@@ -12,8 +12,12 @@ use uuid::Uuid;
 pub struct Contact {
     /// Globally unique Iris contact ID (assigned by Iris, not the source).
     pub id: Uuid,
-    /// The provider this contact originated from.
+    /// The provider type this contact originated from.
     pub source: String,
+    /// Configured provider instance that owns this contact. `None` is accepted
+    /// when decoding older persisted data; public aggregators populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance: Option<String>,
     /// The provider-specific identifier (e.g. phone number, username, user ID).
     pub source_id: String,
     /// Human-readable display name, if available.
@@ -110,8 +114,12 @@ pub struct Attachment {
 pub struct Thread {
     /// Globally unique Iris thread ID.
     pub id: Uuid,
-    /// The provider this thread originated from.
+    /// The provider type this thread originated from.
     pub source: String,
+    /// Configured provider instance that owns this thread. `None` is accepted
+    /// when decoding older persisted data; public aggregators populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance: Option<String>,
     /// The provider-specific thread ID.
     pub source_id: String,
     /// Human-readable thread title (contact name, group name, etc.).

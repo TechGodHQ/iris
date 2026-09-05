@@ -317,10 +317,11 @@ async fn query_audit_entries(
         .map_err(Into::into)
 }
 
+/// List registered configured provider instances, including their static type.
 pub fn list_providers() -> anyhow::Result<()> {
     for provider in get_providers(&attachment_store())? {
         let meta = provider.metadata();
-        println!("  {} — {}", meta.id, meta.name);
+        println!("  {} ({}) — {}", provider.id(), meta.id, meta.name);
     }
     Ok(())
 }

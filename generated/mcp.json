@@ -58,7 +58,7 @@
       "name": "list_messages"
     },
     {
-      "description": "List conversation threads across providers.",
+      "description": "List conversation threads across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -77,7 +77,7 @@
       "name": "list_threads"
     },
     {
-      "description": "List contacts across providers.",
+      "description": "List contacts across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -144,7 +144,7 @@
             "type": "string"
           },
           "provider": {
-            "description": "Provider ID to route the send through when ownership is ambiguous.",
+            "description": "Configured provider instance ID to route the send through when ownership is ambiguous. Discover exact IDs via `GET /providers`; an explicit instance is authoritative.",
             "type": "string"
           },
           "thread_id": {

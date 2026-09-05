@@ -620,6 +620,7 @@ mod tests {
                         sender: Contact {
                             id: uuid::Uuid::new_v4(),
                             source: "fake".into(),
+                            provider_instance: None,
                             source_id: "sender-1".into(),
                             display_name: Some("Sender".into()),
                             avatar_url: None,
