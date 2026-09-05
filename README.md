@@ -120,6 +120,48 @@ development keeps working. When a config file is present, only enabled providers
 listed there are registered. Unknown provider ids fail startup until the matching
 provider implementation is included in the build.
 
+### Multiple instances of one provider type
+
+A provider type may have a default instance plus named instances. The configured
+instance ID is `type.instance` (for example `email.ops-codefold`); it is distinct
+from the static provider type (`email`). Iris never infers a type from an
+arbitrary instance string.
+
+```toml
+# The default instance remains compatible with existing deployments.
+[providers.email.credentials]
+imap_host = "imap.fastmail.com"
+username = { env = "IRIS_EMAIL_USERNAME" }
+password = { env = "IRIS_EMAIL_PASSWORD" }
+
+# Named entries are independently configurable.
+[providers.email.instances.ops-codefold.credentials]
+imap_host = "imap.purelymail.com"
+username = { env = "IRIS_EMAIL__OPS_CODEFOLD__USERNAME" }
+password = { env = "IRIS_EMAIL__OPS_CODEFOLD__PASSWORD" }
+```
+
+For file-free configuration, select exact configured IDs with
+`IRIS_ENABLED_PROVIDERS=email,email.ops-codefold`. Named values use
+`IRIS_<TYPE>__<INSTANCE>__<FIELD>`: uppercase type/field, with hyphens in an
+instance converted to underscores. Thus `email.ops-codefold` uses
+`IRIS_EMAIL__OPS_CODEFOLD__USERNAME`. The legacy default variables such as
+`IRIS_EMAIL_USERNAME` retain their existing meaning.
+
+Agents can discover the configured IDs without source access: `GET /providers`
+(or `iris providers`) returns every instance with its static `provider_type`.
+For example, the HTTP response contains
+`{"id":"email.ops-codefold","provider_type":"email",...}`. `list_threads`
+and `list_contacts` return `provider_instance` for each item. To send where
+source thread IDs collide, supply the discovered ID in the generated
+`send_message` request's `provider` body field:
+
+```json
+{"body":"Reply from the ops mailbox", "provider":"email.ops-codefold"}
+```
+
+An explicit instance is authoritative.
+
 ## Architecture
 
 ```
