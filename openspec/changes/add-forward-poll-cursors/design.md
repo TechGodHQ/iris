@@ -1,0 +1,27 @@
+# Design: Forward Poll Cursors
+
+## Public contract and compatibility
+
+New generated `poll_messages` and `poll_threads` operations accept optional string `since` and return `ListMessagesPage` or `ListThreadsPage`, each containing `items` and non-null `next_since`. Existing `list_messages` and `list_threads` routes, output arrays, inputs, ordering, and pagination remain unchanged. This is additive across HTTP, MCP, and CLI; generated descriptions state the bootstrap-and-poll loop and that cursors are opaque, not portable across deployments, and must be replayed unchanged.
+
+`poll_messages` takes an exact thread ID and derives its provider instance from the generic owner registry. `poll_threads` requires an exact configured provider instance. Neither operation permits aggregate multi-provider checkpoints. All query-affecting inputs are fixed by the operation: messages bind operation, authenticated principal, provider instance, and thread ID; threads bind operation, authenticated principal, and provider instance. `limit` is deliberately not bound because it changes page size only, never the continuation position. Future filters, sort controls, or visibility inputs must be bound in canonical form before they can be added to a polling operation.
+
+## Bootstrap, progression, and ordering
+
+A forward-capable provider defines one immutable, totally ordered source position for each pollable change. The order MUST include a deterministic provider-local tie-breaker; timestamps alone are insufficient. Email's order is the monotonically assigned UID within a UIDVALIDITY epoch. A call without `since` is a bootstrap, not a history listing: it captures one consistent source snapshot and returns `items: []` with a checkpoint at that snapshot's final position. Consumers that want current history first use the existing list operation, then bootstrap polling. This prevents a limited historical response from being mistaken for a fully consumed forward stream. A forward-capable provider always returns a bootstrap cursor, including when its mailbox is empty.
+
+A call with `since` reads one consistent source snapshot and returns only source changes strictly after the saved position in that total order. The provider obtains at most `limit + 1` candidate changes, emits at most `limit`, and sets `next_since` to the position of the final emitted change. If no change is emitted, it returns the exact supplied cursor. It MUST NOT advance a checkpoint to a scanned-but-unemitted high-water mark. Concurrent arrivals after the snapshot are included on a later poll; no item at or before the returned position may be emitted again.
+
+`poll_messages` changes are normalized messages. `poll_threads` is a stream of thread-change observations: every source message position that creates or updates a thread produces that thread's then-current normalized snapshot, so one thread may appear more than once in a page. Its continuation advances by the final emitted source-message position, not by `Thread.last_message_at`. Providers that cannot establish this ordered thread-change stream reject `poll_threads` with the generic forward-poll capability error.
+
+## Domain, security, and provider boundary
+
+`iris-core` owns typed page types, a `ForwardPolling` provider capability, and stable structured errors: `forward_poll_unsupported`, `invalid_forward_cursor`, `forward_cursor_epoch_changed`, and `forward_cursor_auth_unavailable`. `MessageProvider` exposes typed forward-poll methods or options; providers that cannot guarantee a monotonic position advertise no `ForwardPolling` capability and reject the call without name-based registry logic.
+
+The cursor is an opaque, URL-safe AEAD ciphertext, not merely signed/base64 data. Iris configuration supplies a current key identifier and 256-bit key; the authenticated associated data contains the contract version, operation, authenticated principal, provider instance, and canonical query binding. Plaintext contains only the versioned opaque provider position. Tokens have strict encoded and decoded size limits. Unknown key IDs, authentication failure, malformed data, expired contract version, or binding mismatch are rejected before provider I/O with `invalid_forward_cursor`; a missing cursor key makes forward polling unavailable with `forward_cursor_auth_unavailable`. Key rotation accepts configured verification keys during a bounded migration and emits new cursors with the current key.
+
+Email's private position contains UIDVALIDITY plus UID. Outer token validation occurs before I/O. A syntactically valid token then performs only the minimal mailbox metadata read needed to compare UIDVALIDITY; a mismatch returns `forward_cursor_epoch_changed` before listing messages. No email, IMAP, UID, mailbox, or cursor fields appear in generated schemas or public error details.
+
+## Projection and verification
+
+`api/operations.yaml` is the source of truth. Hydra-generated CLI, HTTP, and MCP surfaces expose the same operation names, page schemas, descriptions, and error semantics. No provider-specific route, command, or schema is added. Tests cover compatibility of current list arrays; bootstrap for empty/non-empty sources; adjacent bounded pages without skips or duplicates; empty poll cursor retention; token size/AEAD/binding/key-rotation failures with no I/O; UIDVALIDITY invalidation; two named email instances; duplicate thread-change observations; unsupported providers; HTTP/MCP/CLI parity; generated freshness; and a consumer loop using only generated surface data.
