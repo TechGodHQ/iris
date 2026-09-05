@@ -762,6 +762,7 @@ impl TelegramMessage {
         Thread {
             id: thread_uuid(self.chat.id),
             source: PROVIDER_ID.into(),
+            provider_instance: None,
             source_id: self.chat.id.to_string(),
             title: self.chat.title(),
             participants,
@@ -795,6 +796,7 @@ impl TelegramMessage {
             || Contact {
                 id: contact_uuid(format!("chat:{}", self.chat.id).as_bytes()),
                 source: PROVIDER_ID.into(),
+                provider_instance: None,
                 source_id: self.chat.id.to_string(),
                 display_name: self.chat.title(),
                 avatar_url: None,
@@ -921,6 +923,7 @@ impl TelegramUser {
         Contact {
             id: contact_uuid(format!("user:{}", self.id).as_bytes()),
             source: PROVIDER_ID.into(),
+            provider_instance: None,
             source_id: self.id.to_string(),
             display_name: Some(self.display_name()),
             avatar_url: None,

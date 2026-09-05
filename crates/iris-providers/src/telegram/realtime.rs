@@ -635,7 +635,7 @@ impl RealtimeHub {
                         .await
                         .map_err(ProcessError::Terminal)?;
                     self.fan_out(snapshot, &message);
-                    self.retain_event(update_id, message.as_ref(), thread, contacts);
+                    self.retain_event(update_id, message.as_ref(), *thread, contacts);
                     self.cursor.store(update_id + 1, Ordering::SeqCst);
                 }
                 Classified::Ignored(metadata) => {
@@ -742,7 +742,7 @@ enum Classified {
     /// A normalizable message plus source-normalized query data and fixed audit metadata.
     Message {
         message: Box<Message>,
-        thread: Thread,
+        thread: Box<Thread>,
         contacts: Vec<Contact>,
         metadata: RealtimeAuditMetadata,
     },
@@ -958,7 +958,7 @@ impl TelegramProvider {
             );
             Ok(Classified::Message {
                 message: Box::new(normalized),
-                thread,
+                thread: Box::new(thread),
                 contacts,
                 metadata,
             })

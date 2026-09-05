@@ -333,6 +333,7 @@ fn thread_with_metadata(
     Thread {
         id: thread_uuid(id),
         source: SOURCE.to_owned(),
+        provider_instance: None,
         source_id: id.to_owned(),
         title: title.map(ToOwned::to_owned),
         participants: Vec::new(),
@@ -347,6 +348,7 @@ fn agent_contact(agent: &str, host: &str) -> Contact {
     Contact {
         id: contact_uuid(&source_id),
         source: SOURCE.to_owned(),
+        provider_instance: None,
         source_id,
         display_name: Some(agent.to_owned()),
         avatar_url: None,

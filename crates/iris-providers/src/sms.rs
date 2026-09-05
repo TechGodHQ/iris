@@ -353,6 +353,7 @@ impl TermuxSmsRecord {
         Thread {
             id: thread_uuid(&key),
             source: PROVIDER_ID.into(),
+            provider_instance: None,
             source_id: key,
             title: Some(self.address.clone()),
             participants,
@@ -370,6 +371,7 @@ impl TermuxSmsRecord {
         Contact {
             id: contact_uuid(&address),
             source: PROVIDER_ID.into(),
+            provider_instance: None,
             source_id: address,
             display_name: Some(self.address.clone()),
             avatar_url: None,
@@ -489,6 +491,7 @@ fn self_contact(self_number: Option<&str>) -> Contact {
     Contact {
         id: contact_uuid(&source_id),
         source: PROVIDER_ID.into(),
+        provider_instance: None,
         source_id,
         display_name: Some("Me".into()),
         avatar_url: None,

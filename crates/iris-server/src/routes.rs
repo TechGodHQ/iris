@@ -60,7 +60,10 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Serialize)]
 pub struct ProviderResponse {
-    pub id: &'static str,
+    /// Configured provider instance id (for example `email.ops-codefold`).
+    pub id: String,
+    /// Static provider type (for example `email`).
+    pub provider_type: &'static str,
     pub name: &'static str,
     pub capabilities: Vec<&'static str>,
 }
@@ -201,7 +204,8 @@ async fn list_providers(State(state): State<AppState>) -> Json<Vec<ProviderRespo
         .map(|p| {
             let m = p.metadata();
             ProviderResponse {
-                id: m.id,
+                id: p.id().to_owned(),
+                provider_type: m.id,
                 name: m.name,
                 capabilities: m
                     .capabilities
@@ -403,19 +407,11 @@ async fn send_message(
         attachments,
     };
     let provider = match provider_id.as_deref() {
-        Some(provider_id) => {
-            let provider = provider_by_id(state, provider_id)?;
-            let owner = provider_for_thread(state, &thread_id).await?;
-            if provider.id() != owner.id() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("provider '{provider_id}' does not own thread {thread_id}"),
-                    }),
-                ));
-            }
-            provider
-        }
+        // A configured instance id is an explicit routing directive. It is
+        // intentionally authoritative even when two same-type instances expose
+        // colliding source thread IDs; without it, ownership discovery remains
+        // the deterministic fallback.
+        Some(provider_id) => provider_by_id(state, provider_id)?,
         None => provider_for_thread(state, &thread_id).await?,
     };
     let message = provider
@@ -961,6 +957,7 @@ mod tests {
         Thread {
             id,
             source: source.to_string(),
+            provider_instance: None,
             source_id: format!("{source}-{id}"),
             title: Some(source.to_string()),
             participants: Vec::new(),
@@ -974,6 +971,7 @@ mod tests {
         Contact {
             id: Uuid::new_v4(),
             source: source.to_string(),
+            provider_instance: None,
             source_id: source_id.to_string(),
             display_name: Some(name.to_string()),
             avatar_url: None,

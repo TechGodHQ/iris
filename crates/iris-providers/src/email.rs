@@ -674,6 +674,7 @@ impl EmailEnvelope {
         Thread {
             id: self.thread_id(),
             source: PROVIDER_ID.into(),
+            provider_instance: None,
             source_id: self.thread_key(),
             title: self.subject.clone(),
             participants,
@@ -784,6 +785,7 @@ impl EmailAddress {
         Contact {
             id: uuid_for(format!("contact:{}", self.address.to_lowercase()).as_bytes()),
             source: PROVIDER_ID.into(),
+            provider_instance: None,
             source_id: self.address.clone(),
             display_name: self.name.clone(),
             avatar_url: None,

@@ -182,6 +182,9 @@ impl McpServer {
             body: args.body,
             attachments,
         };
+        // An explicit configured instance is authoritative: callers discover it
+        // from the provider listing and Iris dispatches to that exact instance.
+        // Without one, resolve ownership from the thread.
         let provider = match args.provider.as_deref() {
             Some(provider_id) => self.provider_by_id(provider_id)?,
             None => self.provider_for_thread(&args.thread_id).await?,

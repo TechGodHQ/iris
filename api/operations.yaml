@@ -23,7 +23,7 @@ operations:
         required: false
         location: query
   - name: list_threads
-    description: List conversation threads across providers.
+    description: List conversation threads across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.
     method: GET
     path: /threads
     read: true
@@ -40,7 +40,7 @@ operations:
         required: false
         location: query
   - name: list_contacts
-    description: List contacts across providers.
+    description: List contacts across configured provider instances. Each result includes `provider_instance`, the exact configured instance that owns it.
     method: GET
     path: /contacts
     read: true
@@ -74,7 +74,7 @@ operations:
         required: true
         location: body
       - name: provider
-        description: Provider ID to route the send through when ownership is ambiguous.
+        description: Configured provider instance ID to route the send through when ownership is ambiguous. Discover exact IDs via `GET /providers`; an explicit instance is authoritative.
         type: string
         required: false
         location: body
