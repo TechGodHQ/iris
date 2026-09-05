@@ -334,6 +334,9 @@ fn resolve_provider(
     })
 }
 
+const LEGACY_TELEGRAM_BOT_TOKEN_ENV: &str = "TELEGRAM_BOT_TOKEN";
+const CANONICAL_TELEGRAM_BOT_TOKEN_ENV: &str = "IRIS_TELEGRAM_BOT_TOKEN";
+
 fn apply_provider_env(config: &mut ProviderConfig, provider_type: &str, instance: Option<&str>) {
     let fields: &[(&str, &str)] = provider_env_fields()
         .iter()
@@ -356,6 +359,26 @@ fn apply_provider_env(config: &mut ProviderConfig, provider_type: &str, instance
                 .credentials
                 .insert((*field).to_owned(), SecretValue::FromEnv { env: variable });
         }
+    }
+
+    // v0.1.0 documented this unprefixed variable. Retain it only for the
+    // default Telegram instance so existing deployments can upgrade in place.
+    if provider_type == "telegram"
+        && instance.is_none()
+        && env::var_os(CANONICAL_TELEGRAM_BOT_TOKEN_ENV).is_none()
+        && env::var_os(LEGACY_TELEGRAM_BOT_TOKEN_ENV).is_some()
+    {
+        tracing::warn!(
+            legacy_env = LEGACY_TELEGRAM_BOT_TOKEN_ENV,
+            canonical_env = CANONICAL_TELEGRAM_BOT_TOKEN_ENV,
+            "deprecated Telegram credential environment variable selected; the canonical variable takes precedence when both are set"
+        );
+        config.credentials.insert(
+            "bot_token".to_owned(),
+            SecretValue::FromEnv {
+                env: LEGACY_TELEGRAM_BOT_TOKEN_ENV.to_owned(),
+            },
+        );
     }
 }
 
@@ -707,6 +730,91 @@ bot_token = "123:abc"
             providers_from_config(&config, &test_store(), &test_audit()).expect("registry builds");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "telegram");
+    }
+
+    #[test]
+    fn legacy_telegram_token_env_builds_default_provider() {
+        let _guard = env_lock().lock().expect("environment lock");
+        temp_env::with_vars(
+            [
+                (ENABLED_PROVIDERS_ENV, Some("telegram")),
+                (LEGACY_TELEGRAM_BOT_TOKEN_ENV, Some("legacy-token")),
+                (CANONICAL_TELEGRAM_BOT_TOKEN_ENV, None),
+            ],
+            || {
+                let mut config = IrisConfig::default();
+                config.apply_env_overrides().expect("env applies");
+                let resolved = config
+                    .resolved_enabled_providers()
+                    .expect("provider resolves");
+                assert_eq!(resolved[0].credentials["bot_token"], "legacy-token");
+                let providers = providers_from_config(&config, &test_store(), &test_audit())
+                    .expect("legacy token constructs Telegram provider");
+                assert_eq!(providers[0].id(), "telegram");
+            },
+        );
+    }
+
+    #[test]
+    fn canonical_telegram_token_env_builds_default_provider() {
+        let _guard = env_lock().lock().expect("environment lock");
+        temp_env::with_vars(
+            [
+                (ENABLED_PROVIDERS_ENV, Some("telegram")),
+                (LEGACY_TELEGRAM_BOT_TOKEN_ENV, None),
+                (CANONICAL_TELEGRAM_BOT_TOKEN_ENV, Some("canonical-token")),
+            ],
+            || {
+                let mut config = IrisConfig::default();
+                config.apply_env_overrides().expect("env applies");
+                let resolved = config
+                    .resolved_enabled_providers()
+                    .expect("provider resolves");
+                assert_eq!(resolved[0].credentials["bot_token"], "canonical-token");
+            },
+        );
+    }
+
+    #[test]
+    fn canonical_telegram_token_env_wins_over_legacy() {
+        let _guard = env_lock().lock().expect("environment lock");
+        temp_env::with_vars(
+            [
+                (ENABLED_PROVIDERS_ENV, Some("telegram")),
+                (LEGACY_TELEGRAM_BOT_TOKEN_ENV, Some("legacy-token")),
+                (CANONICAL_TELEGRAM_BOT_TOKEN_ENV, Some("canonical-token")),
+            ],
+            || {
+                let mut config = IrisConfig::default();
+                config.apply_env_overrides().expect("env applies");
+                let resolved = config
+                    .resolved_enabled_providers()
+                    .expect("provider resolves");
+                assert_eq!(resolved[0].credentials["bot_token"], "canonical-token");
+            },
+        );
+    }
+
+    #[test]
+    fn legacy_telegram_token_env_does_not_overlay_unrelated_provider() {
+        let _guard = env_lock().lock().expect("environment lock");
+        temp_env::with_vars(
+            [
+                (ENABLED_PROVIDERS_ENV, Some("mock")),
+                (LEGACY_TELEGRAM_BOT_TOKEN_ENV, Some("legacy-token")),
+                (CANONICAL_TELEGRAM_BOT_TOKEN_ENV, None),
+            ],
+            || {
+                let mut config = IrisConfig::default();
+                config.apply_env_overrides().expect("env applies");
+                let resolved = config
+                    .resolved_enabled_providers()
+                    .expect("provider resolves");
+                assert_eq!(resolved.len(), 1);
+                assert_eq!(resolved[0].id, "mock");
+                assert!(resolved[0].credentials.is_empty());
+            },
+        );
     }
 
     #[test]

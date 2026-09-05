@@ -6,7 +6,8 @@ services:
     restart: unless-stopped
     environment:
       IRIS_ENABLED_PROVIDERS: ${IRIS_ENABLED_PROVIDERS:-telegram}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN}
+      # `TELEGRAM_BOT_TOKEN` is a deprecated fallback for upgrades only.
+      IRIS_TELEGRAM_BOT_TOKEN: ${IRIS_TELEGRAM_BOT_TOKEN:?set IRIS_TELEGRAM_BOT_TOKEN}
     volumes:
       - iris-data:/data
     ports:

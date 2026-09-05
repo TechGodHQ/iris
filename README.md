@@ -49,7 +49,7 @@ docker run --rm \
   --publish 127.0.0.1:9876:9876 \
   --volume iris-data:/data \
   --env IRIS_ENABLED_PROVIDERS=telegram \
-  --env IRIS_TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}" \
+  --env IRIS_TELEGRAM_BOT_TOKEN="${IRIS_TELEGRAM_BOT_TOKEN}" \
   ghcr.io/techgodhq/iris:latest
 ```
 
@@ -61,7 +61,7 @@ variables. To keep the full-fidelity TOML path, mount a file and set
 
 For a reference Iris + Rite deployment, use
 [`deploy/docker-compose.yml`](deploy/docker-compose.yml). Set
-`TELEGRAM_BOT_TOKEN` and `RITE_GITHUB_WEBHOOK_SECRET` in its environment before
+`IRIS_TELEGRAM_BOT_TOKEN` and `RITE_GITHUB_WEBHOOK_SECRET` in its environment before
 running `docker compose -f deploy/docker-compose.yml up -d`.
 
 ## Configuration
@@ -77,7 +77,10 @@ For file-free configuration, set `IRIS_ENABLED_PROVIDERS` and matching
 `IRIS_EMAIL_IMAP_PORT`, `IRIS_EMAIL_SMTP_HOST`, `IRIS_EMAIL_SMTP_PORT`,
 `IRIS_EMAIL_USERNAME`, `IRIS_EMAIL_PASSWORD`, and optional `IRIS_EMAIL_MAILBOX`,
 `IRIS_EMAIL_FROM`, `IRIS_EMAIL_PAGE_SIZE`, and `IRIS_EMAIL_MAX_MESSAGES`.
-Enabled providers validate required credentials at startup.
+Enabled providers validate required credentials at startup. For upgrade compatibility,
+Telegram also accepts the legacy `TELEGRAM_BOT_TOKEN` only when
+`IRIS_TELEGRAM_BOT_TOKEN` is absent; migrate to the Iris-prefixed name because the
+canonical variable always takes precedence and the legacy fallback is deprecated.
 
 ```toml
 [providers.mock]
@@ -95,7 +98,9 @@ enabled = true
 
 [providers.telegram.credentials]
 # Telegram Bot API token. `token` is also accepted as an alias.
-bot_token = { env = "TELEGRAM_BOT_TOKEN" }
+# Prefer the canonical Iris-prefixed variable. Legacy `TELEGRAM_BOT_TOKEN`
+# remains a deprecated fallback only when this variable is absent.
+bot_token = { env = "IRIS_TELEGRAM_BOT_TOKEN" }
 ```
 
 The Telegram provider uses the Bot API. It can list and normalize messages that
