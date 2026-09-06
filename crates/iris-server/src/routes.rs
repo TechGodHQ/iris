@@ -760,6 +760,8 @@ mod tests {
     }
 
     struct FakeProvider {
+        /// Configured instance ID; static type remains `metadata.id`.
+        instance_id: String,
         metadata: ProviderMetadata,
         threads: Vec<Thread>,
         contacts: Vec<Contact>,
@@ -771,9 +773,18 @@ mod tests {
 
     impl FakeProvider {
         fn new(id: &'static str, name: &'static str) -> Self {
+            Self::new_instance(id, id, name)
+        }
+
+        fn new_instance(
+            instance_id: &str,
+            provider_type: &'static str,
+            name: &'static str,
+        ) -> Self {
             Self {
+                instance_id: instance_id.to_owned(),
                 metadata: ProviderMetadata {
-                    id,
+                    id: provider_type,
                     name,
                     capabilities: &[
                         ProviderCapability::ListThreads,
@@ -837,6 +848,10 @@ mod tests {
             &self.metadata
         }
 
+        fn id(&self) -> &str {
+            &self.instance_id
+        }
+
         fn realtime_status(&self) -> RealtimeStatus {
             self.realtime_status.clone()
         }
@@ -844,6 +859,12 @@ mod tests {
         async fn list_threads(&self, limit: Option<u32>) -> iris_core::Result<Vec<Thread>> {
             self.maybe_fail("list_threads")?;
             let mut threads = self.threads.clone();
+            for thread in &mut threads {
+                thread.provider_instance = Some(self.instance_id.clone());
+                for participant in &mut thread.participants {
+                    participant.provider_instance = Some(self.instance_id.clone());
+                }
+            }
             if let Some(limit) = limit {
                 threads.truncate(limit as usize);
             }
@@ -877,6 +898,9 @@ mod tests {
         async fn list_contacts(&self, limit: Option<u32>) -> iris_core::Result<Vec<Contact>> {
             self.maybe_fail("list_contacts")?;
             let mut contacts = self.contacts.clone();
+            for contact in &mut contacts {
+                contact.provider_instance = Some(self.instance_id.clone());
+            }
             if let Some(limit) = limit {
                 contacts.truncate(limit as usize);
             }
@@ -1224,6 +1248,106 @@ mod tests {
             threads.iter().map(|thread| thread.id).collect::<Vec<_>>(),
             vec![newest, middle]
         );
+    }
+
+    #[tokio::test]
+    async fn http_surfaces_discover_and_route_same_type_instances() {
+        let ops_thread = Uuid::new_v4();
+        let support_thread = Uuid::new_v4();
+        let ops = Arc::new(
+            FakeProvider::new_instance("email.ops", "email", "Operations Email")
+                .with_threads(vec![thread(ops_thread, "email", 15)])
+                .with_contacts(vec![contact("email", "ops", "Operations")]),
+        );
+        let support = Arc::new(
+            FakeProvider::new_instance("email.support", "email", "Support Email")
+                .with_threads(vec![thread(support_thread, "email", 16)])
+                .with_contacts(vec![contact("email", "support", "Support")]),
+        );
+        let app_state = AppState {
+            providers: vec![
+                ops.clone() as Arc<dyn MessageProvider>,
+                support.clone() as Arc<dyn MessageProvider>,
+            ],
+            thread_owners: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            attachments: Arc::new(NullStore),
+            audit: Arc::new(iris_audit::LocalFsAuditLog::new(
+                "/tmp/iris-server-test-audit",
+            )),
+            ingest: None,
+            ingest_sources: std::collections::BTreeSet::new(),
+            ingest_secrets: std::collections::BTreeMap::new(),
+            sse: crate::sse::SseSettings::default(),
+        };
+        let app = router(app_state);
+        let providers = app
+            .clone()
+            .oneshot(Request::get("/providers").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(providers.status(), StatusCode::OK);
+        let providers: serde_json::Value =
+            serde_json::from_slice(&to_bytes(providers.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            providers,
+            serde_json::json!([
+                {"id":"email.ops","provider_type":"email","name":"Operations Email","capabilities":["list_threads","list_messages","list_contacts","send_messages"]},
+                {"id":"email.support","provider_type":"email","name":"Support Email","capabilities":["list_threads","list_messages","list_contacts","send_messages"]}
+            ])
+        );
+        let threads = app
+            .clone()
+            .oneshot(Request::get("/threads").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let threads: Vec<Thread> =
+            serde_json::from_slice(&to_bytes(threads.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            threads
+                .iter()
+                .map(|thread| thread.provider_instance.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("email.support"), Some("email.ops")]
+        );
+        let contacts = app
+            .clone()
+            .oneshot(Request::get("/contacts").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let contacts: Vec<Contact> =
+            serde_json::from_slice(&to_bytes(contacts.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            contacts
+                .iter()
+                .map(|contact| contact.provider_instance.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("email.ops"), Some("email.support")]
+        );
+        let request = Request::post(format!("/messages/{ops_thread}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"body":"only ops","provider":"email.ops"}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(ops.recorded_outbound().len(), 1);
+        assert!(support.recorded_outbound().is_empty());
+        let request = Request::post(format!("/messages/{support_thread}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"body":"no dispatch","provider":"email.missing"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(ops.recorded_outbound().len(), 1);
+        assert!(support.recorded_outbound().is_empty());
     }
 
     #[tokio::test]
