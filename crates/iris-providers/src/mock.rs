@@ -29,6 +29,7 @@ const METADATA: ProviderMetadata = ProviderMetadata {
 /// A simple mock provider that returns static test data.
 #[derive(Debug, Default)]
 pub struct MockProvider {
+    instance_id: String,
     audit: Option<Arc<dyn AuditLog>>,
     store: Option<Arc<dyn iris_core::AttachmentStore>>,
     outbound: std::sync::Mutex<Vec<RecordedSend>>,
@@ -48,18 +49,27 @@ pub struct RecordedSend {
 impl MockProvider {
     /// Creates a mock provider without audit instrumentation.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
+            instance_id: METADATA.id.to_owned(),
             audit: None,
             store: None,
             outbound: std::sync::Mutex::new(Vec::new()),
         }
     }
 
+    /// Assign a configured instance ID while retaining the `mock` provider type.
+    #[must_use]
+    pub fn with_instance_id(mut self, instance_id: impl Into<String>) -> Self {
+        self.instance_id = instance_id.into();
+        self
+    }
+
     /// Creates a mock provider that records operation metadata in `audit`.
     #[must_use]
     pub fn with_audit(audit: Arc<dyn AuditLog>) -> Self {
         Self {
+            instance_id: METADATA.id.to_owned(),
             audit: Some(audit),
             store: None,
             outbound: std::sync::Mutex::new(Vec::new()),
@@ -116,6 +126,10 @@ impl MockProvider {
 impl MessageProvider for MockProvider {
     fn metadata(&self) -> &ProviderMetadata {
         &METADATA
+    }
+
+    fn id(&self) -> &str {
+        &self.instance_id
     }
 
     async fn list_threads(&self, limit: Option<u32>) -> Result<Vec<Thread>> {

@@ -617,6 +617,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generated_mcp_send_routes_to_discovered_named_instance() {
+        let ops = Arc::new(MockProvider::new().with_instance_id("mock.ops"));
+        let support = Arc::new(MockProvider::new().with_instance_id("mock.support"));
+        let server = McpServer::new(
+            vec![
+                ops.clone() as Arc<dyn MessageProvider>,
+                support.clone() as Arc<dyn MessageProvider>,
+            ],
+            Arc::new(iris_audit::LocalFsAuditLog::new("/tmp/iris-mcp-test-audit")),
+        );
+        let request = |provider: &str| {
+            json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": {"name": "send_message", "arguments": {
+                    "thread_id": "11111111-1111-1111-1111-111111111111",
+                    "body": "named route", "provider": provider
+                }}
+            })
+        };
+        let sent = server.handle_jsonrpc(request("mock.ops")).await;
+        assert_eq!(sent["error"], Value::Null, "{sent}");
+        assert_eq!(ops.recorded_sends().unwrap().len(), 1);
+        assert!(support.recorded_sends().unwrap().is_empty());
+
+        let missing = server.handle_jsonrpc(request("mock.missing")).await;
+        assert_ne!(missing["error"], Value::Null, "{missing}");
+        assert!(
+            missing["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("provider")
+        );
+        assert_eq!(ops.recorded_sends().unwrap().len(), 1);
+        assert!(support.recorded_sends().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn send_message_tool_rejects_mixed_attachment_union() {
         let response = server()
             .handle_jsonrpc(json!({
