@@ -326,7 +326,43 @@ pub fn list_providers() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reject public listening addresses when no HTTP bearer token is configured.
+///
+/// This intentionally names no overlay network: loopback, RFC1918, carrier-grade
+/// NAT, and IPv6 unique-local addresses are safe deployment classes regardless of
+/// which network product provides them.
+fn validate_unauthenticated_bind(addr: &str, has_api_token: bool) -> anyhow::Result<()> {
+    if has_api_token {
+        return Ok(());
+    }
+    let address: std::net::SocketAddr = addr.parse().map_err(|_| {
+        anyhow::anyhow!("--addr must be a numeric socket address when IRIS_API_TOKEN is unset")
+    })?;
+    let private = match address.ip() {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+        }
+        std::net::IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+    };
+    anyhow::ensure!(
+        private,
+        "IRIS_API_TOKEN is required when binding Iris to a public address"
+    );
+    Ok(())
+}
+
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    let api_token = std::env::var("IRIS_API_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty());
+    validate_unauthenticated_bind(&args.addr, api_token.is_some())?;
+    if api_token.is_none() {
+        tracing::warn!(
+            "IRIS_API_TOKEN is unset: HTTP API authentication is disabled; binding is restricted to a non-public address"
+        );
+    }
     let store = attachment_store();
     let audit = audit_log();
     let providers = get_providers_from_path(args.config.as_deref(), &store, &audit)?;
@@ -339,13 +375,15 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         None => load_default_config()?,
     };
     let (ingest, ingest_sources, ingest_secrets) = ingest_configuration(&config);
-    let app = iris_server::create_app_with_ingest(
+    let app = iris_server::create_app_with_ingest_sse_and_api_token(
         providers.clone(),
         store,
         audit,
         ingest,
         ingest_sources,
         ingest_secrets,
+        iris_server::sse::SseSettings::default(),
+        api_token,
     );
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;

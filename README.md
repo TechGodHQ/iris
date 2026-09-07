@@ -39,9 +39,17 @@ cargo run -- serve
 ## Self-hosting with Docker
 
 Published images are available from GitHub Container Registry after a release tag:
-`ghcr.io/techgodhq/iris:<version>` (or `:latest`). Iris currently has **no
-HTTP authentication** (tracked in COD-429), so bind it to localhost or place it
-only on a private network behind your own authenticated proxy.
+`ghcr.io/techgodhq/iris:<version>` (or `:latest`). Set `IRIS_API_TOKEN` to a
+high-entropy secret in every internet-reachable deployment; every HTTP endpoint
+except `GET /health` then requires `Authorization: Bearer <token>`. Iris compares
+tokens without early exit and does not encode assumptions about any particular
+network product. Without a token, `iris serve` emits a conspicuous warning and
+refuses public or wildcard bind addresses; it allows only numeric loopback,
+private, carrier-grade-NAT, or IPv6 unique-local addresses.
+
+```bash
+curl -H "Authorization: Bearer ${IRIS_API_TOKEN}" http://127.0.0.1:9876/providers
+```
 
 ```bash
 docker run --rm \

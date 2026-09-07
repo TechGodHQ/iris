@@ -29,6 +29,8 @@ pub struct AppState {
     pub ingest_secrets: BTreeMap<String, Arc<str>>,
     /// SSE delivery settings (wire-idle heartbeat interval).
     pub sse: SseSettings,
+    /// Optional static bearer token for the general HTTP API.
+    pub api_token: Option<Arc<str>>,
 }
 
 /// Creates the Axum application with all routes wired.
@@ -94,6 +96,30 @@ pub fn create_app_with_ingest_and_sse(
     ingest_secrets: BTreeMap<String, String>,
     sse: SseSettings,
 ) -> Router {
+    create_app_with_ingest_sse_and_api_token(
+        providers,
+        attachments,
+        audit,
+        ingest,
+        ingest_sources,
+        ingest_secrets,
+        sse,
+        None,
+    )
+}
+
+/// Creates the application with explicit ingestion, SSE, and HTTP bearer-token settings.
+#[allow(clippy::too_many_arguments)]
+pub fn create_app_with_ingest_sse_and_api_token(
+    providers: Vec<Arc<dyn MessageProvider>>,
+    attachments: Arc<dyn AttachmentStore>,
+    audit: Arc<dyn AuditLog>,
+    ingest: Option<Arc<dyn IngestStore>>,
+    ingest_sources: impl IntoIterator<Item = String>,
+    ingest_secrets: BTreeMap<String, String>,
+    sse: SseSettings,
+    api_token: Option<String>,
+) -> Router {
     let ingest_sources = ingest_sources.into_iter().collect();
     // A blank configuration value must never turn into a valid empty bearer token.
     let ingest_secrets = ingest_secrets
@@ -110,6 +136,9 @@ pub fn create_app_with_ingest_and_sse(
         ingest_sources,
         ingest_secrets,
         sse,
+        api_token: api_token
+            .filter(|token| !token.trim().is_empty())
+            .map(Arc::from),
     };
     routes::router(state)
 }

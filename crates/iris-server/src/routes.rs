@@ -88,7 +88,37 @@ pub fn router(state: AppState) -> Router {
             .any(|route| route.name == "subscribe_events" && route.path == "/v1/events"),
         "generated SSE metadata must cover the runtime-bound subscribe_events route"
     );
-    router.with_state(state)
+    router
+        .layer(middleware::from_fn_with_state(state.clone(), api_auth))
+        .with_state(state)
+}
+
+/// Authenticate every HTTP endpoint except the liveness probe.
+async fn api_auth(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if request.uri().path() == "/health" || state.api_token.is_none() {
+        return next.run(request).await;
+    }
+    let authorization = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if authorization.is_none_or(|provided| {
+        !constant_time_secret_eq(state.api_token.as_deref().expect("checked above"), provided)
+    }) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid or missing bearer authorization".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 const MAX_INGEST_BODY_BYTES: usize = 1024 * 1024;
@@ -952,6 +982,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            api_token: None,
         }
     }
 
@@ -1180,6 +1211,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            api_token: None,
         };
         let _router = super::router(app_state);
     }
@@ -1278,6 +1310,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            api_token: None,
         };
         let app = router(app_state);
         let providers = app
@@ -1502,6 +1535,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            api_token: None,
         };
         let mut input = input_with_thread(thread_id, &[]);
         input.body = serde_json::json!({
@@ -1630,6 +1664,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            api_token: None,
         };
 
         // Retrieve via the HTTP handler.
@@ -1666,6 +1701,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            api_token: None,
         };
 
         let random_id = Uuid::new_v4();
@@ -1691,6 +1727,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            api_token: None,
         };
 
         let response = get_attachment_content(
@@ -1727,6 +1764,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            api_token: None,
         };
 
         let response = get_attachment_content(
@@ -1770,6 +1808,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            api_token: None,
         };
 
         let response = get_attachment_content(
