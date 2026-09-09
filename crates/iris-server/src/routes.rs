@@ -789,6 +789,37 @@ mod tests {
         }
     }
 
+    /// A no-op audit log for routes that do not emit audit events.
+    #[derive(Debug)]
+    struct NullAudit;
+
+    #[async_trait]
+    impl AuditLog for NullAudit {
+        async fn record(&self, _event: AuditEvent) -> iris_core::Result<iris_core::AuditEntry> {
+            unreachable!("authenticated router test does not record audit entries")
+        }
+
+        async fn query(
+            &self,
+            _filter: &iris_core::AuditFilter,
+        ) -> iris_core::Result<Vec<iris_core::AuditEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn verify_chain(&self) -> iris_core::Result<bool> {
+            Ok(true)
+        }
+
+        async fn record_once(
+            &self,
+            _provider: &str,
+            _source_id: &str,
+            _event: AuditEvent,
+        ) -> iris_core::Result<iris_core::RecordOutcome> {
+            unreachable!("authenticated router test does not record audit entries")
+        }
+    }
+
     struct FakeProvider {
         /// Configured instance ID; static type remains `metadata.id`.
         instance_id: String,
@@ -984,6 +1015,19 @@ mod tests {
             sse: crate::sse::SseSettings::default(),
             api_token: None,
         }
+    }
+
+    fn router_with_api_token(api_token: &str) -> axum::Router {
+        crate::app::create_app_with_ingest_sse_and_api_token(
+            Vec::new(),
+            Arc::new(NullStore),
+            Arc::new(NullAudit),
+            None,
+            std::iter::empty(),
+            BTreeMap::new(),
+            crate::sse::SseSettings::default(),
+            Some(api_token.to_owned()),
+        )
     }
 
     fn input(query: &[(&str, &str)]) -> generated::GeneratedOperationInput {
@@ -1185,6 +1229,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn configured_api_token_authenticates_public_router_boundary() {
+        let app = router_with_api_token("test-only-api-token");
+        for authorization in [None, Some("Bearer"), Some("Bearer wrong-test-only-token")] {
+            let mut request = Request::get("/providers");
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let authorized = app
+            .clone()
+            .oneshot(
+                Request::get("/providers")
+                    .header(header::AUTHORIZATION, "Bearer test-only-api-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        let health = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
     }
 
     #[test]
