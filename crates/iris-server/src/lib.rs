@@ -8,6 +8,8 @@ pub mod app;
 pub mod routes;
 pub mod sse;
 
+mod replay_broker;
+
 pub use app::{
     create_app, create_app_with_ingest, create_app_with_ingest_sse_and_api_token,
     create_app_with_sse,
