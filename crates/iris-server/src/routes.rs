@@ -1013,6 +1013,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            replay_broker: crate::replay_broker::ReplayBroker::new(),
             api_token: None,
         }
     }
@@ -1290,6 +1291,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            replay_broker: crate::replay_broker::ReplayBroker::new(),
             api_token: None,
         };
         let _router = super::router(app_state);
@@ -1389,6 +1391,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            replay_broker: crate::replay_broker::ReplayBroker::new(),
             api_token: None,
         };
         let app = router(app_state);
@@ -1614,6 +1617,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            replay_broker: crate::replay_broker::ReplayBroker::new(),
             api_token: None,
         };
         let mut input = input_with_thread(thread_id, &[]);
@@ -1743,6 +1747,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            replay_broker: crate::replay_broker::ReplayBroker::new(),
             api_token: None,
         };
 
@@ -1780,6 +1785,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            replay_broker: crate::replay_broker::ReplayBroker::new(),
             api_token: None,
         };
 
@@ -1806,6 +1812,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            replay_broker: crate::replay_broker::ReplayBroker::new(),
             api_token: None,
         };
 
@@ -1843,6 +1850,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            replay_broker: crate::replay_broker::ReplayBroker::new(),
             api_token: None,
         };
 
@@ -1887,6 +1895,7 @@ mod tests {
             ingest_sources: std::collections::BTreeSet::new(),
             ingest_secrets: std::collections::BTreeMap::new(),
             sse: crate::sse::SseSettings::default(),
+            replay_broker: crate::replay_broker::ReplayBroker::new(),
             api_token: None,
         };
 
