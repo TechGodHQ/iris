@@ -8,7 +8,7 @@ use std::{
 use axum::Router;
 use iris_core::{AttachmentStore, AuditLog, IngestStore, MessageProvider};
 
-use crate::{routes, sse::SseSettings};
+use crate::{replay_broker::ReplayBroker, routes, sse::SseSettings};
 
 /// Shared application state — holds all registered providers.
 #[derive(Clone)]
@@ -29,6 +29,9 @@ pub struct AppState {
     pub ingest_secrets: BTreeMap<String, Arc<str>>,
     /// SSE delivery settings (wire-idle heartbeat interval).
     pub sse: SseSettings,
+    /// Private process-local owner of SSE replay retention and future fan-out.
+    #[allow(dead_code)]
+    pub(crate) replay_broker: ReplayBroker,
     /// Optional static bearer token for the general HTTP API.
     pub api_token: Option<Arc<str>>,
 }
@@ -136,6 +139,7 @@ pub fn create_app_with_ingest_sse_and_api_token(
         ingest_sources,
         ingest_secrets,
         sse,
+        replay_broker: ReplayBroker::new(),
         api_token: api_token
             .filter(|token| !token.trim().is_empty())
             .map(Arc::from),
