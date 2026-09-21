@@ -2,12 +2,13 @@
 //!
 //! This module implements the frozen `add-realtime-subscriptions` design's
 //! SSE surface: provider selection (422 for an unusable filtered provider,
-//! 503 when no capability-positive provider can subscribe), per-provider
-//! branch tasks fanning into one wire driver, the five public terminal
-//! error codes with sanitized messages, a wire-idle comment heartbeat, and
-//! disconnect-driven subscription cleanup. It owns no polling logic —
-//! providers supply [`MessageStream`]s through
-//! [`MessageProvider::subscribe_realtime`](iris_core::MessageProvider).
+//! 503 when no capability-positive provider can subscribe), broker-owned
+//! per-instance upstream lifecycle, a wire driver over broker registrations,
+//! the five public terminal error codes with sanitized messages, a wire-idle
+//! comment heartbeat, and disconnect-driven subscriber cleanup. Providers
+//! supply [`MessageStream`]s through
+//! [`MessageProvider::subscribe_realtime`](iris_core::MessageProvider); the
+//! broker, not an individual HTTP request, owns consumption and fan-out.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,9 +25,12 @@ use iris_core::{IrisError, Message, MessageProvider};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::Stream;
 
-use crate::app::AppState;
+use crate::{
+    app::AppState,
+    replay_broker::{BrokerEvent, BrokerSubscription, SubscriberTerminal},
+};
 
 /// Default wire-idle heartbeat interval (design-frozen at 15 seconds).
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -106,11 +110,7 @@ pub(crate) async fn subscribe_events(
         Err(status) => return *status,
     };
 
-    let body_stream = spawn_sse_pipeline(
-        branches,
-        query.thread_id.as_deref(),
-        state.sse.heartbeat_interval,
-    );
+    let body_stream = spawn_sse_pipeline(branches, state.sse.heartbeat_interval);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -119,67 +119,38 @@ pub(crate) async fn subscribe_events(
         .expect("static SSE response parts are valid")
 }
 
-/// Resolve which provider branches this request subscribes to.
+/// Resolve provider selection, then register broker-owned branches.
 ///
-/// A provider-filtered request that cannot establish its single branch
-/// yields HTTP 422 `unsupported_realtime_provider`; an unfiltered request
-/// that cannot establish any branch yields HTTP 503
-/// `no_realtime_provider`.
+/// Metadata selection happens before broker registration. A filtered request
+/// whose selected provider cannot establish its first shared upstream retains
+/// HTTP 422; an aggregate request omits a provider that cannot establish and
+/// retains HTTP 503 when none can establish.
 async fn select_branches(
     state: &AppState,
     query: &SubscribeEventsQuery,
 ) -> std::result::Result<Vec<ProviderBranch>, Box<Response>> {
-    match query.provider.as_deref() {
-        Some(provider_id) => select_filtered(state, provider_id).await,
-        None => select_aggregate(state).await,
-    }
-}
-
-/// Establish the single branch of a provider-filtered request.
-async fn select_filtered(
-    state: &AppState,
-    provider_id: &str,
-) -> std::result::Result<Vec<ProviderBranch>, Box<Response>> {
-    let usable = state
-        .providers
-        .iter()
-        .find(|provider| provider.id() == provider_id)
-        .filter(|provider| provider.metadata().has_realtime());
-    let Some(provider) = usable else {
-        return Err(Box::new(unsupported_response(provider_id)));
+    let providers = match query.provider.as_deref() {
+        Some(provider_id) => select_filtered(state, provider_id)?,
+        None => select_aggregate(state),
     };
-    let subscribed = provider.subscribe_realtime().await;
-    subscribed
-        .map(|stream| {
-            vec![ProviderBranch {
-                provider: provider_id.to_string(),
-                stream,
-            }]
-        })
-        .map_err(|_| Box::new(unsupported_response(provider.id())))
-}
-
-/// Establish every available branch of an unfiltered (aggregate) request.
-///
-/// Capability-negative providers are skipped; capability-positive providers
-/// that fail runtime readiness are omitted (warned, not fatal). An empty
-/// result yields the 503 `no_realtime_provider` response.
-async fn select_aggregate(
-    state: &AppState,
-) -> std::result::Result<Vec<ProviderBranch>, Box<Response>> {
     let mut branches = Vec::new();
-    for provider in &state.providers {
-        if !provider.metadata().has_realtime() {
-            continue;
-        }
-        match provider.subscribe_realtime().await {
-            Ok(stream) => branches.push(ProviderBranch {
-                provider: provider.id().to_string(),
-                stream,
+    for provider in providers {
+        let provider_id = provider.id().to_string();
+        match state
+            .replay_broker
+            .subscribe(provider, query.thread_id.clone())
+            .await
+        {
+            Ok(subscription) => branches.push(ProviderBranch {
+                provider: provider_id,
+                subscription,
             }),
+            Err(_error) if query.provider.is_some() => {
+                return Err(Box::new(unsupported_response(&provider_id)));
+            }
             Err(error) => {
                 tracing::warn!(
-                    provider = provider.id(),
+                    provider = provider_id,
                     error = %error,
                     "omitting unavailable realtime provider from aggregate stream"
                 );
@@ -193,6 +164,33 @@ async fn select_aggregate(
         )));
     }
     Ok(branches)
+}
+
+/// Select the single capability-positive branch of a provider-filtered request.
+fn select_filtered(
+    state: &AppState,
+    provider_id: &str,
+) -> std::result::Result<Vec<Arc<dyn MessageProvider>>, Box<Response>> {
+    let provider = state
+        .providers
+        .iter()
+        .find(|provider| provider.id() == provider_id)
+        .filter(|provider| provider.metadata().has_realtime())
+        .cloned();
+    let Some(provider) = provider else {
+        return Err(Box::new(unsupported_response(provider_id)));
+    };
+    Ok(vec![provider])
+}
+
+/// Select all capability-positive branches of an aggregate request.
+fn select_aggregate(state: &AppState) -> Vec<Arc<dyn MessageProvider>> {
+    state
+        .providers
+        .iter()
+        .filter(|provider| provider.metadata().has_realtime())
+        .cloned()
+        .collect()
 }
 
 /// The HTTP 422 `unsupported_realtime_provider` response for `provider`.
@@ -215,31 +213,25 @@ fn json_status(status: StatusCode, body: &serde_json::Value) -> Response {
         .expect("static response parts are valid")
 }
 
-/// One subscribed provider stream feeding the aggregate wire driver.
+/// One broker-owned provider subscription feeding the aggregate wire driver.
 struct ProviderBranch {
     provider: String,
-    stream: iris_core::MessageStream,
+    subscription: BrokerSubscription,
 }
 
 /// Spawn the branch tasks and the wire driver; return the wire body stream.
 ///
-/// Branch tasks apply the thread filter locally: filtered-out events are
-/// dropped before they reach the wire driver, so they never reset the
-/// heartbeat timer. When the HTTP body is dropped (client disconnect), the
-/// wire receiver closes, every branch observes the closed channel, drops
-/// its [`iris_core::MessageStream`], and the provider hub prunes the
-/// subscription — releasing hub capacity without server-side bookkeeping.
-fn spawn_sse_pipeline(
-    branches: Vec<ProviderBranch>,
-    thread_filter: Option<&str>,
-    heartbeat: Duration,
-) -> SseBodyStream {
+/// Broker registrations apply exact provider and thread filters before branch
+/// frames reach the wire driver, so filtered-out events never reset the
+/// heartbeat. When the HTTP body is dropped (client disconnect), the wire
+/// receiver closes, every branch drops its registration, and the broker cancels
+/// and joins an upstream only after its final demand is gone.
+fn spawn_sse_pipeline(branches: Vec<ProviderBranch>, heartbeat: Duration) -> SseBodyStream {
     let (frame_tx, frame_rx) = mpsc::channel::<WireFrame>(256);
     for branch in branches {
         let frame_tx = frame_tx.clone();
-        let thread_filter = thread_filter.map(str::to_string);
         tokio::spawn(async move {
-            run_branch(branch, thread_filter.as_deref(), frame_tx).await;
+            run_branch(branch, frame_tx).await;
         });
     }
     drop(frame_tx);
@@ -249,52 +241,200 @@ fn spawn_sse_pipeline(
     SseBodyStream { wire: wire_rx }
 }
 
-/// Forward one provider branch into the shared frame channel.
+/// Forward one broker branch into the shared frame channel.
 ///
-/// The branch task exits — dropping its provider stream and thereby the
-/// provider-side subscription — when the stream ends, after forwarding a
-/// terminal error frame, or when the driver has gone away (channel
-/// closed), which is the disconnect-cleanup path.
-async fn run_branch(
-    branch: ProviderBranch,
-    thread_filter: Option<&str>,
-    frame_tx: mpsc::Sender<WireFrame>,
-) {
-    let ProviderBranch { provider, stream } = branch;
-    let mut stream = stream;
+/// The registration guard lives for exactly as long as this task. Dropping the
+/// HTTP body closes `frame_tx`, which ends this branch and lets the broker
+/// cancel/join an upstream only after its final subscriber has gone away.
+async fn run_branch(branch: ProviderBranch, frame_tx: mpsc::Sender<WireFrame>) {
+    let ProviderBranch {
+        provider,
+        subscription,
+    } = branch;
+    let (replay, mut live, terminal, _registration) = subscription.into_parts();
+    // These independent watch receivers let a blocked frame forward react
+    // immediately to its own slow-consumer eviction without consuming an
+    // upstream error that must instead be emitted after the queued live
+    // messages are drained.
+    let mut slow_terminal = terminal.clone();
+    let mut error_terminal = terminal;
+    for event in replay {
+        match send_branch_frame(
+            &frame_tx,
+            WireFrame(render_message_frame(&event.message)),
+            &mut slow_terminal,
+        )
+        .await
+        {
+            BranchSend::Sent => {}
+            BranchSend::SlowConsumer => {
+                report_slow_consumer(&frame_tx, &provider);
+                return;
+            }
+            BranchSend::Closed => return,
+        }
+    }
+    let mut pending_terminal_error = None;
     loop {
-        tokio::select! {
-            biased;
-            () = frame_tx.closed() => break,
-            item = stream.next() => match item {
-                None => break,
-                Some(Ok(message)) => {
-                    let filtered_out = thread_filter
-                        .is_some_and(|filter| message.thread_id.to_string() != filter);
-                    if filtered_out {
-                        // Filtered out before the wire: does not reset
-                        // the heartbeat, is never delivered.
-                        continue;
-                    }
-                    let frame = WireFrame(render_message_frame(&message));
-                    if frame_tx.send(frame).await.is_err() {
-                        break;
+        if let Some(error) = pending_terminal_error.take() {
+            // The broker has removed this subscriber after recording an
+            // out-of-band terminal error. Drain every message that was already
+            // queued before the terminal signal, then render the guaranteed
+            // public error frame. This preserves order even when the live queue
+            // was full at the instant the upstream failed.
+            match live.recv().await {
+                Some(BrokerEvent::Message(event)) => {
+                    pending_terminal_error = Some(error);
+                    match send_branch_frame(
+                        &frame_tx,
+                        WireFrame(render_message_frame(&event.message)),
+                        &mut slow_terminal,
+                    )
+                    .await
+                    {
+                        BranchSend::Sent => {}
+                        BranchSend::SlowConsumer => {
+                            report_slow_consumer(&frame_tx, &provider);
+                            break;
+                        }
+                        BranchSend::Closed => break,
                     }
                 }
-                Some(Err(error)) => {
+                None => {
                     let frame = WireFrame(render_error_frame(
                         &provider,
                         public_error_code(&error),
                         &sanitize_error_message(&error),
                     ));
-                    // Best effort: if the driver is gone there is nobody
-                    // left to report to — the connection is already dead.
+                    // If the client has already gone away there is nobody left
+                    // to report to; otherwise retain the existing terminal
+                    // frame behavior.
                     let _ = frame_tx.send(frame).await;
                     break;
+                }
+            }
+            continue;
+        }
+        tokio::select! {
+            biased;
+            () = frame_tx.closed() => break,
+            () = wait_for_slow_consumer(&mut slow_terminal) => {
+                report_slow_consumer(&frame_tx, &provider);
+                break;
+            }
+            error = wait_for_terminal_error(&mut error_terminal) => {
+                pending_terminal_error = Some(error);
+            }
+            event = live.recv() => match event {
+                None => break,
+                Some(BrokerEvent::Message(event)) => {
+                    match send_branch_frame(
+                        &frame_tx,
+                        WireFrame(render_message_frame(&event.message)),
+                        &mut slow_terminal,
+                    )
+                    .await
+                    {
+                        BranchSend::Sent => {}
+                        BranchSend::SlowConsumer => {
+                            report_slow_consumer(&frame_tx, &provider);
+                            break;
+                        }
+                        BranchSend::Closed => break,
+                    }
                 }
             },
         }
     }
+}
+
+/// Outcome of forwarding one broker event toward a connection's wire driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchSend {
+    Sent,
+    SlowConsumer,
+    Closed,
+}
+
+/// Forward one frame unless the client disconnects or the broker evicts this
+/// branch for bounded-queue backpressure.
+///
+/// Watching the broker terminal signal while awaiting `frame_tx.send` is
+/// essential: a non-reading HTTP body can fill the wire and frame queues while
+/// the broker simultaneously fills the live queue. In that case the branch
+/// must release its registration so the final-demand cancellation path runs.
+async fn send_branch_frame(
+    frame_tx: &mpsc::Sender<WireFrame>,
+    frame: WireFrame,
+    terminal: &mut tokio::sync::watch::Receiver<SubscriberTerminal>,
+) -> BranchSend {
+    tokio::select! {
+        biased;
+        () = frame_tx.closed() => BranchSend::Closed,
+        () = wait_for_slow_consumer(terminal) => BranchSend::SlowConsumer,
+        sent = frame_tx.send(frame) => {
+            if sent.is_ok() {
+                BranchSend::Sent
+            } else {
+                BranchSend::Closed
+            }
+        }
+    }
+}
+
+/// Wait only for an actual slow-consumer terminal signal.
+///
+/// Normal stream completion drops the sender after queued messages have been
+/// accepted. That sender-close must not preempt draining those live messages;
+/// `live.recv()` owns the ordinary end-of-stream transition. A closed signal
+/// that never became `SlowConsumer` therefore remains pending forever here.
+async fn wait_for_slow_consumer(terminal: &mut tokio::sync::watch::Receiver<SubscriberTerminal>) {
+    loop {
+        let signal = terminal.borrow_and_update().clone();
+        match signal {
+            SubscriberTerminal::SlowConsumer => return,
+            // A separate receiver owns terminal-error delivery so a frame
+            // currently being forwarded is not preempted and lost.
+            SubscriberTerminal::UpstreamError(_) => std::future::pending::<()>().await,
+            SubscriberTerminal::Open => {}
+        }
+        if terminal.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Wait for a broker-owned upstream failure without treating normal completion
+/// or slow-consumer eviction as an upstream error.
+async fn wait_for_terminal_error(
+    terminal: &mut tokio::sync::watch::Receiver<SubscriberTerminal>,
+) -> IrisError {
+    loop {
+        let signal = terminal.borrow_and_update().clone();
+        match signal {
+            SubscriberTerminal::UpstreamError(error) => return error,
+            // The slow-consumer receiver owns this path; it terminates the
+            // branch immediately to release upstream demand.
+            SubscriberTerminal::SlowConsumer => std::future::pending::<()>().await,
+            SubscriberTerminal::Open => {}
+        }
+        if terminal.changed().await.is_err() {
+            std::future::pending::<IrisError>().await;
+        }
+    }
+}
+
+/// Report a slow consumer when the wire still has capacity, then always let the
+/// branch end. If the wire is already saturated, closure is the bounded,
+/// truthful outcome; waiting for an error frame would recreate the leak that
+/// this signal prevents.
+fn report_slow_consumer(frame_tx: &mpsc::Sender<WireFrame>, provider: &str) {
+    let error = IrisError::SlowConsumer;
+    let _ = frame_tx.try_send(WireFrame(render_error_frame(
+        provider,
+        public_error_code(&error),
+        &sanitize_error_message(&error),
+    )));
 }
 
 /// Multiplex rendered frames into wire bytes with a wire-idle heartbeat.
