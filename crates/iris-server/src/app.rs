@@ -30,7 +30,6 @@ pub struct AppState {
     /// SSE delivery settings (wire-idle heartbeat interval).
     pub sse: SseSettings,
     /// Private process-local owner of SSE replay retention and future fan-out.
-    #[allow(dead_code)]
     pub(crate) replay_broker: ReplayBroker,
     /// Optional static bearer token for the general HTTP API.
     pub api_token: Option<Arc<str>>,
