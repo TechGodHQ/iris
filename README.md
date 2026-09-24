@@ -170,6 +170,60 @@ source thread IDs collide, supply the discovered ID in the generated
 
 An explicit instance is authoritative.
 
+For the history and send-receipt boundary that applies to the current provider
+implementations, see [Message history and send receipts](#message-history-and-send-receipts).
+
+### Message history and send receipts
+
+Message history completeness is provider-specific. Iris does not promise one
+durable, complete conversation archive across providers; a successful send
+response and a later list result are separate pieces of evidence. The concrete
+behavior below describes the current Telegram provider implementation.
+
+For the current Telegram implementation, `list_messages` reads the bounded
+process-memory update history retained by its single realtime `getUpdates`
+owner. The buffer holds 512 retained events; older history rotates out. A
+successful `send_message` returns the provider's normalized outbound
+message and records a content-free send audit event, but the returned outbound
+message is not inserted into that retained update history. A later
+`list_messages` call can therefore omit a message that was successfully sent.
+This is behavior of Iris's Telegram provider implementation, not a guarantee
+about Telegram clients generally or other Iris providers.
+
+When a send succeeds, callers must retain or persist the returned `Message` in
+their own conversation context, associated with the exact configured provider
+instance and thread used for the send. That caller-owned record is the only
+way to preserve outbound messages; the entire provider update buffer is
+process memory and does not preserve conversation history across an Iris
+process termination or provider/realtime hub recreation. The returned
+outbound response is not inserted into that history, so `list_messages` is not
+a send receipt and cannot verify whether a particular outbound send succeeded.
+Do not use list presence or absence as a retry or deduplication gate. Transport
+errors and ambiguous outcomes remain ambiguous; do not blindly retry. A
+timeout, transport error, or 5xx response leaves the provider state unknown;
+neither `list_messages` nor `audit_query` can recover that outcome.
+
+The provider's send audit is a system-level trace available through Iris's
+`audit_query` surface. It includes only content-free metadata such as the
+operation, source/thread identifier, provider message identifier, and
+attachment shape/counts. The audit is written only after Iris receives and
+normalizes a provider response. If a success record exists—even if the caller
+missed the response—it corroborates that Iris processed that response, not an
+atomic provider state during a network timeout. A timeout or 5xx normally
+produces no audit entry, and its absence cannot establish whether the provider
+accepted a request before the response was lost. An audit query cannot resolve
+that outcome in real time. The audit is
+not automatically a message-body archive or a replacement for the returned
+`Message`, so callers must not expect to recover sent text from audit metadata
+or resolve an ambiguous outcome by assuming an audit entry exists.
+
+The Telegram retained history is process memory with a bounded 512-event
+buffer; it is not durable outbound storage. Process termination or
+provider/realtime hub recreation loses the buffer; restarting a poller within
+the same hub does not make it durable. This documentation does not add outbound
+persistence or echo/replay of outbound messages through list or event-stream
+surfaces, or an exactly-once send guarantee.
+
 ## Architecture
 
 ```
