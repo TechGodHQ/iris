@@ -27,5 +27,6 @@ pub fn iris_generate_config() -> GenerateConfig {
         sse_binding_prefix: "super::".to_string(),
         http_raw_dispatch_fn: "super::execute_generated_raw_operation".to_string(),
         generator_name: "hydra (iris)".to_string(),
+        ts_client_name: "IrisClient".to_string(),
     }
 }

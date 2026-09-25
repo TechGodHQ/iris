@@ -15,6 +15,8 @@ fn committed_generated_artifacts_are_fresh() {
     let cli = std::fs::read_to_string("../../generated/cli.rs").expect("generated/cli.rs");
     let http = std::fs::read_to_string("../../generated/http.rs").expect("generated/http.rs");
     let mcp = std::fs::read_to_string("../../generated/mcp.json").expect("generated/mcp.json");
+    let ts_client = std::fs::read_to_string("../../generated/ts-client/index.ts")
+        .expect("generated/ts-client/index.ts");
 
     assert_eq!(
         cli, artifacts.cli_rs,
@@ -28,6 +30,10 @@ fn committed_generated_artifacts_are_fresh() {
         mcp, artifacts.mcp_json,
         "generated/mcp.json is stale — run `cargo run -p iris-codegen --bin iris-codegen -- write`"
     );
+    assert_eq!(
+        ts_client, artifacts.ts_client_ts,
+        "generated/ts-client/index.ts is stale — run `cargo run -p iris-codegen --bin iris-codegen -- write`"
+    );
 }
 
 #[test]
@@ -37,6 +43,7 @@ fn public_ingest_surfaces_do_not_name_a_provider() {
         "../../generated/cli.rs",
         "../../generated/http.rs",
         "../../generated/mcp.json",
+        "../../generated/ts-client",
         "../../crates/iris-server/src",
         "../../crates/iris-mcp/src",
         "../../crates/iris-cli/src",
