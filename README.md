@@ -36,6 +36,32 @@ cargo run -- contacts
 cargo run -- serve
 ```
 
+## TypeScript client
+
+Iris also ships a generated, zero-runtime-dependency TypeScript fetch client
+from the same `api/operations.yaml` contract. Release tags publish the package
+with the matching Iris version:
+
+```bash
+npm install @techgodhq/iris-client
+```
+
+```ts
+import { IrisClient } from "@techgodhq/iris-client";
+
+const client = new IrisClient({
+  baseUrl: process.env.IRIS_URL ?? "http://127.0.0.1:9876",
+  token: process.env.IRIS_API_TOKEN,
+});
+
+const threads = await client.listThreads({ limit: 10 });
+```
+
+The generated client uses the platform `fetch` API, preserves explicit
+path/query/body parameter locations, and throws `ApiError` for non-2xx
+responses. The SSE operation is intentionally not included in this unary
+client; streaming TypeScript support needs a separate contract.
+
 ## Self-hosting with Docker
 
 Published images are available from GitHub Container Registry after a release tag:
@@ -251,7 +277,7 @@ surfaces, or an exactly-once send guarantee.
 | `iris-server` | Axum HTTP server (REST API) |
 | `iris-cli` | Command-line interface (clap) |
 | `iris-mcp` | MCP server surface |
-| `iris-codegen` | Code generation — keeps CLI/HTTP/MCP in sync |
+| `iris-codegen` | Code generation — keeps CLI/HTTP/MCP/TypeScript in sync |
 
 ## Adding a Provider
 

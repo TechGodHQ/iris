@@ -46,3 +46,44 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  publish-npm:
+    name: Publish TypeScript client
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: generated/ts-client/package-lock.json
+
+      - name: Install SDK dependencies
+        working-directory: generated/ts-client
+        run: npm ci --ignore-scripts
+
+      - name: Align package version with the Iris tag
+        working-directory: generated/ts-client
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          npm version "$version" --no-git-tag-version --allow-same-version
+
+      - name: Verify and build SDK
+        working-directory: generated/ts-client
+        run: |
+          npm run typecheck
+          npm run build
+
+      - name: Publish public npm package
+        working-directory: generated/ts-client
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

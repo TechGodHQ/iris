@@ -136,4 +136,3 @@ pub struct WatchArgs {
     #[arg(long)]
     pub thread_id: Option<String>,
 }
-

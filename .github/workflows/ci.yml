@@ -29,6 +29,34 @@ jobs:
       - name: Check generated surfaces
         run: cargo run -p iris-codegen --bin iris-codegen -- check
 
+  typescript:
+    name: TypeScript client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: generated/ts-client/package-lock.json
+
+      - name: Install SDK dependencies
+        working-directory: generated/ts-client
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck SDK
+        working-directory: generated/ts-client
+        run: npm run typecheck
+
+      - name: Build SDK
+        working-directory: generated/ts-client
+        run: npm run build
+
+      - name: Pack, install, and compile a consumer
+        working-directory: generated/ts-client
+        run: npm run package:smoke
+
   fmt:
     name: Format Check
     runs-on: ubuntu-latest
