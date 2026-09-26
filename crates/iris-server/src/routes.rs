@@ -1,5 +1,6 @@
 //! HTTP route definitions.
 
+#[allow(dead_code)]
 mod generated {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -771,6 +772,78 @@ mod tests {
     use std::collections::BTreeMap;
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn generated_sse_replay_errors_have_declared_wire_shapes() {
+        let app = Router::new()
+            .route(
+                "/invalid",
+                get(|| async {
+                    super::generated::subscribe_events_http_errors::invalid_replay_cursor()
+                        .into_response()
+                }),
+            )
+            .route(
+                "/expired",
+                get(|| async {
+                    super::generated::subscribe_events_http_errors::replay_cursor_expired(Some(
+                        "inc.7".to_owned(),
+                    ))
+                    .into_response()
+                }),
+            )
+            .route(
+                "/expired-without-oldest",
+                get(|| async {
+                    super::generated::subscribe_events_http_errors::replay_cursor_expired(None)
+                        .into_response()
+                }),
+            );
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/invalid").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "invalid_replay_cursor"})
+        );
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/expired").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "replay_cursor_expired", "oldest_cursor": "inc.7"})
+        );
+
+        let response = app
+            .oneshot(
+                Request::get("/expired-without-oldest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "replay_cursor_expired"}),
+            "optional oldest_cursor must be omitted rather than serialized as null"
+        );
+    }
 
     /// A no-op attachment store for tests that don't exercise attachment logic.
     #[derive(Debug)]

@@ -3,7 +3,9 @@
 //! `iris-codegen check`; as a test it fails locally before a stale commit
 //! can land.
 
-use iris_codegen::{generate_all, iris_generate_config, load_api_definition};
+use iris_codegen::{
+    ParameterLocation, Surface, generate_all, iris_generate_config, load_api_definition,
+};
 
 #[test]
 fn committed_generated_artifacts_are_fresh() {
@@ -34,6 +36,64 @@ fn committed_generated_artifacts_are_fresh() {
         ts_client, artifacts.ts_client_ts,
         "generated/ts-client/index.ts is stale — run `cargo run -p iris-codegen --bin iris-codegen -- write`"
     );
+}
+
+#[test]
+fn sse_replay_projection_is_explicit_and_four_artifacts_are_deterministic() {
+    let definition = load_api_definition("../../api/operations.yaml")
+        .expect("api/operations.yaml parses and validates");
+    let operation = definition
+        .operations
+        .iter()
+        .find(|operation| operation.name == "subscribe_events")
+        .expect("subscribe_events operation");
+
+    assert_eq!(
+        operation.surfaces.as_ref(),
+        Some(&vec![Surface::Http, Surface::Cli])
+    );
+    let cursor = operation
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "cursor")
+        .expect("cursor parameter");
+    assert!(!cursor.required);
+    assert_eq!(cursor.location, ParameterLocation::Query);
+
+    assert_eq!(operation.cli_output_flags.len(), 1);
+    assert_eq!(operation.cli_output_flags[0].flag, "include-cursor");
+    assert_eq!(operation.cli_output_flags[0].field, "include_cursor");
+    assert_eq!(operation.http_error_responses.len(), 2);
+    assert_eq!(operation.http_error_responses[0].status, 400);
+    assert_eq!(
+        operation.http_error_responses[0].fields[0]
+            .constant
+            .as_deref(),
+        Some("invalid_replay_cursor")
+    );
+    assert_eq!(operation.http_error_responses[1].status, 409);
+    assert!(!operation.http_error_responses[1].fields[1].required);
+    assert!(
+        operation.http_error_responses[1].fields[1]
+            .constant
+            .is_none()
+    );
+
+    let config = iris_generate_config();
+    let first = generate_all(&definition, &config);
+    let second = generate_all(&definition, &config);
+    assert_eq!(first.cli_rs, second.cli_rs);
+    assert_eq!(first.http_rs, second.http_rs);
+    assert_eq!(first.mcp_json, second.mcp_json);
+    assert_eq!(first.ts_client_ts, second.ts_client_ts);
+    assert!(first.cli_rs.contains("pub include_cursor: bool"));
+    assert!(
+        first
+            .http_rs
+            .contains("pub mod subscribe_events_http_errors")
+    );
+    assert!(!first.mcp_json.contains("subscribe_events"));
+    assert!(!first.ts_client_ts.contains("subscribe_events"));
 }
 
 #[test]
