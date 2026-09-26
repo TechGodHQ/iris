@@ -1,6 +1,5 @@
 //! HTTP route definitions.
 
-#[allow(dead_code)]
 mod generated {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -203,6 +202,17 @@ pub(crate) fn bind_runtime_sse_subscribe_events(
     router: Router<crate::app::AppState>,
 ) -> Router<crate::app::AppState> {
     router.route("/v1/events", get(crate::sse::subscribe_events))
+}
+
+/// Keep SSE runtime status construction behind the generated operation's
+/// declared typed error constructors. The handler module cannot access the
+/// private generated module directly.
+pub(crate) fn invalid_replay_cursor_response() -> Response {
+    generated::subscribe_events_http_errors::invalid_replay_cursor().into_response()
+}
+
+pub(crate) fn replay_cursor_expired_response(oldest_cursor: Option<String>) -> Response {
+    generated::subscribe_events_http_errors::replay_cursor_expired(oldest_cursor).into_response()
 }
 
 async fn health() -> Json<serde_json::Value> {
