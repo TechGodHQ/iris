@@ -60,6 +60,70 @@ pub fn bind_subscribe_events(router: Router<crate::app::AppState>) -> Router<cra
     super::bind_runtime_sse_subscribe_events(router)
 }
 
+/// Typed HTTP error responses declared for the `subscribe_events` operation.
+pub mod subscribe_events_http_errors {
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        Json,
+    };
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct InvalidReplayCursorBody {
+        error: String,
+    }
+
+    /// Typed HTTP response for the declared `invalid_replay_cursor` error.
+    pub struct InvalidReplayCursorResponse {
+        body: InvalidReplayCursorBody,
+    }
+
+    impl IntoResponse for InvalidReplayCursorResponse {
+        fn into_response(self) -> Response {
+            (StatusCode::from_u16(400).expect("validated HTTP error status"), Json(self.body)).into_response()
+        }
+    }
+
+    /// Construct the declared 400 `invalid_replay_cursor` HTTP response.
+    pub fn invalid_replay_cursor() -> InvalidReplayCursorResponse {
+        InvalidReplayCursorResponse {
+            body: InvalidReplayCursorBody {
+                error: "invalid_replay_cursor".to_owned(),
+            },
+        }
+    }
+
+    #[derive(Serialize)]
+    struct ReplayCursorExpiredBody {
+        error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        oldest_cursor: Option<String>,
+    }
+
+    /// Typed HTTP response for the declared `replay_cursor_expired` error.
+    pub struct ReplayCursorExpiredResponse {
+        body: ReplayCursorExpiredBody,
+    }
+
+    impl IntoResponse for ReplayCursorExpiredResponse {
+        fn into_response(self) -> Response {
+            (StatusCode::from_u16(409).expect("validated HTTP error status"), Json(self.body)).into_response()
+        }
+    }
+
+    /// Construct the declared 409 `replay_cursor_expired` HTTP response.
+    pub fn replay_cursor_expired(oldest_cursor: Option<String>) -> ReplayCursorExpiredResponse {
+        ReplayCursorExpiredResponse {
+            body: ReplayCursorExpiredBody {
+                error: "replay_cursor_expired".to_owned(),
+                oldest_cursor,
+            },
+        }
+    }
+
+}
+
 async fn list_messages(
     State(state): State<crate::app::AppState>,
     Path(path): Path<BTreeMap<String, String>>,

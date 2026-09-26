@@ -201,3 +201,30 @@ operations:
         type: string
         required: false
         location: query
+      - name: cursor
+        description: Opaque replay cursor to resume after the last retained event.
+        type: string
+        required: false
+        location: query
+    cli_output_flags:
+      - flag: include-cursor
+        field: include_cursor
+        description: Include the opaque replay cursor alongside each streamed message for checkpoint persistence.
+    http_error_responses:
+      - name: invalid_replay_cursor
+        status: 400
+        fields:
+          - name: error
+            type: string
+            required: true
+            const: invalid_replay_cursor
+      - name: replay_cursor_expired
+        status: 409
+        fields:
+          - name: error
+            type: string
+            required: true
+            const: replay_cursor_expired
+          - name: oldest_cursor
+            type: string
+            required: false

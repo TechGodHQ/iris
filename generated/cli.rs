@@ -43,7 +43,7 @@ impl GeneratedCommand {
             Self::SendMessage(args) => serde_json::json!({"thread_id": args.thread_id.clone(), "body": args.body.clone(), "provider": args.provider.clone(), "attachments": args.attachments.clone().unwrap_or_default(), "attach_mime": args.attach_mime.clone()}),
             Self::AuditQuery(args) => serde_json::json!({"provider": args.provider.clone(), "action": args.action.clone(), "since": args.since.clone(), "until": args.until.clone(), "source_id": args.source_id.clone(), "limit": args.limit.clone()}),
             Self::IngestBatch(args) => serde_json::json!({"batch": args.batch.clone()}),
-            Self::Watch(args) => serde_json::json!({"provider": args.provider.clone(), "thread_id": args.thread_id.clone()}),
+            Self::Watch(args) => serde_json::json!({"provider": args.provider.clone(), "thread_id": args.thread_id.clone(), "cursor": args.cursor.clone()}),
         }
     }
 }
@@ -135,4 +135,10 @@ pub struct WatchArgs {
     /// Optional exact-match thread filter for emitted events.
     #[arg(long)]
     pub thread_id: Option<String>,
+    /// Opaque replay cursor to resume after the last retained event.
+    #[arg(long)]
+    pub cursor: Option<String>,
+    /// Include the opaque replay cursor alongside each streamed message for checkpoint persistence.
+    #[arg(long = "include-cursor", action = clap::ArgAction::SetTrue)]
+    pub include_cursor: bool,
 }

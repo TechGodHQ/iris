@@ -386,6 +386,8 @@ mod tests {
         let args = WatchArgs {
             provider: None,
             thread_id: None,
+            cursor: None,
+            include_cursor: false,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -414,6 +416,8 @@ mod tests {
         let args = WatchArgs {
             provider: None,
             thread_id: None,
+            cursor: None,
+            include_cursor: false,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -441,6 +445,8 @@ mod tests {
         let args = WatchArgs {
             provider: None,
             thread_id: None,
+            cursor: None,
+            include_cursor: false,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -468,6 +474,8 @@ mod tests {
         let args = WatchArgs {
             provider: Some("fake".into()),
             thread_id: None,
+            cursor: None,
+            include_cursor: false,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -493,6 +501,8 @@ mod tests {
         let args = WatchArgs {
             provider: Some("nonexistent".into()),
             thread_id: None,
+            cursor: None,
+            include_cursor: false,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -522,6 +532,8 @@ mod tests {
         let args = WatchArgs {
             provider: None,
             thread_id: Some("00000000-0000-0000-0000-000000000042".into()),
+            cursor: None,
+            include_cursor: false,
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
