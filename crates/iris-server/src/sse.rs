@@ -10,6 +10,7 @@
 //! [`MessageProvider::subscribe_realtime`](iris_core::MessageProvider); the
 //! broker, not an individual HTTP request, owns consumption and fan-out.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -21,7 +22,7 @@ use axum::{
     http::{StatusCode, header},
     response::Response,
 };
-use iris_core::{IrisError, Message, MessageProvider};
+use iris_core::{IrisError, MessageProvider};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -29,7 +30,11 @@ use tokio_stream::Stream;
 
 use crate::{
     app::AppState,
-    replay_broker::{BrokerEvent, BrokerSubscription, SubscriberTerminal},
+    replay_broker::{
+        BrokerEvent, BrokerSubscription, RegisterError, ReplayCursor, ReplayFilter,
+        RetainedMessage, SubscriberTerminal,
+    },
+    routes::{invalid_replay_cursor_response, replay_cursor_expired_response},
 };
 
 /// Default wire-idle heartbeat interval (design-frozen at 15 seconds).
@@ -82,6 +87,8 @@ pub struct SubscribeEventsQuery {
     pub provider: Option<String>,
     /// Optional exact-match Iris thread filter.
     pub thread_id: Option<String>,
+    /// Optional opaque broker cursor used to resume retained delivery.
+    pub cursor: Option<String>,
 }
 
 /// A rendered SSE frame ready for the wire.
@@ -105,12 +112,26 @@ pub(crate) async fn subscribe_events(
         );
     }
 
-    let branches = match select_branches(&state, &query).await {
-        Ok(branches) => branches,
+    let cursor = match query.cursor.as_deref() {
+        Some(value) => match ReplayCursor::parse_wire_value(value) {
+            Ok(cursor) => Some(cursor),
+            Err(()) => return invalid_replay_cursor_response(),
+        },
+        None => None,
+    };
+    if let Some(cursor) = cursor
+        && let Err(RegisterError::Expired { oldest_cursor }) =
+            state.replay_broker.validate_cursor(cursor)
+    {
+        return replay_cursor_expired_response(oldest_cursor);
+    }
+
+    let subscription = match select_subscription(&state, &query, cursor).await {
+        Ok(subscription) => subscription,
         Err(status) => return *status,
     };
 
-    let body_stream = spawn_sse_pipeline(branches, state.sse.heartbeat_interval);
+    let body_stream = spawn_sse_pipeline(subscription, state.sse.heartbeat_interval);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -125,45 +146,46 @@ pub(crate) async fn subscribe_events(
 /// whose selected provider cannot establish its first shared upstream retains
 /// HTTP 422; an aggregate request omits a provider that cannot establish and
 /// retains HTTP 503 when none can establish.
-async fn select_branches(
+async fn select_subscription(
     state: &AppState,
     query: &SubscribeEventsQuery,
-) -> std::result::Result<Vec<ProviderBranch>, Box<Response>> {
+    cursor: Option<ReplayCursor>,
+) -> std::result::Result<BrokerSubscription, Box<Response>> {
     let providers = match query.provider.as_deref() {
         Some(provider_id) => select_filtered(state, provider_id)?,
         None => select_aggregate(state),
     };
-    let mut branches = Vec::new();
-    for provider in providers {
-        let provider_id = provider.id().to_string();
-        match state
-            .replay_broker
-            .subscribe(provider, query.thread_id.clone())
-            .await
-        {
-            Ok(subscription) => branches.push(ProviderBranch {
-                provider: provider_id,
-                subscription,
-            }),
-            Err(_error) if query.provider.is_some() => {
-                return Err(Box::new(unsupported_response(&provider_id)));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    provider = provider_id,
-                    error = %error,
-                    "omitting unavailable realtime provider from aggregate stream"
-                );
-            }
+    let filter = ReplayFilter {
+        provider_id: query.provider.clone(),
+        thread_id: query.thread_id.clone(),
+    };
+    let result = state
+        .replay_broker
+        .subscribe_many(providers, filter, cursor)
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(RegisterError::Expired { oldest_cursor }) => {
+            return Err(Box::new(replay_cursor_expired_response(oldest_cursor)));
         }
+    };
+    for (provider, error) in &result.failures {
+        tracing::warn!(
+            provider,
+            error = %error,
+            "omitting unavailable realtime provider from aggregate stream"
+        );
     }
-    if branches.is_empty() {
+    let Some(subscription) = result.subscription else {
+        if let Some(provider_id) = query.provider.as_deref() {
+            return Err(Box::new(unsupported_response(provider_id)));
+        }
         return Err(Box::new(json_status(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({ "error": "no_realtime_provider" }),
         )));
-    }
-    Ok(branches)
+    };
+    Ok(subscription)
 }
 
 /// Select the single capability-positive branch of a provider-filtered request.
@@ -213,27 +235,18 @@ fn json_status(status: StatusCode, body: &serde_json::Value) -> Response {
         .expect("static response parts are valid")
 }
 
-/// One broker-owned provider subscription feeding the aggregate wire driver.
-struct ProviderBranch {
-    provider: String,
-    subscription: BrokerSubscription,
-}
-
-/// Spawn the branch tasks and the wire driver; return the wire body stream.
+/// Spawn the single ordered subscription driver and the wire driver; return the
+/// wire body stream.
 ///
-/// Broker registrations apply exact provider and thread filters before branch
-/// frames reach the wire driver, so filtered-out events never reset the
-/// heartbeat. When the HTTP body is dropped (client disconnect), the wire
-/// receiver closes, every branch drops its registration, and the broker cancels
-/// and joins an upstream only after its final demand is gone.
-fn spawn_sse_pipeline(branches: Vec<ProviderBranch>, heartbeat: Duration) -> SseBodyStream {
+/// The broker owns one bounded queue for the whole selected provider set. That
+/// is important for aggregate replay: independent per-provider branch tasks
+/// could concatenate snapshots correctly while still reordering live frames.
+fn spawn_sse_pipeline(subscription: BrokerSubscription, heartbeat: Duration) -> SseBodyStream {
     let (frame_tx, frame_rx) = mpsc::channel::<WireFrame>(256);
-    for branch in branches {
-        let frame_tx = frame_tx.clone();
-        tokio::spawn(async move {
-            run_branch(branch, frame_tx).await;
-        });
-    }
+    let driver_tx = frame_tx.clone();
+    tokio::spawn(async move {
+        run_subscription(subscription, driver_tx).await;
+    });
     drop(frame_tx);
 
     let (wire_tx, wire_rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
@@ -241,106 +254,182 @@ fn spawn_sse_pipeline(branches: Vec<ProviderBranch>, heartbeat: Duration) -> Sse
     SseBodyStream { wire: wire_rx }
 }
 
-/// Forward one broker branch into the shared frame channel.
+/// Forward one ordered broker subscription into the shared frame channel.
 ///
-/// The registration guard lives for exactly as long as this task. Dropping the
-/// HTTP body closes `frame_tx`, which ends this branch and lets the broker
-/// cancel/join an upstream only after its final subscriber has gone away.
-async fn run_branch(branch: ProviderBranch, frame_tx: mpsc::Sender<WireFrame>) {
-    let ProviderBranch {
-        provider,
-        subscription,
-    } = branch;
-    let (replay, mut live, terminal, _registration) = subscription.into_parts();
-    // These independent watch receivers let a blocked frame forward react
-    // immediately to its own slow-consumer eviction without consuming an
-    // upstream error that must instead be emitted after the queued live
-    // messages are drained.
+/// Terminal failures use an out-of-band unbounded signal plus a broker sequence
+/// watermark. This keeps the error observable even when the bounded live queue
+/// is full, while still draining every queued message that was accepted before
+/// the failing upstream became terminal.
+// This state machine keeps replay, sequence-watermarked terminal draining, and
+// bounded live delivery together so their ordering invariants are auditable.
+#[allow(clippy::too_many_lines)]
+async fn run_subscription(subscription: BrokerSubscription, frame_tx: mpsc::Sender<WireFrame>) {
+    let (replay, mut live, terminal, mut terminal_events, _registration) =
+        subscription.into_parts();
     let mut slow_terminal = terminal.clone();
-    let mut error_terminal = terminal;
     for event in replay {
-        match send_branch_frame(
+        match send_subscription_frame(
             &frame_tx,
-            WireFrame(render_message_frame(&event.message)),
+            WireFrame(render_message_frame(&event)),
             &mut slow_terminal,
         )
         .await
         {
             BranchSend::Sent => {}
             BranchSend::SlowConsumer => {
-                report_slow_consumer(&frame_tx, &provider);
+                report_slow_consumer(&frame_tx, "sse");
                 return;
             }
             BranchSend::Closed => return,
         }
     }
-    let mut pending_terminal_error = None;
+
+    let mut pending_terminal_errors: VecDeque<(String, IrisError, u64)> = VecDeque::new();
+    let mut deferred_live: Option<Box<RetainedMessage>> = None;
+    let mut live_closed = false;
+    let mut terminal_events_closed = false;
     loop {
-        if let Some(error) = pending_terminal_error.take() {
-            // The broker has removed this subscriber after recording an
-            // out-of-band terminal error. Drain every message that was already
-            // queued before the terminal signal, then render the guaranteed
-            // public error frame. This preserves order even when the live queue
-            // was full at the instant the upstream failed.
-            match live.recv().await {
-                Some(BrokerEvent::Message(event)) => {
-                    pending_terminal_error = Some(error);
-                    match send_branch_frame(
+        while let Ok(signal) = terminal_events.try_recv() {
+            if let SubscriberTerminal::UpstreamError {
+                provider,
+                error,
+                through_sequence,
+            } = signal
+            {
+                pending_terminal_errors.push_back((provider, error, through_sequence));
+            }
+        }
+
+        if let Some(signal) = pending_terminal_errors.front().cloned() {
+            if let Some(event) = deferred_live.take() {
+                if event.cursor.sequence() <= signal.2 {
+                    match send_subscription_frame(
                         &frame_tx,
-                        WireFrame(render_message_frame(&event.message)),
+                        WireFrame(render_message_frame(&event)),
                         &mut slow_terminal,
                     )
                     .await
                     {
-                        BranchSend::Sent => {}
+                        BranchSend::Sent => continue,
                         BranchSend::SlowConsumer => {
-                            report_slow_consumer(&frame_tx, &provider);
-                            break;
+                            report_slow_consumer(&frame_tx, "sse");
+                            return;
                         }
-                        BranchSend::Closed => break,
+                        BranchSend::Closed => return,
                     }
                 }
-                None => {
-                    let frame = WireFrame(render_error_frame(
-                        &provider,
-                        public_error_code(&error),
-                        &sanitize_error_message(&error),
-                    ));
-                    // If the client has already gone away there is nobody left
-                    // to report to; otherwise retain the existing terminal
-                    // frame behavior.
-                    let _ = frame_tx.send(frame).await;
-                    break;
+                deferred_live = Some(event);
+            } else {
+                match live.try_recv() {
+                    Ok(BrokerEvent::Message(event)) if event.cursor.sequence() <= signal.2 => {
+                        match send_subscription_frame(
+                            &frame_tx,
+                            WireFrame(render_message_frame(&event)),
+                            &mut slow_terminal,
+                        )
+                        .await
+                        {
+                            BranchSend::Sent => continue,
+                            BranchSend::SlowConsumer => {
+                                report_slow_consumer(&frame_tx, "sse");
+                                return;
+                            }
+                            BranchSend::Closed => return,
+                        }
+                    }
+                    Ok(BrokerEvent::Message(event)) => deferred_live = Some(event),
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(mpsc::error::TryRecvError::Disconnected) => live_closed = true,
                 }
             }
-            continue;
+            {
+                pending_terminal_errors.pop_front();
+                let frame = WireFrame(render_error_frame(
+                    &signal.0,
+                    public_error_code(&signal.1),
+                    &sanitize_error_message(&signal.1),
+                ));
+                match send_subscription_frame(&frame_tx, frame, &mut slow_terminal).await {
+                    BranchSend::Sent => continue,
+                    BranchSend::SlowConsumer => {
+                        report_slow_consumer(&frame_tx, "sse");
+                        return;
+                    }
+                    BranchSend::Closed => return,
+                }
+            }
         }
+
+        if let Some(event) = deferred_live.take() {
+            match send_subscription_frame(
+                &frame_tx,
+                WireFrame(render_message_frame(&event)),
+                &mut slow_terminal,
+            )
+            .await
+            {
+                BranchSend::Sent => continue,
+                BranchSend::SlowConsumer => {
+                    report_slow_consumer(&frame_tx, "sse");
+                    return;
+                }
+                BranchSend::Closed => return,
+            }
+        }
+        if live_closed {
+            return;
+        }
+
         tokio::select! {
             biased;
-            () = frame_tx.closed() => break,
+            () = frame_tx.closed() => return,
             () = wait_for_slow_consumer(&mut slow_terminal) => {
-                report_slow_consumer(&frame_tx, &provider);
-                break;
+                report_slow_consumer(&frame_tx, "sse");
+                return;
             }
-            error = wait_for_terminal_error(&mut error_terminal) => {
-                pending_terminal_error = Some(error);
-            }
+            signal = terminal_events.recv(), if !terminal_events_closed => match signal {
+                Some(SubscriberTerminal::UpstreamError {
+                    provider,
+                    error,
+                    through_sequence,
+                }) => pending_terminal_errors.push_back((provider, error, through_sequence)),
+                Some(SubscriberTerminal::Open | SubscriberTerminal::SlowConsumer) => {}
+                None => {
+                    terminal_events_closed = true;
+                }
+            },
             event = live.recv() => match event {
-                None => break,
+                None => live_closed = true,
                 Some(BrokerEvent::Message(event)) => {
-                    match send_branch_frame(
+                    while let Ok(signal) = terminal_events.try_recv() {
+                        if let SubscriberTerminal::UpstreamError {
+                            provider,
+                            error,
+                            through_sequence,
+                        } = signal
+                        {
+                            pending_terminal_errors.push_back((provider, error, through_sequence));
+                        }
+                    }
+                    if pending_terminal_errors.front().is_some_and(|signal| {
+                        event.cursor.sequence() > signal.2
+                    }) {
+                        deferred_live = Some(event);
+                        continue;
+                    }
+                    match send_subscription_frame(
                         &frame_tx,
-                        WireFrame(render_message_frame(&event.message)),
+                        WireFrame(render_message_frame(&event)),
                         &mut slow_terminal,
                     )
                     .await
                     {
                         BranchSend::Sent => {}
                         BranchSend::SlowConsumer => {
-                            report_slow_consumer(&frame_tx, &provider);
-                            break;
+                            report_slow_consumer(&frame_tx, "sse");
+                            return;
                         }
-                        BranchSend::Closed => break,
+                        BranchSend::Closed => return,
                     }
                 }
             },
@@ -363,7 +452,7 @@ enum BranchSend {
 /// essential: a non-reading HTTP body can fill the wire and frame queues while
 /// the broker simultaneously fills the live queue. In that case the branch
 /// must release its registration so the final-demand cancellation path runs.
-async fn send_branch_frame(
+async fn send_subscription_frame(
     frame_tx: &mpsc::Sender<WireFrame>,
     frame: WireFrame,
     terminal: &mut tokio::sync::watch::Receiver<SubscriberTerminal>,
@@ -395,31 +484,11 @@ async fn wait_for_slow_consumer(terminal: &mut tokio::sync::watch::Receiver<Subs
             SubscriberTerminal::SlowConsumer => return,
             // A separate receiver owns terminal-error delivery so a frame
             // currently being forwarded is not preempted and lost.
-            SubscriberTerminal::UpstreamError(_) => std::future::pending::<()>().await,
+            SubscriberTerminal::UpstreamError { .. } => std::future::pending::<()>().await,
             SubscriberTerminal::Open => {}
         }
         if terminal.changed().await.is_err() {
             std::future::pending::<()>().await;
-        }
-    }
-}
-
-/// Wait for a broker-owned upstream failure without treating normal completion
-/// or slow-consumer eviction as an upstream error.
-async fn wait_for_terminal_error(
-    terminal: &mut tokio::sync::watch::Receiver<SubscriberTerminal>,
-) -> IrisError {
-    loop {
-        let signal = terminal.borrow_and_update().clone();
-        match signal {
-            SubscriberTerminal::UpstreamError(error) => return error,
-            // The slow-consumer receiver owns this path; it terminates the
-            // branch immediately to release upstream demand.
-            SubscriberTerminal::SlowConsumer => std::future::pending::<()>().await,
-            SubscriberTerminal::Open => {}
-        }
-        if terminal.changed().await.is_err() {
-            std::future::pending::<IrisError>().await;
         }
     }
 }
@@ -485,11 +554,15 @@ async fn send_wire(
         .map_err(|_| ())
 }
 
-/// Render an `event: message` frame with the JSON message as data.
-fn render_message_frame(message: &Message) -> String {
-    let data = serde_json::to_string(message)
+/// Render an `event: message` frame with its broker cursor and unchanged JSON
+/// message payload.
+fn render_message_frame(event: &RetainedMessage) -> String {
+    let data = serde_json::to_string(&event.message)
         .unwrap_or_else(|_| json!({ "error": "message_serialization_failed" }).to_string());
-    format!("event: message\ndata: {data}\n\n")
+    format!(
+        "event: message\nid: {}\ndata: {data}\n\n",
+        event.cursor.as_wire_value()
+    )
 }
 
 /// Render an `event: error` frame with the public terminal diagnostic.

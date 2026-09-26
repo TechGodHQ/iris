@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use iris_core::{IrisError, Message, MessageProvider, MessageStream};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 
 /// Number of normalized messages retained in process memory for SSE replay.
@@ -43,8 +43,11 @@ struct BrokerState {
 struct Subscriber {
     filter: ReplayFilter,
     sender: mpsc::Sender<BrokerEvent>,
-    demand: Option<ProviderDemand>,
+    /// Provider instances whose upstreams feed this one aggregate queue.
+    provider_ids: Option<Vec<String>>,
+    demands: Vec<ProviderDemand>,
     terminal: watch::Sender<SubscriberTerminal>,
+    terminal_events: mpsc::UnboundedSender<SubscriberTerminal>,
 }
 
 /// A broker-local terminal signal for one HTTP subscription.
@@ -58,7 +61,14 @@ struct Subscriber {
 pub enum SubscriberTerminal {
     Open,
     SlowConsumer,
-    UpstreamError(IrisError),
+    UpstreamError {
+        provider: String,
+        error: IrisError,
+        /// The last broker sequence allocated before this provider became
+        /// terminal. Messages at or below this watermark must drain before
+        /// the terminal frame is rendered.
+        through_sequence: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -175,10 +185,72 @@ pub struct ReplayCursor {
 }
 
 impl ReplayCursor {
-    /// Render the frozen opaque cursor form without exposing a parser yet.
+    /// Render the frozen opaque cursor form.
     pub fn as_wire_value(self) -> String {
         format!("{}.{}", base64url_no_pad(&self.incarnation), self.sequence)
     }
+
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    /// Parse the exact opaque cursor form declared by the SSE contract.
+    ///
+    /// The incarnation must be the canonical unpadded base64url encoding of
+    /// exactly 128 bits, and the sequence must be positive decimal `u64` text.
+    /// Keeping this parser here makes syntax validation independent
+    /// of HTTP and ensures replay cursors cannot be mistaken for provider or
+    /// forward-poll checkpoints.
+    pub fn parse_wire_value(value: &str) -> Result<Self, ()> {
+        let mut parts = value.split('.');
+        let incarnation_text = parts.next().ok_or(())?;
+        let sequence_text = parts.next().ok_or(())?;
+        if parts.next().is_some()
+            || sequence_text.is_empty()
+            || !sequence_text.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(());
+        }
+        let sequence = sequence_text.parse::<u64>().map_err(|_| ())?;
+        if sequence == 0 {
+            return Err(());
+        }
+        let incarnation = decode_base64url_128(incarnation_text).ok_or(())?;
+        Ok(Self {
+            incarnation,
+            sequence,
+        })
+    }
+}
+
+fn decode_base64url_128(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 22 || !value.is_ascii() {
+        return None;
+    }
+    let mut output = [0_u8; 16];
+    let mut bit_index = 0_usize;
+    for byte in value.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        for shift in (0..6).rev() {
+            let bit = (value >> shift) & 1;
+            if bit_index < 128 {
+                output[bit_index / 8] |= bit << (7 - (bit_index % 8));
+            } else if bit != 0 {
+                // The final four base64 bits are padding and must be zero for
+                // the unpadded canonical encoding of 16 bytes.
+                return None;
+            }
+            bit_index += 1;
+        }
+    }
+    (base64url_no_pad(&output) == value).then_some(output)
 }
 
 /// Exact-match filters shared by replay and live fan-out.
@@ -205,6 +277,7 @@ pub struct BrokerSubscription {
     pub replay: Vec<RetainedMessage>,
     pub live: mpsc::Receiver<BrokerEvent>,
     terminal: watch::Receiver<SubscriberTerminal>,
+    terminal_events: mpsc::UnboundedReceiver<SubscriberTerminal>,
     registration: Registration,
 }
 
@@ -223,9 +296,16 @@ impl BrokerSubscription {
         Vec<RetainedMessage>,
         mpsc::Receiver<BrokerEvent>,
         watch::Receiver<SubscriberTerminal>,
+        mpsc::UnboundedReceiver<SubscriberTerminal>,
         Registration,
     ) {
-        (self.replay, self.live, self.terminal, self.registration)
+        (
+            self.replay,
+            self.live,
+            self.terminal,
+            self.terminal_events,
+            self.registration,
+        )
     }
 }
 
@@ -233,19 +313,54 @@ impl BrokerSubscription {
 pub struct Registration {
     broker: ReplayBroker,
     id: u64,
-    demand: Option<ProviderDemand>,
+    demands: Vec<ProviderDemand>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        self.broker.unregister(self.id, self.demand.as_ref());
+        self.broker.unregister(self.id, &self.demands);
     }
 }
 
 /// Registration failure for a cursor whose retained history no longer exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterError {
-    Expired,
+    Expired { oldest_cursor: Option<String> },
+}
+
+/// Result of preparing a selected provider set. Some providers may be
+/// unavailable in an aggregate request; the caller can keep the successful
+/// providers and report the failures without changing the existing 503/422
+/// selection semantics.
+pub struct SubscribeManyResult {
+    pub subscription: Option<BrokerSubscription>,
+    pub failures: Vec<(String, IrisError)>,
+}
+
+enum PreparedProvider {
+    Existing(ProviderDemand),
+    New {
+        provider_id: String,
+        stream: MessageStream,
+        starting: StartingGuard,
+    },
+}
+
+struct WorkerStart {
+    provider_id: String,
+    control: Arc<UpstreamControl>,
+    stream: MessageStream,
+}
+
+type NewControl = (String, Arc<UpstreamControl>);
+
+enum CommitMany {
+    Retry,
+    Expired(RegisterError),
+    Committed {
+        subscription: BrokerSubscription,
+        workers: Vec<WorkerStart>,
+    },
 }
 
 /// Typed terminal outcomes for a broker-owned upstream worker.
@@ -310,7 +425,7 @@ impl ReplayBroker {
             .inner
             .lock()
             .expect("replay broker lock is not poisoned");
-        Self::append_locked(&mut state, provider_id.into(), message)
+        Self::append_locked(&mut state, provider_id.into(), None, message)
     }
 
     /// Atomically collect retained messages strictly after a cursor and register
@@ -327,27 +442,101 @@ impl ReplayBroker {
             .inner
             .lock()
             .expect("replay broker lock is not poisoned");
-        self.register_locked(&mut state, filter, after, None)
+        self.register_locked(&mut state, filter, after, Vec::new(), None)
     }
 
-    /// Register one HTTP subscriber for one already-selected provider instance.
-    ///
-    /// The first demand performs `subscribe_realtime()` outside the broker lock,
-    /// records the subscriber, then starts a single worker. Concurrent demand
-    /// waits for that preparation rather than creating another upstream stream.
-    /// The final registration drop cancels the worker; its monitor joins it
-    /// before a later subscriber can create a fresh owner.
+    /// Validate a parsed cursor without touching any provider. This preflight
+    /// is deliberately separate from final registration: provider readiness
+    /// may take time, so the same check is repeated at the atomic commit point.
+    pub fn validate_cursor(&self, cursor: ReplayCursor) -> Result<(), RegisterError> {
+        let state = self
+            .inner
+            .lock()
+            .expect("replay broker lock is not poisoned");
+        Self::validate_cursor_locked(&state, cursor)
+    }
+
+    /// Register one HTTP subscriber over a selected provider set. Every
+    /// provider is prepared outside the broker mutex, while the final replay
+    /// snapshot, subscriber queue, and newly-created upstream owners are
+    /// committed together under one lock.
+    pub async fn subscribe_many(
+        &self,
+        providers: Vec<Arc<dyn MessageProvider>>,
+        filter: ReplayFilter,
+        after: Option<ReplayCursor>,
+    ) -> Result<SubscribeManyResult, RegisterError> {
+        loop {
+            let mut prepared = Vec::new();
+            let mut failures = Vec::new();
+            for provider in &providers {
+                match self.prepare_provider(Arc::clone(provider)).await {
+                    Ok(provider) => prepared.push(provider),
+                    Err(error) => failures.push((provider.id().to_string(), error)),
+                }
+            }
+
+            if prepared.is_empty() {
+                return Ok(SubscribeManyResult {
+                    subscription: None,
+                    failures,
+                });
+            }
+
+            match self.commit_many(prepared, filter.clone(), after) {
+                CommitMany::Retry => {}
+                CommitMany::Expired(error) => return Err(error),
+                CommitMany::Committed {
+                    subscription,
+                    workers,
+                } => {
+                    for worker in workers {
+                        self.spawn_worker(worker);
+                    }
+                    return Ok(SubscribeManyResult {
+                        subscription: Some(subscription),
+                        failures,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Compatibility wrapper for the single-provider broker tests and any
+    /// internal callers that do not need replay.
     pub async fn subscribe(
         &self,
         provider: Arc<dyn MessageProvider>,
         thread_id: Option<String>,
     ) -> iris_core::Result<BrokerSubscription> {
         let provider_id = provider.id().to_string();
-        let filter = ReplayFilter {
-            provider_id: Some(provider_id.clone()),
-            thread_id,
-        };
+        let result = self
+            .subscribe_many(
+                vec![provider],
+                ReplayFilter {
+                    provider_id: Some(provider_id.clone()),
+                    thread_id,
+                },
+                None,
+            )
+            .await
+            .map_err(|_| IrisError::RealtimeUnavailable {
+                provider: provider_id.clone(),
+                code: "replay cursor expired".to_string(),
+            })?;
+        result
+            .subscription
+            .ok_or_else(|| IrisError::RealtimeUnavailable {
+                provider: provider_id,
+                code: "realtime provider unavailable".to_string(),
+            })
+    }
 
+    async fn prepare_provider(
+        &self,
+        provider: Arc<dyn MessageProvider>,
+    ) -> iris_core::Result<PreparedProvider> {
+        let provider_id = provider.id().to_string();
         loop {
             enum Action {
                 Start { control: Arc<StartingControl> },
@@ -361,13 +550,10 @@ impl ReplayBroker {
                     .expect("replay broker lock is not poisoned");
                 let action = match state.upstreams.get(&provider_id) {
                     Some(UpstreamState::Running { control }) if !control.is_cancelled() => {
-                        let demand = ProviderDemand {
+                        return Ok(PreparedProvider::Existing(ProviderDemand {
                             provider_id: provider_id.clone(),
                             generation: control.generation,
-                        };
-                        return Ok(self
-                            .register_locked(&mut state, filter.clone(), None, Some(demand))
-                            .expect("future-only registration cannot expire"));
+                        }));
                     }
                     Some(
                         UpstreamState::Running { control } | UpstreamState::Stopping { control },
@@ -400,16 +586,14 @@ impl ReplayBroker {
                     }
                 }
                 Action::Start { control } => {
-                    let mut starting =
-                        StartingGuard::new(self.clone(), provider_id.clone(), control);
+                    let starting = StartingGuard::new(self.clone(), provider_id.clone(), control);
                     match provider.subscribe_realtime().await {
                         Ok(stream) => {
-                            return Ok(self.start_and_register(
-                                provider_id.clone(),
-                                filter.clone(),
+                            return Ok(PreparedProvider::New {
+                                provider_id,
                                 stream,
-                                &mut starting,
-                            ));
+                                starting,
+                            });
                         }
                         Err(error) => return Err(error),
                     }
@@ -418,46 +602,158 @@ impl ReplayBroker {
         }
     }
 
-    fn start_and_register(
+    fn commit_many(
         &self,
-        provider_id: String,
+        prepared: Vec<PreparedProvider>,
         filter: ReplayFilter,
-        stream: MessageStream,
-        starting: &mut StartingGuard,
-    ) -> BrokerSubscription {
-        let generation = {
-            let mut state = self
-                .inner
-                .lock()
-                .expect("replay broker lock is not poisoned");
-            let generation = state.next_upstream_generation;
-            state.next_upstream_generation = state
-                .next_upstream_generation
-                .checked_add(1)
-                .expect("SSE upstream generations exhausted");
-            generation
-        };
-        let (cancel, _) = watch::channel(false);
-        let (completion, _) = watch::channel(false);
-        let control = Arc::new(UpstreamControl {
-            generation,
-            cancel,
-            completion,
-        });
-        let (start_tx, start_rx) = oneshot::channel();
+        after: Option<ReplayCursor>,
+    ) -> CommitMany {
+        let provider_ids: Vec<String> = prepared
+            .iter()
+            .map(|prepared| match prepared {
+                PreparedProvider::Existing(demand) => demand.provider_id.clone(),
+                PreparedProvider::New { provider_id, .. } => provider_id.clone(),
+            })
+            .collect();
+        let (subscription, new_controls) =
+            match self.commit_prepared(&prepared, &provider_ids, filter, after) {
+                Ok(committed) => committed,
+                Err(error) => return error,
+            };
+        let workers = Self::finish_workers(prepared, new_controls);
+        CommitMany::Committed {
+            subscription,
+            workers,
+        }
+    }
 
+    fn commit_prepared(
+        &self,
+        prepared: &[PreparedProvider],
+        provider_ids: &[String],
+        filter: ReplayFilter,
+        after: Option<ReplayCursor>,
+    ) -> Result<(BrokerSubscription, Vec<NewControl>), CommitMany> {
+        let mut demands = Vec::with_capacity(prepared.len());
+        let mut new_controls = Vec::new();
+        let mut state = self
+            .inner
+            .lock()
+            .expect("replay broker lock is not poisoned");
+
+        for prepared in prepared {
+            match prepared {
+                PreparedProvider::Existing(demand) => {
+                    if !matches!(
+                        state.upstreams.get(&demand.provider_id),
+                        Some(UpstreamState::Running { control })
+                            if control.generation == demand.generation
+                                && !control.is_cancelled()
+                    ) {
+                        return Err(CommitMany::Retry);
+                    }
+                    demands.push(demand.clone());
+                }
+                PreparedProvider::New {
+                    provider_id,
+                    starting,
+                    ..
+                } => {
+                    if !matches!(
+                        state.upstreams.get(provider_id),
+                        Some(UpstreamState::Starting { control })
+                            if Arc::ptr_eq(control, &starting.control)
+                    ) {
+                        return Err(CommitMany::Retry);
+                    }
+                }
+            }
+        }
+
+        for prepared in prepared {
+            if let PreparedProvider::New { provider_id, .. } = prepared {
+                let generation = state.next_upstream_generation;
+                state.next_upstream_generation = state
+                    .next_upstream_generation
+                    .checked_add(1)
+                    .expect("SSE upstream generations exhausted");
+                let (cancel, _) = watch::channel(false);
+                let (completion, _) = watch::channel(false);
+                let control = Arc::new(UpstreamControl {
+                    generation,
+                    cancel,
+                    completion,
+                });
+                new_controls.push((provider_id.clone(), control.clone()));
+                demands.push(ProviderDemand {
+                    provider_id: provider_id.clone(),
+                    generation,
+                });
+            }
+        }
+
+        let subscription =
+            match self.register_locked(&mut state, filter, after, demands, Some(provider_ids)) {
+                Ok(subscription) => subscription,
+                Err(error) => return Err(CommitMany::Expired(error)),
+            };
+
+        for (provider_id, control) in &new_controls {
+            state.upstreams.insert(
+                provider_id.clone(),
+                UpstreamState::Running {
+                    control: control.clone(),
+                },
+            );
+        }
+        drop(state);
+        Ok((subscription, new_controls))
+    }
+
+    fn finish_workers(
+        prepared: Vec<PreparedProvider>,
+        mut new_controls: Vec<NewControl>,
+    ) -> Vec<WorkerStart> {
+        let mut workers = Vec::new();
+        for prepared in prepared {
+            if let PreparedProvider::New {
+                provider_id,
+                stream,
+                mut starting,
+            } = prepared
+            {
+                let index = new_controls
+                    .iter()
+                    .position(|(id, _)| id == &provider_id)
+                    .expect("new provider control exists");
+                let (_, control) = new_controls.swap_remove(index);
+                starting.resolve();
+                workers.push(WorkerStart {
+                    provider_id,
+                    control,
+                    stream,
+                });
+            }
+        }
+        workers
+    }
+
+    fn spawn_worker(&self, worker: WorkerStart) {
+        let WorkerStart {
+            provider_id,
+            control,
+            stream,
+        } = worker;
         let worker_broker = self.clone();
         let worker_provider = provider_id.clone();
         let worker_control = control.clone();
         let worker = tokio::spawn(async move {
-            if start_rx.await.is_ok() {
-                run_upstream(worker_broker, worker_provider, worker_control, stream).await;
-            }
+            run_upstream(worker_broker, worker_provider, worker_control, stream).await;
         });
 
         let monitor_broker = self.clone();
-        let monitor_provider = provider_id.clone();
-        let monitor_control = control.clone();
+        let monitor_provider = provider_id;
+        let monitor_control = control;
         drop(tokio::spawn(async move {
             if worker.await.is_err() {
                 monitor_broker.mark_terminal(
@@ -468,32 +764,6 @@ impl ReplayBroker {
             }
             monitor_broker.complete_stop(&monitor_provider, &monitor_control);
         }));
-
-        let subscription = {
-            let mut state = self
-                .inner
-                .lock()
-                .expect("replay broker lock is not poisoned");
-            debug_assert!(matches!(
-                state.upstreams.get(&provider_id),
-                Some(UpstreamState::Starting { control })
-                    if Arc::ptr_eq(control, &starting.control)
-            ));
-            let demand = ProviderDemand {
-                provider_id: provider_id.clone(),
-                generation,
-            };
-            let subscription = self
-                .register_locked(&mut state, filter, None, Some(demand))
-                .expect("future-only registration cannot expire");
-            state
-                .upstreams
-                .insert(provider_id, UpstreamState::Running { control });
-            subscription
-        };
-        starting.resolve();
-        let _ = start_tx.send(());
-        subscription
     }
 
     fn append_from_upstream(
@@ -512,15 +782,21 @@ impl ReplayBroker {
                 if control.generation == generation
                     && !control.is_cancelled()
         ) && state.subscribers.values().any(|subscriber| {
-            subscriber.demand.as_ref().is_some_and(|demand| {
-                demand.provider_id == provider_id && demand.generation == generation
-            })
+            subscriber
+                .demands
+                .iter()
+                .any(|demand| demand.provider_id == provider_id && demand.generation == generation)
         });
         if !demanded {
             drop(state);
             return None;
         }
-        let event = Self::append_locked(&mut state, provider_id.to_string(), message);
+        let event = Self::append_locked(
+            &mut state,
+            provider_id.to_string(),
+            Some(generation),
+            message,
+        );
         drop(state);
         Some(event)
     }
@@ -528,6 +804,7 @@ impl ReplayBroker {
     fn append_locked(
         state: &mut BrokerState,
         provider_id: String,
+        generation: Option<u64>,
         message: Message,
     ) -> RetainedMessage {
         let sequence = state.next_sequence;
@@ -550,7 +827,18 @@ impl ReplayBroker {
         state.retained.push_back(event.clone());
 
         state.subscribers.retain(|_, subscriber| {
-            if !subscriber.filter.matches(&event) {
+            if !subscriber.filter.matches(&event)
+                || !subscriber.provider_ids.as_ref().is_none_or(|provider_ids| {
+                    provider_ids
+                        .iter()
+                        .any(|provider| provider == &event.provider_id)
+                })
+                || !generation.is_none_or(|generation| {
+                    subscriber.demands.iter().any(|demand| {
+                        demand.provider_id == event.provider_id && demand.generation == generation
+                    })
+                })
+            {
                 return true;
             }
             if subscriber
@@ -578,32 +866,33 @@ impl ReplayBroker {
         state: &mut BrokerState,
         filter: ReplayFilter,
         after: Option<ReplayCursor>,
-        demand: Option<ProviderDemand>,
+        demands: Vec<ProviderDemand>,
+        provider_ids: Option<&[String]>,
     ) -> Result<BrokerSubscription, RegisterError> {
-        let replay = match after {
-            None => Vec::new(),
-            Some(cursor) if cursor.incarnation != state.incarnation => {
-                return Err(RegisterError::Expired);
-            }
-            Some(cursor) => {
-                let Some(oldest) = state.retained.front() else {
-                    return Err(RegisterError::Expired);
-                };
-                if cursor.sequence < oldest.cursor.sequence
-                    || cursor.sequence >= state.next_sequence
-                {
-                    return Err(RegisterError::Expired);
-                }
+        if let Some(cursor) = after {
+            Self::validate_cursor_locked(state, cursor)?;
+        }
+        let matches_provider = |event: &RetainedMessage| {
+            provider_ids.is_none_or(|provider_ids| {
+                provider_ids
+                    .iter()
+                    .any(|provider| provider == &event.provider_id)
+            })
+        };
+        let replay = after
+            .map(|cursor| {
                 state
                     .retained
                     .iter()
                     .filter(|event| {
-                        event.cursor.sequence > cursor.sequence && filter.matches(event)
+                        event.cursor.sequence > cursor.sequence
+                            && filter.matches(event)
+                            && matches_provider(event)
                     })
                     .cloned()
                     .collect()
-            }
-        };
+            })
+            .unwrap_or_default();
         let id = state.next_subscriber_id;
         state.next_subscriber_id = state
             .next_subscriber_id
@@ -611,25 +900,51 @@ impl ReplayBroker {
             .expect("SSE replay subscriber IDs exhausted");
         let (sender, live) = mpsc::channel(LIVE_QUEUE_CAPACITY);
         let (terminal_tx, terminal) = watch::channel(SubscriberTerminal::Open);
+        let (terminal_events, terminal_receiver) = mpsc::unbounded_channel();
         state.subscribers.insert(
             id,
             Subscriber {
                 filter,
+                provider_ids: provider_ids.map(ToOwned::to_owned),
                 sender,
-                demand: demand.clone(),
+                demands: demands.clone(),
                 terminal: terminal_tx,
+                terminal_events,
             },
         );
         Ok(BrokerSubscription {
             replay,
             live,
             terminal,
+            terminal_events: terminal_receiver,
             registration: Registration {
                 broker: self.clone(),
                 id,
-                demand,
+                demands,
             },
         })
+    }
+
+    fn validate_cursor_locked(
+        state: &BrokerState,
+        cursor: ReplayCursor,
+    ) -> Result<(), RegisterError> {
+        let oldest_cursor = state
+            .retained
+            .front()
+            .map(|event| event.cursor.as_wire_value());
+        let valid = cursor.incarnation == state.incarnation
+            && state
+                .retained
+                .front()
+                .is_some_and(|oldest| cursor.sequence >= oldest.cursor.sequence)
+            && cursor.sequence < state.next_sequence
+            && state.retained.iter().any(|event| event.cursor == cursor);
+        if valid {
+            Ok(())
+        } else {
+            Err(RegisterError::Expired { oldest_cursor })
+        }
     }
 
     fn clear_starting(&self, provider_id: &str, control: &Arc<StartingControl>) {
@@ -653,41 +968,49 @@ impl ReplayBroker {
         }
     }
 
-    fn unregister(&self, id: u64, demand: Option<&ProviderDemand>) {
-        let control = {
+    fn unregister(&self, id: u64, demands: &[ProviderDemand]) {
+        let controls = {
             let mut state = self
                 .inner
                 .lock()
                 .expect("replay broker lock is not poisoned");
             state.subscribers.remove(&id);
-            let Some(demand) = demand else {
-                return;
-            };
-            let still_demanded = state.subscribers.values().any(|subscriber| {
-                subscriber.demand.as_ref().is_some_and(|other| {
-                    other.provider_id == demand.provider_id && other.generation == demand.generation
+            let controls = demands
+                .iter()
+                .filter_map(|demand| {
+                    let still_demanded = state.subscribers.values().any(|subscriber| {
+                        subscriber.demands.iter().any(|other| {
+                            other.provider_id == demand.provider_id
+                                && other.generation == demand.generation
+                        })
+                    });
+                    if still_demanded {
+                        return None;
+                    }
+                    let Some(UpstreamState::Running { control }) =
+                        state.upstreams.get(&demand.provider_id)
+                    else {
+                        return None;
+                    };
+                    if control.generation != demand.generation {
+                        return None;
+                    }
+                    let control = control.clone();
+                    state.upstreams.insert(
+                        demand.provider_id.clone(),
+                        UpstreamState::Stopping {
+                            control: control.clone(),
+                        },
+                    );
+                    Some(control)
                 })
-            });
-            if still_demanded {
-                return;
-            }
-            let Some(UpstreamState::Running { control }) = state.upstreams.get(&demand.provider_id)
-            else {
-                return;
-            };
-            if control.generation != demand.generation {
-                return;
-            }
-            let control = control.clone();
-            state.upstreams.insert(
-                demand.provider_id.clone(),
-                UpstreamState::Stopping {
-                    control: control.clone(),
-                },
-            );
-            control
+                .collect::<Vec<_>>();
+            drop(state);
+            controls
         };
-        control.cancel();
+        for control in controls {
+            control.cancel();
+        }
     }
 
     fn mark_terminal(
@@ -722,17 +1045,25 @@ impl ReplayBroker {
             }),
             UpstreamTerminal::Ended | UpstreamTerminal::Cancelled => None,
         };
+        let through_sequence = state.next_sequence.saturating_sub(1);
         state.subscribers.retain(|_, subscriber| {
-            let belongs_to_upstream = subscriber.demand.as_ref().is_some_and(|demand| {
+            let belongs_to_upstream = subscriber.demands.iter().any(|demand| {
                 demand.provider_id == provider_id && demand.generation == control.generation
             });
             if belongs_to_upstream {
+                subscriber.demands.retain(|demand| {
+                    !(demand.provider_id == provider_id && demand.generation == control.generation)
+                });
                 if let Some(error) = terminal_error.as_ref() {
-                    let _ = subscriber
-                        .terminal
-                        .send_replace(SubscriberTerminal::UpstreamError(error.clone()));
+                    let signal = SubscriberTerminal::UpstreamError {
+                        provider: provider_id.to_string(),
+                        error: error.clone(),
+                        through_sequence,
+                    };
+                    let _ = subscriber.terminal.send_replace(signal.clone());
+                    let _ = subscriber.terminal_events.send(signal);
                 }
-                false
+                !subscriber.demands.is_empty()
             } else {
                 true
             }
@@ -867,6 +1198,67 @@ mod tests {
     }
 
     #[test]
+    fn wire_cursor_parser_requires_canonical_incarnation_and_sequence() {
+        let broker = ReplayBroker::new();
+        let cursor = broker
+            .append("a", message("00000000-0000-0000-0000-000000000001", "one"))
+            .cursor;
+        assert_eq!(
+            ReplayCursor::parse_wire_value(&cursor.as_wire_value()),
+            Ok(cursor)
+        );
+
+        let wire = cursor.as_wire_value();
+        let incarnation = wire.split('.').next().unwrap();
+        for invalid in [
+            "",
+            "not-a-cursor",
+            "AAAAAAAAAAAAAAAAAAAAAA",
+            "AAAAAAAAAAAAAAAAAAAAAA.0",
+            "AAAAAAAAAAAAAAAAAAAAAA.+1",
+            "AAAAAAAAAAAAAAAAAAAAAA.18446744073709551616",
+            "AAAAAAAAAAAAAAAAAAAAAA.1.extra",
+            "AAAAAAAAAAAAAAAAAAAAAB.1",
+        ] {
+            assert!(
+                ReplayCursor::parse_wire_value(invalid).is_err(),
+                "expected invalid cursor: {invalid}"
+            );
+        }
+        assert!(
+            ReplayCursor::parse_wire_value(&format!("{incarnation}.18446744073709551615")).is_ok()
+        );
+        assert_eq!(
+            ReplayCursor::parse_wire_value(&format!("{incarnation}.01"))
+                .expect("leading-zero decimal remains a valid u64")
+                .sequence(),
+            1
+        );
+    }
+
+    #[test]
+    fn cursor_expiry_reports_oldest_only_when_retention_exists() {
+        let empty = ReplayBroker::new();
+        let parsed = ReplayCursor::parse_wire_value("AAAAAAAAAAAAAAAAAAAAAA.1").unwrap();
+        assert_eq!(
+            empty.validate_cursor(parsed),
+            Err(RegisterError::Expired {
+                oldest_cursor: None
+            })
+        );
+
+        let broker = ReplayBroker::new();
+        let first = broker.append("a", message("00000000-0000-0000-0000-000000000001", "one"));
+        let wrong_incarnation = ReplayCursor::parse_wire_value("AAAAAAAAAAAAAAAAAAAAAA.1").unwrap();
+        assert_eq!(
+            broker.validate_cursor(wrong_incarnation),
+            Err(RegisterError::Expired {
+                oldest_cursor: Some(first.cursor.as_wire_value())
+            })
+        );
+    }
+
+    #[test]
     fn retention_is_fifo_and_bounded() {
         let broker = ReplayBroker::new();
         let thread = "00000000-0000-0000-0000-000000000001";
@@ -876,7 +1268,7 @@ mod tests {
         }
         assert!(matches!(
             broker.register(ReplayFilter::default(), Some(first.cursor)),
-            Err(RegisterError::Expired)
+            Err(RegisterError::Expired { .. })
         ));
     }
 
@@ -935,7 +1327,7 @@ mod tests {
         {
             let mut state = broker.inner.lock().expect("broker lock");
             let subscriber = state.subscribers.values_mut().next().expect("subscriber");
-            subscriber.demand = Some(ProviderDemand {
+            subscriber.demands.push(ProviderDemand {
                 provider_id: "wanted".into(),
                 generation: control.generation,
             });
@@ -960,8 +1352,17 @@ mod tests {
         );
 
         match &*subscription.terminal.borrow() {
-            SubscriberTerminal::UpstreamError(IrisError::Provider { provider, message }) => {
+            SubscriberTerminal::UpstreamError {
+                provider,
+                error:
+                    IrisError::Provider {
+                        provider: error_provider,
+                        message,
+                    },
+                ..
+            } => {
                 assert_eq!(provider, "wanted");
+                assert_eq!(error_provider, "wanted");
                 assert_eq!(message, "terminal test failure");
             }
             signal => panic!("expected preserved upstream error, got {signal:?}"),

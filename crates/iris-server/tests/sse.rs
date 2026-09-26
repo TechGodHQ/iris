@@ -368,6 +368,14 @@ fn event_request(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
+fn cursor_from_chunk(chunk: &[u8]) -> String {
+    String::from_utf8_lossy(chunk)
+        .lines()
+        .find_map(|line| line.strip_prefix("id: "))
+        .expect("message frame has an SSE id")
+        .to_owned()
+}
+
 // ---------------------------------------------------------------------------
 // Statuses
 // ---------------------------------------------------------------------------
@@ -516,6 +524,220 @@ async fn message_frames_carry_json_payload_unchanged() {
     let events = sse_events(&body);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].1, expected);
+}
+
+#[tokio::test]
+async fn saved_wire_cursor_reconnects_through_the_public_router() {
+    use tokio_stream::StreamExt;
+
+    let (provider, handle) = FakeRealtimeProvider::realtime("fake", drop_channel().0);
+    let app = app_with(vec![Arc::new(provider)], 15_000);
+    let response = app
+        .clone()
+        .oneshot(event_request("/v1/events"))
+        .await
+        .expect("initial response");
+    let mut initial = response.into_body().into_data_stream();
+    let opening = initial
+        .next()
+        .await
+        .expect("initial stream opens")
+        .expect("opening bytes");
+    assert!(opening.starts_with(b": stream open"));
+
+    let first = sample_message("00000000-0000-0000-0000-000000000021", "first");
+    handle.emit(&first);
+    let first_chunk = tokio::time::timeout(Duration::from_secs(1), initial.next())
+        .await
+        .expect("first message arrives")
+        .expect("first message chunk")
+        .expect("first message bytes");
+    let cursor = cursor_from_chunk(&first_chunk);
+
+    let second = sample_message("00000000-0000-0000-0000-000000000022", "second");
+    handle.emit(&second);
+
+    let replay_response = app
+        .oneshot(event_request(&format!("/v1/events?cursor={cursor}")))
+        .await
+        .expect("replay response");
+    assert_eq!(replay_response.status(), StatusCode::OK);
+    let mut replay = replay_response.into_body().into_data_stream();
+    let opening = replay
+        .next()
+        .await
+        .expect("replay stream opens")
+        .expect("replay opening bytes");
+    assert!(opening.starts_with(b": stream open"));
+    let replay_chunk = tokio::time::timeout(Duration::from_secs(1), replay.next())
+        .await
+        .expect("retained message arrives")
+        .expect("retained message chunk")
+        .expect("retained message bytes");
+    let replay_text = String::from_utf8_lossy(&replay_chunk);
+    assert!(replay_text.contains("event: message"));
+    assert!(replay_text.contains("data: "));
+    assert!(replay_text.contains("\"body\":\"second\""));
+    assert_ne!(cursor, cursor_from_chunk(&replay_chunk));
+
+    handle.end();
+    drop(initial);
+    drop(replay);
+}
+
+#[tokio::test]
+async fn replay_cursor_failures_are_generated_and_pre_io() {
+    let (provider, handle) = FakeRealtimeProvider::realtime("fake", drop_channel().0);
+    let subscribe_count = handle.subscribe_count.clone();
+    let app = app_with(vec![Arc::new(provider)], 15_000);
+
+    let malformed = app
+        .clone()
+        .oneshot(event_request("/v1/events?cursor=not-a-cursor"))
+        .await
+        .expect("malformed response");
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&read_body(malformed).await).unwrap(),
+        serde_json::json!({ "error": "invalid_replay_cursor" })
+    );
+    assert_eq!(subscribe_count.load(Ordering::SeqCst), 0);
+
+    // 16 zero bytes in canonical unpadded base64url, sequence one. The fresh
+    // broker has no retained history, so this is syntactically valid but
+    // expired and still must not prepare a provider.
+    let expired = app
+        .oneshot(event_request("/v1/events?cursor=AAAAAAAAAAAAAAAAAAAAAA.1"))
+        .await
+        .expect("expired response");
+    assert_eq!(expired.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&read_body(expired).await).unwrap(),
+        serde_json::json!({ "error": "replay_cursor_expired" })
+    );
+    assert_eq!(subscribe_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn aggregate_replay_queue_preserves_broker_order_across_instances() {
+    use tokio_stream::StreamExt;
+
+    let (first_provider, first_handle) =
+        FakeRealtimeProvider::realtime("telegram-primary", drop_channel().0);
+    let (second_provider, second_handle) =
+        FakeRealtimeProvider::realtime("telegram-archive", drop_channel().0);
+    let app = app_with(
+        vec![Arc::new(first_provider), Arc::new(second_provider)],
+        15_000,
+    );
+    let response = app
+        .oneshot(event_request("/v1/events"))
+        .await
+        .expect("aggregate response");
+    let mut stream = response.into_body().into_data_stream();
+    let opening = stream
+        .next()
+        .await
+        .expect("aggregate stream opens")
+        .expect("opening bytes");
+    assert!(opening.starts_with(b": stream open"));
+
+    first_handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000031",
+        "ordered primary",
+    ));
+    let first_chunk = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("primary message arrives")
+        .expect("primary message chunk")
+        .expect("primary message bytes");
+    assert!(String::from_utf8_lossy(&first_chunk).contains("ordered primary"));
+
+    second_handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000032",
+        "ordered archive",
+    ));
+    let second_chunk = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("archive message arrives")
+        .expect("archive message chunk")
+        .expect("archive message bytes");
+    assert!(String::from_utf8_lossy(&second_chunk).contains("ordered archive"));
+    assert!(cursor_from_chunk(&first_chunk) < cursor_from_chunk(&second_chunk));
+
+    first_handle.end();
+    second_handle.end();
+    drop(stream);
+}
+
+#[tokio::test]
+async fn aggregate_subscriber_does_not_follow_a_restarted_provider_generation() {
+    use tokio_stream::StreamExt;
+
+    let (first_provider, first_handle) = FakeRealtimeProvider::realtime("first", drop_channel().0);
+    let (second_provider, second_handle) =
+        FakeRealtimeProvider::realtime("second", drop_channel().0);
+    let app = app_with(
+        vec![Arc::new(first_provider), Arc::new(second_provider)],
+        15_000,
+    );
+    let aggregate_response = app
+        .clone()
+        .oneshot(event_request("/v1/events"))
+        .await
+        .expect("aggregate response");
+    let mut aggregate = aggregate_response.into_body().into_data_stream();
+    let opening = aggregate
+        .next()
+        .await
+        .expect("aggregate stream opens")
+        .expect("opening bytes");
+    assert!(opening.starts_with(b": stream open"));
+
+    first_handle.emit_error(&IrisError::SlowConsumer);
+    let terminal = tokio::time::timeout(Duration::from_secs(1), aggregate.next())
+        .await
+        .expect("aggregate receives the first terminal frame")
+        .expect("terminal frame chunk")
+        .expect("terminal frame bytes");
+    assert!(String::from_utf8_lossy(&terminal).contains("slow_consumer"));
+
+    let restarted_response = app
+        .clone()
+        .oneshot(event_request("/v1/events?provider=first"))
+        .await
+        .expect("restarted filtered response");
+    assert_eq!(restarted_response.status(), StatusCode::OK);
+    let mut restarted = restarted_response.into_body().into_data_stream();
+    let opening = restarted
+        .next()
+        .await
+        .expect("restarted stream opens")
+        .expect("restarted opening bytes");
+    assert!(opening.starts_with(b": stream open"));
+
+    first_handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000041",
+        "new-generation-only",
+    ));
+    let restarted_message = tokio::time::timeout(Duration::from_secs(1), restarted.next())
+        .await
+        .expect("restarted provider receives its message")
+        .expect("restarted message chunk")
+        .expect("restarted message bytes");
+    assert!(String::from_utf8_lossy(&restarted_message).contains("new-generation-only"));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), aggregate.next())
+            .await
+            .is_err(),
+        "old aggregate subscription must not receive the restarted provider generation"
+    );
+
+    first_handle.end();
+    second_handle.end();
+    drop(aggregate);
+    drop(restarted);
 }
 
 #[tokio::test]
