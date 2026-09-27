@@ -483,9 +483,10 @@ async fn wait_for_slow_consumer(terminal: &mut tokio::sync::watch::Receiver<Subs
         match signal {
             SubscriberTerminal::SlowConsumer => return,
             // A separate receiver owns terminal-error delivery so a frame
-            // currently being forwarded is not preempted and lost.
-            SubscriberTerminal::UpstreamError { .. } => std::future::pending::<()>().await,
-            SubscriberTerminal::Open => {}
+            // currently being forwarded is not preempted and lost. Keep
+            // observing the watch, however: an aggregate can report one
+            // provider's error and later be evicted for slow consumption.
+            SubscriberTerminal::UpstreamError { .. } | SubscriberTerminal::Open => {}
         }
         if terminal.changed().await.is_err() {
             std::future::pending::<()>().await;
@@ -691,3 +692,74 @@ impl Stream for SseBodyStream {
 /// Convenience alias mirroring [`iris_core`] usage in this module.
 #[allow(dead_code)]
 type SharedProvider = Arc<dyn MessageProvider>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn slow_consumer_signal_is_observed_after_prior_upstream_error() {
+        use std::future::Future;
+        use std::sync::Arc;
+
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel(1);
+        frame_tx
+            .try_send(WireFrame("already queued".into()))
+            .expect("test frame channel starts full");
+        let (terminal_tx, terminal_rx) =
+            tokio::sync::watch::channel(SubscriberTerminal::UpstreamError {
+                provider: "failed-provider".into(),
+                error: IrisError::Provider {
+                    provider: "failed-provider".into(),
+                    message: "synthetic failure".into(),
+                },
+                through_sequence: 0,
+            });
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let blocked_wait = blocked.notified();
+        let blocked_signal = Arc::clone(&blocked);
+        let waiter = tokio::spawn(async move {
+            let mut terminal_rx = terminal_rx;
+            let mut send = Box::pin(send_subscription_frame(
+                &frame_tx,
+                WireFrame("must remain pending".into()),
+                &mut terminal_rx,
+            ));
+            std::future::poll_fn(|cx| {
+                let poll = send.as_mut().poll(cx);
+                if poll.is_pending() {
+                    blocked_signal.notify_one();
+                }
+                poll
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), blocked_wait)
+            .await
+            .expect("frame forwarding must reach its blocked first poll");
+        assert_eq!(
+            frame_rx.capacity(),
+            0,
+            "the downstream channel remains full"
+        );
+        assert!(
+            !waiter.is_finished(),
+            "an observed upstream error must not finish the blocked send"
+        );
+
+        terminal_tx.send_replace(SubscriberTerminal::SlowConsumer);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("slow-consumer cancellation must wake the watcher")
+                .expect("watcher task must complete"),
+            BranchSend::SlowConsumer
+        );
+        assert!(
+            frame_rx.try_recv().is_ok(),
+            "the blocked frame must not drain the downstream channel"
+        );
+    }
+}
