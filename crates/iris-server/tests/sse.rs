@@ -1056,6 +1056,71 @@ async fn slow_consumer_releases_the_final_shared_upstream() {
 }
 
 #[tokio::test]
+async fn aggregate_slow_consumer_after_provider_error_releases_survivor() {
+    use tokio_stream::StreamExt;
+
+    let (a_drop_tx, mut a_drop_rx) = drop_channel();
+    let (b_drop_tx, mut b_drop_rx) = drop_channel();
+    let (provider_a, handle_a) = FakeRealtimeProvider::realtime("a", a_drop_tx);
+    let (provider_b, handle_b) = FakeRealtimeProvider::realtime("b", b_drop_tx);
+    let app = app_with(vec![Arc::new(provider_a), Arc::new(provider_b)], 15_000);
+    let response = app
+        .oneshot(event_request("/v1/events"))
+        .await
+        .expect("aggregate response");
+    let mut data = response.into_body().into_data_stream();
+    let opening = data
+        .next()
+        .await
+        .expect("stream opens")
+        .expect("opening bytes");
+    assert!(opening.starts_with(b": stream open"));
+
+    // Wait for A's worker to finish marking the subscriber's terminal watch
+    // before driving B. This establishes failure-before-backpressure without
+    // depending on scheduler luck or a sleep.
+    handle_a.emit_error(&IrisError::Provider {
+        provider: "a".into(),
+        message: "synthetic upstream failure".into(),
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), a_drop_rx.recv())
+            .await
+            .expect("failed provider worker finishes")
+            .is_some(),
+        "A's failed upstream must be dropped before B is saturated"
+    );
+    assert!(
+        b_drop_rx.try_recv().is_err(),
+        "a surviving provider must remain demanded after A fails"
+    );
+
+    // Leave the HTTP body open after its opening chunk. The aggregate's
+    // ordered frame path fills the wire, frame, and broker queues; the final
+    // slow-consumer eviction must then release B without reading or dropping
+    // the body.
+    // The 700 events exceed the broker's bounded live queue while the frame
+    // and wire queues remain occupied by the unread body, but stay below the
+    // synthetic provider's 1024-entry input buffer so the fixture itself does
+    // not drop the burst before the broker makes its eviction decision.
+    for index in 0..700 {
+        handle_b.emit(&sample_message(
+            "00000000-0000-0000-0000-000000000015",
+            &format!("aggregate-burst-{index}"),
+        ));
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), b_drop_rx.recv())
+            .await
+            .expect("aggregate slow-consumer cleanup completes")
+            .is_some(),
+        "final aggregate eviction must cancel the surviving provider"
+    );
+    drop(data);
+}
+
+#[tokio::test]
 async fn preparation_race_creates_one_upstream_owner() {
     let (entered_tx, mut entered_rx) = mpsc::channel(2);
     let release = Arc::new(Notify::new());
