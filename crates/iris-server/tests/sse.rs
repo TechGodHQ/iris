@@ -376,6 +376,53 @@ fn cursor_from_chunk(chunk: &[u8]) -> String {
         .to_owned()
 }
 
+fn message_frame_from_chunk(chunk: &[u8]) -> (String, String) {
+    let text = String::from_utf8_lossy(chunk);
+    assert!(
+        text.contains("event: message"),
+        "not a message frame: {text}"
+    );
+    let cursor = cursor_from_chunk(chunk);
+    let data = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("message frame has a data line")
+        .to_owned();
+    (cursor, data)
+}
+
+fn cursor_sequence(cursor: &str) -> u64 {
+    cursor
+        .rsplit_once('.')
+        .expect("cursor has an incarnation separator")
+        .1
+        .parse()
+        .expect("cursor sequence is decimal")
+}
+
+fn cursor_with_sequence(cursor: &str, sequence: u64) -> String {
+    let incarnation = cursor
+        .rsplit_once('.')
+        .expect("cursor has an incarnation separator")
+        .0;
+    format!("{incarnation}.{sequence}")
+}
+
+async fn next_sse_chunk<S, E>(stream: &mut S) -> Vec<u8>
+where
+    S: tokio_stream::Stream<Item = std::result::Result<axum::body::Bytes, E>> + Unpin,
+    E: std::fmt::Debug,
+{
+    use tokio_stream::StreamExt;
+
+    tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("SSE frame arrives")
+        .expect("SSE stream remains open")
+        .expect("SSE frame has no body error")
+        .to_vec()
+}
+
 // ---------------------------------------------------------------------------
 // Statuses
 // ---------------------------------------------------------------------------
@@ -547,18 +594,21 @@ async fn saved_wire_cursor_reconnects_through_the_public_router() {
 
     let first = sample_message("00000000-0000-0000-0000-000000000021", "first");
     handle.emit(&first);
-    let first_chunk = tokio::time::timeout(Duration::from_secs(1), initial.next())
-        .await
-        .expect("first message arrives")
-        .expect("first message chunk")
-        .expect("first message bytes");
-    let cursor = cursor_from_chunk(&first_chunk);
+    let first_chunk = next_sse_chunk(&mut initial).await;
+    let (first_cursor, first_wire) = message_frame_from_chunk(&first_chunk);
 
     let second = sample_message("00000000-0000-0000-0000-000000000022", "second");
     handle.emit(&second);
+    let second_chunk = next_sse_chunk(&mut initial).await;
+    let (second_cursor, second_wire) = message_frame_from_chunk(&second_chunk);
+
+    let third = sample_message("00000000-0000-0000-0000-000000000023", "third");
+    handle.emit(&third);
+    let third_chunk = next_sse_chunk(&mut initial).await;
+    let (third_cursor, third_wire) = message_frame_from_chunk(&third_chunk);
 
     let replay_response = app
-        .oneshot(event_request(&format!("/v1/events?cursor={cursor}")))
+        .oneshot(event_request(&format!("/v1/events?cursor={first_cursor}")))
         .await
         .expect("replay response");
     assert_eq!(replay_response.status(), StatusCode::OK);
@@ -569,16 +619,34 @@ async fn saved_wire_cursor_reconnects_through_the_public_router() {
         .expect("replay stream opens")
         .expect("replay opening bytes");
     assert!(opening.starts_with(b": stream open"));
-    let replay_chunk = tokio::time::timeout(Duration::from_secs(1), replay.next())
-        .await
-        .expect("retained message arrives")
-        .expect("retained message chunk")
-        .expect("retained message bytes");
-    let replay_text = String::from_utf8_lossy(&replay_chunk);
-    assert!(replay_text.contains("event: message"));
-    assert!(replay_text.contains("data: "));
-    assert!(replay_text.contains("\"body\":\"second\""));
-    assert_ne!(cursor, cursor_from_chunk(&replay_chunk));
+    let replay_second = next_sse_chunk(&mut replay).await;
+    assert_eq!(
+        message_frame_from_chunk(&replay_second),
+        (second_cursor.clone(), second_wire.clone())
+    );
+
+    // Registration is complete after the response exists. Append while the
+    // replay driver is still draining, then prove the live event follows the
+    // retained snapshot once and with its original wire identity/payload.
+    handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000024",
+        "fourth-live",
+    ));
+    let replay_third = next_sse_chunk(&mut replay).await;
+    assert_eq!(
+        message_frame_from_chunk(&replay_third),
+        (third_cursor.clone(), third_wire.clone())
+    );
+    let replay_fourth = next_sse_chunk(&mut replay).await;
+    let (fourth_cursor, fourth_wire) = message_frame_from_chunk(&replay_fourth);
+    assert_eq!(
+        cursor_sequence(&fourth_cursor),
+        cursor_sequence(&third_cursor) + 1
+    );
+    assert!(fourth_wire.contains("\"body\":\"fourth-live\""));
+
+    assert_ne!(first_cursor, second_cursor);
+    assert_ne!(first_wire, second_wire);
 
     handle.end();
     drop(initial);
@@ -591,21 +659,42 @@ async fn replay_cursor_failures_are_generated_and_pre_io() {
     let subscribe_count = handle.subscribe_count.clone();
     let app = app_with(vec![Arc::new(provider)], 15_000);
 
-    let malformed = app
-        .clone()
-        .oneshot(event_request("/v1/events?cursor=not-a-cursor"))
-        .await
-        .expect("malformed response");
-    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&read_body(malformed).await).unwrap(),
-        serde_json::json!({ "error": "invalid_replay_cursor" })
-    );
+    for cursor in [
+        "not-a-cursor",
+        "AAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAA.1.extra",
+        "AAAAAAAAAAAAAAAAAAAAAA.x",
+        "AAAAAAAAAAAAAAAAAAAAAA.0",
+        "AAAAAAAAAAAAAAAAAAAAAA.18446744073709551616",
+        "AAAAAAAAAAAAAAAAAAAAA.1",
+        "AAAAAAAAAAAAAAAAAAAAAA=.1",
+        "//////////////////////.1",
+    ] {
+        let malformed = app
+            .clone()
+            .oneshot(event_request(&format!("/v1/events?cursor={cursor}")))
+            .await
+            .expect("malformed response");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST, "{cursor}");
+        assert_eq!(
+            malformed
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "malformed cursors must not open an SSE response: {cursor}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&read_body(malformed).await).unwrap(),
+            serde_json::json!({ "error": "invalid_replay_cursor" }),
+            "{cursor}"
+        );
+    }
     assert_eq!(subscribe_count.load(Ordering::SeqCst), 0);
 
-    // 16 zero bytes in canonical unpadded base64url, sequence one. The fresh
-    // broker has no retained history, so this is syntactically valid but
-    // expired and still must not prepare a provider.
+    // A canonical valid-form cursor from another process has no retained
+    // history in this fresh broker. It must be an explicit 409, not a
+    // live-only fallback, and it must not disclose any message content.
     let expired = app
         .oneshot(event_request("/v1/events?cursor=AAAAAAAAAAAAAAAAAAAAAA.1"))
         .await
@@ -616,6 +705,137 @@ async fn replay_cursor_failures_are_generated_and_pre_io() {
         serde_json::json!({ "error": "replay_cursor_expired" })
     );
     assert_eq!(subscribe_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn replay_expiry_matrix_reports_observed_retention_without_data_leaks() {
+    let (provider, handle) = FakeRealtimeProvider::realtime("fake", drop_channel().0);
+    let app = app_with(vec![Arc::new(provider)], 15_000);
+    let response = app
+        .clone()
+        .oneshot(event_request("/v1/events?provider=fake"))
+        .await
+        .expect("keeper response");
+    let mut keeper = response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut keeper)
+            .await
+            .starts_with(b": stream open")
+    );
+
+    let first_message = sample_message(
+        "00000000-0000-0000-0000-000000000051",
+        "sensitive-retained-first",
+    );
+    handle.emit(&first_message);
+    let first_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+    let first_sequence = cursor_sequence(&first_frame.0);
+    assert_eq!(first_sequence, 1);
+
+    let future = app
+        .clone()
+        .oneshot(event_request(&format!(
+            "/v1/events?provider=fake&cursor={}",
+            cursor_with_sequence(&first_frame.0, first_sequence + 1)
+        )))
+        .await
+        .expect("future cursor response");
+    assert_eq!(future.status(), StatusCode::CONFLICT);
+    let future_body: serde_json::Value = serde_json::from_str(&read_body(future).await).unwrap();
+    assert_eq!(future_body["error"], "replay_cursor_expired");
+    assert_eq!(future_body["oldest_cursor"], first_frame.0);
+    assert!(!future_body.to_string().contains("sensitive-retained-first"));
+
+    let mut newest_frame = first_frame.clone();
+    for index in 0..512 {
+        handle.emit(&sample_message(
+            "00000000-0000-0000-0000-000000000052",
+            &format!("retained-{index}"),
+        ));
+        newest_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+    }
+    assert_eq!(cursor_sequence(&newest_frame.0), 513);
+
+    let evicted = app
+        .clone()
+        .oneshot(event_request(&format!(
+            "/v1/events?provider=fake&cursor={}",
+            first_frame.0
+        )))
+        .await
+        .expect("evicted cursor response");
+    assert_eq!(evicted.status(), StatusCode::CONFLICT);
+    let evicted_body: serde_json::Value = serde_json::from_str(&read_body(evicted).await).unwrap();
+    assert_eq!(evicted_body["error"], "replay_cursor_expired");
+    let oldest = evicted_body["oldest_cursor"]
+        .as_str()
+        .expect("retained history exposes oldest cursor");
+    assert_eq!(cursor_sequence(oldest), 2);
+    assert_eq!(
+        cursor_sequence(&newest_frame.0) - cursor_sequence(oldest) + 1,
+        512
+    );
+    assert!(
+        !evicted_body
+            .to_string()
+            .contains("sensitive-retained-first")
+    );
+
+    // The newest retained cursor is valid and must produce an empty replay;
+    // the first message after registration is the explicitly appended live
+    // event, not an accidental replay of the newest retained item.
+    let newest_response = app
+        .clone()
+        .oneshot(event_request(&format!(
+            "/v1/events?provider=fake&cursor={}",
+            newest_frame.0
+        )))
+        .await
+        .expect("newest-cursor response");
+    assert_eq!(newest_response.status(), StatusCode::OK);
+    let mut newest = newest_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut newest)
+            .await
+            .starts_with(b": stream open")
+    );
+    handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000053",
+        "newest-cursor-live",
+    ));
+    let live_frame = message_frame_from_chunk(&next_sse_chunk(&mut newest).await);
+    assert!(live_frame.1.contains("\"body\":\"newest-cursor-live\""));
+    assert_eq!(cursor_sequence(&live_frame.0), 514);
+
+    // A new app is a new process incarnation with an empty retained history.
+    // The old cursor is valid syntax but must not open a stream or expose the
+    // old payload.
+    let (restarted_provider, restarted_handle) =
+        FakeRealtimeProvider::realtime("fake", drop_channel().0);
+    let restarted_subscribe_count = restarted_handle.subscribe_count.clone();
+    let restarted_app = app_with(vec![Arc::new(restarted_provider)], 15_000);
+    let restarted = restarted_app
+        .oneshot(event_request(&format!(
+            "/v1/events?provider=fake&cursor={}",
+            newest_frame.0
+        )))
+        .await
+        .expect("restart-expired response");
+    assert_eq!(restarted.status(), StatusCode::CONFLICT);
+    let restarted_body: serde_json::Value =
+        serde_json::from_str(&read_body(restarted).await).unwrap();
+    assert_eq!(
+        restarted_body,
+        serde_json::json!({ "error": "replay_cursor_expired" })
+    );
+    assert!(!restarted_body.to_string().contains("retained-"));
+    assert_eq!(restarted_subscribe_count.load(Ordering::SeqCst), 0);
+
+    handle.end();
+    restarted_handle.end();
+    drop(keeper);
+    drop(newest);
 }
 
 #[tokio::test]
@@ -631,6 +851,7 @@ async fn aggregate_replay_queue_preserves_broker_order_across_instances() {
         15_000,
     );
     let response = app
+        .clone()
         .oneshot(event_request("/v1/events"))
         .await
         .expect("aggregate response");
@@ -646,28 +867,131 @@ async fn aggregate_replay_queue_preserves_broker_order_across_instances() {
         "00000000-0000-0000-0000-000000000031",
         "ordered primary",
     ));
-    let first_chunk = tokio::time::timeout(Duration::from_secs(1), stream.next())
-        .await
-        .expect("primary message arrives")
-        .expect("primary message chunk")
-        .expect("primary message bytes");
-    assert!(String::from_utf8_lossy(&first_chunk).contains("ordered primary"));
+    let first_chunk = next_sse_chunk(&mut stream).await;
+    let first_frame = message_frame_from_chunk(&first_chunk);
+    assert!(first_frame.1.contains("ordered primary"));
 
     second_handle.emit(&sample_message(
         "00000000-0000-0000-0000-000000000032",
         "ordered archive",
     ));
-    let second_chunk = tokio::time::timeout(Duration::from_secs(1), stream.next())
+    let second_chunk = next_sse_chunk(&mut stream).await;
+    let second_frame = message_frame_from_chunk(&second_chunk);
+    assert!(second_frame.1.contains("ordered archive"));
+
+    first_handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000033",
+        "ordered primary second",
+    ));
+    let third_frame = message_frame_from_chunk(&next_sse_chunk(&mut stream).await);
+    second_handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000034",
+        "ordered archive second",
+    ));
+    let fourth_frame = message_frame_from_chunk(&next_sse_chunk(&mut stream).await);
+
+    assert_eq!(
+        [
+            cursor_sequence(&first_frame.0),
+            cursor_sequence(&second_frame.0),
+            cursor_sequence(&third_frame.0),
+            cursor_sequence(&fourth_frame.0),
+        ],
+        [1, 2, 3, 4]
+    );
+
+    let replay_response = app
+        .clone()
+        .oneshot(event_request(&format!(
+            "/v1/events?cursor={}",
+            first_frame.0
+        )))
         .await
-        .expect("archive message arrives")
-        .expect("archive message chunk")
-        .expect("archive message bytes");
-    assert!(String::from_utf8_lossy(&second_chunk).contains("ordered archive"));
-    assert!(cursor_from_chunk(&first_chunk) < cursor_from_chunk(&second_chunk));
+        .expect("aggregate replay response");
+    assert_eq!(replay_response.status(), StatusCode::OK);
+    let mut replay = replay_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut replay)
+            .await
+            .starts_with(b": stream open")
+    );
+    for expected in [second_frame, third_frame, fourth_frame] {
+        let actual = message_frame_from_chunk(&next_sse_chunk(&mut replay).await);
+        assert_eq!(actual, expected);
+    }
 
     first_handle.end();
     second_handle.end();
     drop(stream);
+    drop(replay);
+}
+
+#[tokio::test]
+async fn changed_instance_and_thread_filters_empty_replay_then_accept_one_live_event() {
+    let (primary, primary_handle) =
+        FakeRealtimeProvider::realtime("telegram-primary", drop_channel().0);
+    let (archive, archive_handle) =
+        FakeRealtimeProvider::realtime("telegram-archive", drop_channel().0);
+    let app = app_with(vec![Arc::new(primary), Arc::new(archive)], 15_000);
+    let keeper_response = app
+        .clone()
+        .oneshot(event_request("/v1/events"))
+        .await
+        .expect("aggregate keeper response");
+    let mut keeper = keeper_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut keeper)
+            .await
+            .starts_with(b": stream open")
+    );
+
+    primary_handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000062",
+        "primary-before-cursor-but-filter-match",
+    ));
+    let primary_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+    archive_handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000061",
+        "archive-cursor-anchor",
+    ));
+    let archive_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+    assert_eq!(
+        cursor_sequence(&primary_frame.0) + 1,
+        cursor_sequence(&archive_frame.0)
+    );
+
+    // The reconnect changes both filters. There is no matching retained event
+    // after the saved global cursor, so the first post-open message must be a
+    // newly appended live event from the selected configured instance/thread.
+    let filtered_response = app
+        .clone()
+        .oneshot(event_request(&format!(
+            "/v1/events?provider=telegram-primary&thread_id=00000000-0000-0000-0000-000000000062&cursor={}",
+            archive_frame.0
+        )))
+        .await
+        .expect("changed-filter reconnect response");
+    assert_eq!(filtered_response.status(), StatusCode::OK);
+    let mut filtered = filtered_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut filtered)
+            .await
+            .starts_with(b": stream open")
+    );
+
+    primary_handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000062",
+        "changed-filter-live",
+    ));
+    let live = message_frame_from_chunk(&next_sse_chunk(&mut filtered).await);
+    assert!(live.1.contains("\"body\":\"changed-filter-live\""));
+    assert!(!live.1.contains("primary-before-cursor-but-filter-match"));
+    assert!(!live.1.contains("archive-cursor-anchor"));
+
+    primary_handle.end();
+    archive_handle.end();
+    drop(keeper);
+    drop(filtered);
 }
 
 #[tokio::test]
@@ -1200,6 +1524,121 @@ async fn cancelled_first_preparation_releases_waiters_for_a_fresh_attempt() {
     assert_eq!(handle.subscribe_count.load(Ordering::SeqCst), 2);
     handle.end();
     let _ = read_body(second).await;
+}
+
+#[tokio::test]
+async fn cursor_eviction_during_readiness_returns_expiry_and_rolls_back_demand() {
+    let (anchor, anchor_handle) = FakeRealtimeProvider::realtime("anchor", drop_channel().0);
+    let (entered_tx, mut entered_rx) = mpsc::channel(3);
+    let release = Arc::new(Notify::new());
+    let (slow_drop_tx, mut slow_drop_rx) = drop_channel();
+    let (slow, slow_handle) =
+        FakeRealtimeProvider::delayed("slow", slow_drop_tx, entered_tx, release.clone());
+    let slow_subscribe_count = slow_handle.subscribe_count.clone();
+    let app = app_with(vec![Arc::new(anchor), Arc::new(slow)], 15_000);
+
+    let anchor_response = app
+        .clone()
+        .oneshot(event_request("/v1/events?provider=anchor"))
+        .await
+        .expect("anchor response");
+    let mut anchor_stream = anchor_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut anchor_stream)
+            .await
+            .starts_with(b": stream open")
+    );
+    anchor_handle.emit(&sample_message(
+        "00000000-0000-0000-0000-000000000071",
+        "cursor-before-readiness-race",
+    ));
+    let anchor_cursor = message_frame_from_chunk(&next_sse_chunk(&mut anchor_stream).await).0;
+
+    let pending_app = app.clone();
+    let pending_cursor = anchor_cursor.clone();
+    let pending = tokio::spawn(async move {
+        pending_app
+            .oneshot(event_request(&format!(
+                "/v1/events?provider=slow&cursor={pending_cursor}"
+            )))
+            .await
+            .expect("pending reconnect response")
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("slow provider readiness begins")
+            .is_some()
+    );
+
+    // The reconnect passed its preflight check and is now blocked before the
+    // atomic register. Accept 512 later anchor events through the keeper so
+    // the saved cursor is definitely evicted while readiness is pending.
+    for index in 0..512 {
+        anchor_handle.emit(&sample_message(
+            "00000000-0000-0000-0000-000000000072",
+            &format!("eviction-{index}"),
+        ));
+        let _ = next_sse_chunk(&mut anchor_stream).await;
+    }
+    release.notify_one();
+    let expired = pending.await.expect("pending task");
+    assert_eq!(expired.status(), StatusCode::CONFLICT);
+    let expired_body: serde_json::Value = serde_json::from_str(&read_body(expired).await).unwrap();
+    assert_eq!(expired_body["error"], "replay_cursor_expired");
+    assert_eq!(
+        cursor_sequence(expired_body["oldest_cursor"].as_str().unwrap()),
+        2
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), slow_drop_rx.recv())
+            .await
+            .expect("failed registration drops its prepared stream")
+            .is_some(),
+        "expired registration must not retain the uncommitted provider stream"
+    );
+
+    // The prepared stream was never committed into an HTTP registration. A
+    // fresh attempt must be able to start, proving the failed commit cleared
+    // the Starting entry rather than leaving a stale owner behind.
+    assert_eq!(slow_subscribe_count.load(Ordering::SeqCst), 1);
+    let latest_cursor = cursor_with_sequence(&anchor_cursor, 513);
+    let retry_app = app.clone();
+    let retry = tokio::spawn(async move {
+        retry_app
+            .oneshot(event_request(&format!(
+                "/v1/events?provider=slow&cursor={latest_cursor}"
+            )))
+            .await
+            .expect("retry response")
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("retry readiness begins after rollback")
+            .is_some()
+    );
+    release.notify_one();
+    let retry_response = retry.await.expect("retry task");
+    assert_eq!(retry_response.status(), StatusCode::OK);
+    let mut retry_stream = retry_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut retry_stream)
+            .await
+            .starts_with(b": stream open")
+    );
+    drop(retry_stream);
+    assert_eq!(slow_subscribe_count.load(Ordering::SeqCst), 2);
+
+    anchor_handle.end();
+    slow_handle.end();
+    drop(anchor_stream);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), slow_drop_rx.recv())
+            .await
+            .expect("retry registration joins its provider stream")
+            .is_some()
+    );
 }
 
 #[tokio::test]
