@@ -13,7 +13,7 @@ use iris_core::{
     RecordOutcome, Result, Thread,
 };
 use iris_server::{SseSettings, create_app_with_sse};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tower::ServiceExt; // oneshot
 
 // ---------------------------------------------------------------------------
@@ -331,6 +331,13 @@ fn sample_message(thread: &str, body: &str) -> Message {
         is_outbound: false,
         metadata: serde_json::json!({}),
     }
+}
+
+/// A fully-formed message with a caller-selected identity for replay tests.
+fn sample_message_with_id(thread: &str, body: &str, id: &str) -> Message {
+    let mut message = sample_message(thread, body);
+    message.id = uuid::Uuid::parse_str(id).expect("message UUID");
+    message
 }
 
 /// Read the entire SSE body as a string.
@@ -654,6 +661,92 @@ async fn saved_wire_cursor_reconnects_through_the_public_router() {
 }
 
 #[tokio::test]
+async fn equal_body_messages_replay_with_distinct_identities() {
+    use tokio_stream::StreamExt;
+
+    let (provider, handle) = FakeRealtimeProvider::realtime("fake", drop_channel().0);
+    let app = app_with(vec![Arc::new(provider)], 15_000);
+    let keeper_response = app
+        .clone()
+        .oneshot(event_request("/v1/events?provider=fake"))
+        .await
+        .expect("keeper response");
+    let mut keeper = keeper_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut keeper)
+            .await
+            .starts_with(b": stream open")
+    );
+
+    let anchor = sample_message_with_id(
+        "00000000-0000-0000-0000-000000000081",
+        "equal-body-anchor",
+        "00000000-0000-0000-0000-000000000181",
+    );
+    handle.emit(&anchor);
+    let anchor_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+
+    let first = sample_message_with_id(
+        "00000000-0000-0000-0000-000000000082",
+        "same-body",
+        "00000000-0000-0000-0000-000000000182",
+    );
+    let second = sample_message_with_id(
+        "00000000-0000-0000-0000-000000000083",
+        "same-body",
+        "00000000-0000-0000-0000-000000000183",
+    );
+    assert_ne!(first.id, second.id);
+    let first_wire = serde_json::to_string(&first).expect("first JSON");
+    let second_wire = serde_json::to_string(&second).expect("second JSON");
+
+    handle.emit(&first);
+    let first_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+    handle.emit(&second);
+    let second_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+    assert_eq!(first_frame.1, first_wire);
+    assert_eq!(second_frame.1, second_wire);
+    assert_ne!(first_frame.0, second_frame.0);
+
+    let replay_response = app
+        .clone()
+        .oneshot(event_request(&format!(
+            "/v1/events?provider=fake&cursor={}",
+            anchor_frame.0
+        )))
+        .await
+        .expect("equal-body replay response");
+    assert_eq!(replay_response.status(), StatusCode::OK);
+    let mut replay = replay_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut replay)
+            .await
+            .starts_with(b": stream open")
+    );
+    assert_eq!(
+        message_frame_from_chunk(&next_sse_chunk(&mut replay).await),
+        first_frame
+    );
+    assert_eq!(
+        message_frame_from_chunk(&next_sse_chunk(&mut replay).await),
+        second_frame
+    );
+
+    // End the provider after the two expected frames so the stream has a
+    // controlled terminal boundary. No third message may be synthesized or
+    // replayed when equal text is used with distinct message identities.
+    drop(keeper);
+    handle.end();
+    let extra = tokio::time::timeout(Duration::from_secs(2), replay.next())
+        .await
+        .expect("equal-body replay reaches its controlled end");
+    assert!(
+        extra.is_none(),
+        "equal-body replay contained an extra frame"
+    );
+}
+
+#[tokio::test]
 async fn replay_cursor_failures_are_generated_and_pre_io() {
     let (provider, handle) = FakeRealtimeProvider::realtime("fake", drop_channel().0);
     let subscribe_count = handle.subscribe_count.clone();
@@ -710,6 +803,8 @@ async fn replay_cursor_failures_are_generated_and_pre_io() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn replay_expiry_matrix_reports_observed_retention_without_data_leaks() {
+    use tokio_stream::StreamExt;
+
     let (provider, handle) = FakeRealtimeProvider::realtime("fake", drop_channel().0);
     let app = app_with(vec![Arc::new(provider)], 15_000);
     let response = app
@@ -748,12 +843,14 @@ async fn replay_expiry_matrix_reports_observed_retention_without_data_leaks() {
     assert!(!future_body.to_string().contains("sensitive-retained-first"));
 
     let mut newest_frame = first_frame.clone();
+    let mut retained_frames = Vec::with_capacity(512);
     for index in 0..512 {
         handle.emit(&sample_message(
             "00000000-0000-0000-0000-000000000052",
             &format!("retained-{index}"),
         ));
         newest_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+        retained_frames.push(newest_frame.clone());
     }
     assert_eq!(cursor_sequence(&newest_frame.0), 513);
 
@@ -782,14 +879,84 @@ async fn replay_expiry_matrix_reports_observed_retention_without_data_leaks() {
             .contains("sensitive-retained-first")
     );
 
-    // The newest retained cursor is valid and must produce an empty replay;
-    // the first message after registration is the explicitly appended live
-    // event, not an accidental replay of the newest retained item.
+    // Reconnect from the reported oldest retained cursor before accepting any
+    // further event. A concurrent bounded drain proves the complete suffix is
+    // delivered and a controlled live sentinel follows it exactly once.
+    assert_eq!(oldest, retained_frames[0].0);
+    let expected_replay = retained_frames[1..].to_vec();
+    let rollover_live = sample_message_with_id(
+        "00000000-0000-0000-0000-000000000054",
+        "rollover-live-sentinel",
+        "00000000-0000-0000-0000-000000000154",
+    );
+    let rollover_live_wire = serde_json::to_string(&rollover_live).expect("rollover live JSON");
+    let (replay_done_tx, replay_done_rx) = oneshot::channel();
+    let (sentinel_seen_tx, sentinel_seen_rx) = oneshot::channel();
+    let (finish_tx, finish_rx) = oneshot::channel();
+    let rollover_response = app
+        .clone()
+        .oneshot(event_request(&format!(
+            "/v1/events?provider=fake&cursor={oldest}"
+        )))
+        .await
+        .expect("oldest-retained reconnect response");
+    assert_eq!(rollover_response.status(), StatusCode::OK);
+    let mut rollover = rollover_response.into_body().into_data_stream();
+    let collector = tokio::spawn(async move {
+        assert!(
+            next_sse_chunk(&mut rollover)
+                .await
+                .starts_with(b": stream open")
+        );
+        let mut replayed = Vec::with_capacity(expected_replay.len());
+        for expected in expected_replay {
+            let actual = message_frame_from_chunk(&next_sse_chunk(&mut rollover).await);
+            assert_eq!(actual, expected);
+            replayed.push(actual);
+        }
+        replay_done_tx
+            .send(())
+            .expect("replay drain barrier receiver remains live");
+        let live = message_frame_from_chunk(&next_sse_chunk(&mut rollover).await);
+        sentinel_seen_tx
+            .send(())
+            .expect("sentinel barrier receiver remains live");
+        finish_rx.await.expect("finish barrier sender remains live");
+        let extra = tokio::time::timeout(Duration::from_secs(2), rollover.next())
+            .await
+            .expect("rollover stream reaches its controlled end");
+        assert!(extra.is_none(), "rollover replay contained an extra frame");
+        drop(rollover);
+        (replayed, live)
+    });
+    replay_done_rx
+        .await
+        .expect("oldest-retained replay drain completes");
+    handle.emit(&rollover_live);
+    sentinel_seen_rx
+        .await
+        .expect("oldest-retained sentinel arrives");
+    drop(keeper);
+    handle.end();
+    finish_tx
+        .send(())
+        .expect("finish barrier receiver remains live");
+    let (rollover_replayed, rollover_live_frame) =
+        collector.await.expect("oldest-retained replay collector");
+    assert_eq!(rollover_replayed.len(), 511);
+    assert_eq!(rollover_live_frame.1, rollover_live_wire);
+    assert_eq!(
+        cursor_sequence(&rollover_live_frame.0),
+        cursor_sequence(oldest) + 512
+    );
+
+    // The newest cursor is now the controlled live sentinel. It must produce
+    // an empty replay, then the next explicitly appended event.
     let newest_response = app
         .clone()
         .oneshot(event_request(&format!(
             "/v1/events?provider=fake&cursor={}",
-            newest_frame.0
+            rollover_live_frame.0
         )))
         .await
         .expect("newest-cursor response");
@@ -806,7 +973,7 @@ async fn replay_expiry_matrix_reports_observed_retention_without_data_leaks() {
     ));
     let live_frame = message_frame_from_chunk(&next_sse_chunk(&mut newest).await);
     assert!(live_frame.1.contains("\"body\":\"newest-cursor-live\""));
-    assert_eq!(cursor_sequence(&live_frame.0), 514);
+    assert_eq!(cursor_sequence(&live_frame.0), 515);
 
     // A new app is a new process incarnation with an empty retained history.
     // The old cursor is valid syntax but must not open a stream or expose the
@@ -834,7 +1001,6 @@ async fn replay_expiry_matrix_reports_observed_retention_without_data_leaks() {
 
     handle.end();
     restarted_handle.end();
-    drop(keeper);
     drop(newest);
 }
 
@@ -1639,6 +1805,119 @@ async fn cursor_eviction_during_readiness_returns_expiry_and_rolls_back_demand()
             .expect("retry registration joins its provider stream")
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn successful_registration_boundary_replays_active_event_and_then_live() {
+    use tokio_stream::StreamExt;
+
+    let (entered_tx, mut entered_rx) = mpsc::channel(1);
+    let release = Arc::new(Notify::new());
+    let (active, active_handle) = FakeRealtimeProvider::realtime("active", drop_channel().0);
+    let (delayed, delayed_handle) =
+        FakeRealtimeProvider::delayed("delayed", drop_channel().0, entered_tx, release.clone());
+    let app = app_with(vec![Arc::new(active), Arc::new(delayed)], 15_000);
+
+    // Keep one provider active while the aggregate reconnect prepares its
+    // second provider. This gives the boundary a real retained/live source.
+    let keeper_response = app
+        .clone()
+        .oneshot(event_request("/v1/events?provider=active"))
+        .await
+        .expect("active keeper response");
+    let mut keeper = keeper_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut keeper)
+            .await
+            .starts_with(b": stream open")
+    );
+
+    let anchor = sample_message_with_id(
+        "00000000-0000-0000-0000-000000000091",
+        "registration-anchor",
+        "00000000-0000-0000-0000-000000000191",
+    );
+    let anchor_wire = serde_json::to_string(&anchor).expect("anchor JSON");
+    active_handle.emit(&anchor);
+    let anchor_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+    assert_eq!(anchor_frame.1, anchor_wire);
+
+    let pending_app = app.clone();
+    let pending_cursor = anchor_frame.0.clone();
+    let pending = tokio::spawn(async move {
+        pending_app
+            .oneshot(event_request(&format!(
+                "/v1/events?cursor={pending_cursor}"
+            )))
+            .await
+            .expect("aggregate reconnect response")
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("delayed provider readiness begins")
+            .is_some()
+    );
+
+    // This event is accepted while the second provider is still preparing. It
+    // must be in the atomic replay snapshot, not lost between preflight and
+    // registration.
+    let during = sample_message_with_id(
+        "00000000-0000-0000-0000-000000000092",
+        "during-registration",
+        "00000000-0000-0000-0000-000000000192",
+    );
+    let during_wire = serde_json::to_string(&during).expect("during-registration JSON");
+    active_handle.emit(&during);
+    let during_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+    assert_eq!(during_frame.1, during_wire);
+    assert_eq!(
+        cursor_sequence(&during_frame.0),
+        cursor_sequence(&anchor_frame.0) + 1
+    );
+
+    release.notify_one();
+    let aggregate_response = pending.await.expect("aggregate reconnect task");
+    assert_eq!(aggregate_response.status(), StatusCode::OK);
+    assert_eq!(delayed_handle.subscribe_count.load(Ordering::SeqCst), 1);
+    let mut aggregate = aggregate_response.into_body().into_data_stream();
+    assert!(
+        next_sse_chunk(&mut aggregate)
+            .await
+            .starts_with(b": stream open")
+    );
+    assert_eq!(
+        message_frame_from_chunk(&next_sse_chunk(&mut aggregate).await),
+        during_frame
+    );
+
+    let after = sample_message_with_id(
+        "00000000-0000-0000-0000-000000000093",
+        "after-registration",
+        "00000000-0000-0000-0000-000000000193",
+    );
+    let after_wire = serde_json::to_string(&after).expect("after-registration JSON");
+    active_handle.emit(&after);
+    let after_keeper_frame = message_frame_from_chunk(&next_sse_chunk(&mut keeper).await);
+    let after_frame = message_frame_from_chunk(&next_sse_chunk(&mut aggregate).await);
+    assert_eq!(after_keeper_frame.1, after_wire);
+    assert_eq!(after_frame, after_keeper_frame);
+    assert_eq!(
+        cursor_sequence(&after_frame.0),
+        cursor_sequence(&during_frame.0) + 1
+    );
+
+    drop(keeper);
+    active_handle.end();
+    delayed_handle.end();
+    let extra = tokio::time::timeout(Duration::from_secs(2), aggregate.next())
+        .await
+        .expect("registration-boundary stream reaches its controlled end");
+    assert!(
+        extra.is_none(),
+        "registration-boundary replay contained an extra frame"
+    );
+    drop(aggregate);
 }
 
 #[tokio::test]
