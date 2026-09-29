@@ -1,0 +1,84 @@
+name: Bootstrap npm package (one-time)
+
+# One-time, manual bootstrap for packages that don't yet exist on npm.
+# OIDC trusted publishing cannot create a package's first version
+# (npm/cli#8544), so this is the ONLY workflow allowed to use a
+# long-lived NPM_TOKEN, and only via the protected `npm-bootstrap`
+# environment (required reviewer approval + branches limited to main).
+# After the first publish, register the trusted publisher on npmjs.com
+# and never use this workflow again for the package.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_dir:
+        description: "Package directory (e.g. generated/ts-client)"
+        required: true
+      version:
+        description: "Version to publish (e.g. 0.4.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    environment: npm-bootstrap
+    steps:
+      - name: Guard — package must not already exist on npm
+        run: |
+          PKG=$(jq -r '.name' "${{ inputs.package_dir }}/package.json")
+          if npm view "$PKG" version >/dev/null 2>&1; then
+            echo "::error::$PKG already exists on npm. Use release.yml (OIDC) instead."
+            exit 1
+          fi
+          echo "bootstrapping $PKG"
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: ${{ inputs.package_dir }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.package_dir }}
+        run: npm ci --ignore-scripts
+
+      - name: Set bootstrap version
+        working-directory: ${{ inputs.package_dir }}
+        run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Verify and build
+        working-directory: ${{ inputs.package_dir }}
+        run: |
+          npm run typecheck
+          npm run build
+
+      - name: Publish bootstrap version (token, one time only)
+        working-directory: ${{ inputs.package_dir }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+      - name: Next steps
+        env:
+          PKG: ${{ inputs.package_dir }}
+        run: |
+          NAME=$(jq -r '.name' "$PKG/package.json")
+          {
+            echo "## Bootstrap complete: \`$NAME\`"
+            echo ""
+            echo "Before the next release:"
+            echo "1. Visit https://www.npmjs.com/package/$NAME/access"
+            echo "2. Trusted Publishers → GitHub Actions → repo \`TechGodHQ/iris\`,"
+            echo "   workflow \`release.yml\`, allow \`npm publish\`."
+            echo "3. (Recommended) Publishing access → Require 2FA and disallow tokens."
+            echo "4. Delete the NPM_TOKEN secret from the \`npm-bootstrap\` environment."
+            echo "From then on, tag-triggered release.yml publishes autonomously via OIDC."
+          } >> "$GITHUB_STEP_SUMMARY"
