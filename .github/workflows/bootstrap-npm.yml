@@ -26,17 +26,17 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm-bootstrap
     steps:
-      - name: Guard — package must not already exist on npm
-        run: |
-          PKG=$(jq -r '.name' "${{ inputs.package_dir }}/package.json")
-          if npm view "$PKG" version >/dev/null 2>&1; then
-            echo "::error::$PKG already exists on npm. Use release.yml (OIDC) instead."
-            exit 1
-          fi
-          echo "bootstrapping $PKG"
-
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Guard — package must not already exist on npm
+        run: |
+          PKG_NAME=$(jq -r '.name' "${{ inputs.package_dir }}/package.json")
+          if npm view "$PKG_NAME" version >/dev/null 2>&1; then
+            echo "::error::$PKG_NAME already exists on npm. Use release.yml (OIDC) instead."
+            exit 1
+          fi
+          echo "bootstrapping $PKG_NAME"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
