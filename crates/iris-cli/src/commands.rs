@@ -45,7 +45,15 @@ fn get_providers_from_path(
 
 /// Execute a generated API operation command.
 pub async fn execute_generated(command: generated::GeneratedCommand) -> anyhow::Result<()> {
-    execute_generated_operation(command.operation_name(), command.parameters_json()).await
+    match command {
+        // `include_cursor` is intentionally CLI-only and therefore omitted by
+        // `parameters_json()`. Keep the typed generated argument here so the
+        // runtime can honor the output mode without leaking it into HTTP.
+        generated::GeneratedCommand::Watch(args) => subscribe_events(args).await,
+        command => {
+            execute_generated_operation(command.operation_name(), command.parameters_json()).await
+        }
+    }
 }
 
 async fn execute_generated_operation(
@@ -274,7 +282,8 @@ async fn ingest_batch(args: generated::IngestBatchArgs) -> anyhow::Result<()> {
 ///
 /// Streams `GET /v1/events` from `IRIS_SERVER_URL` (default
 /// `http://127.0.0.1:3000`): every `message` JSON is written unchanged as
-/// one stdout line (JSONL), `error` diagnostics go to stderr, and the
+/// one stdout line by default, or as a `{cursor, message}` checkpoint envelope
+/// with `--include-cursor`; `error` diagnostics go to stderr, and the
 /// process exits non-zero when the selected stream or all aggregate
 /// branches terminate in error. See [`crate::watch`].
 async fn subscribe_events(args: generated::WatchArgs) -> anyhow::Result<()> {
