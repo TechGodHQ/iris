@@ -250,6 +250,40 @@ the same hub does not make it durable. This documentation does not add outbound
 persistence or echo/replay of outbound messages through list or event-stream
 surfaces, or an exactly-once send guarantee.
 
+### Streaming with `iris watch`
+
+The generated `iris watch` command consumes the existing SSE operation. Its
+`--provider` and `--thread-id` filters are exact matches, `--cursor` resumes
+from an opaque server-issued replay cursor, and `--include-cursor` selects a
+checkpoint-friendly output envelope:
+
+```bash
+# Backwards-compatible message-only JSONL (the default)
+iris watch --provider telegram
+
+# Save the cursor-bearing JSONL envelopes for caller-owned checkpoint storage
+iris watch --provider telegram --include-cursor
+
+# Resume after the last cursor your consumer durably saved
+iris watch --provider telegram --cursor '<saved-cursor>' --include-cursor
+```
+
+Without `--include-cursor`, each stdout line is the unchanged normalized
+message object. With it, each line is
+`{"cursor":"<server-cursor>","message":<unchanged-message>}`. The CLI does
+not persist checkpoints, invent a cursor, or retry a failed reconnect; the
+consumer owns storage and must choose whether to resume, discard an expired
+cursor, or perform another explicit recovery flow.
+
+Replay is process-local and retained in a bounded 512-entry server buffer. A
+malformed cursor returns HTTP 400 (`invalid_replay_cursor`); a cursor from a
+restart or one that has aged out returns HTTP 409 (`replay_cursor_expired`).
+Expiry is explicit: Iris does not silently downgrade a failed resume to a
+future-only stream. Retention is not durable history and does not promise
+exactly-once delivery across expiry, restart, or a consumer losing its saved
+checkpoint. No event accepted while nobody is subscribed is promised as a
+replayable event.
+
 ## Architecture
 
 ```

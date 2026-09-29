@@ -2,10 +2,11 @@
 //!
 //! Connects to `IRIS_SERVER_URL` (default `http://127.0.0.1:3000`), parses
 //! SSE frames from `GET /v1/events`, writes every `message` JSON unchanged
-//! as one stdout line (JSONL), writes `error` diagnostics to stderr, and
-//! applies the exit policy: non-zero when the selected (provider-filtered)
-//! stream terminates in error, or when the unfiltered aggregate's last
-//! branch terminates in error.
+//! as one stdout line (JSONL), or wraps each message with its server-issued
+//! cursor when `--include-cursor` is selected. It writes `error` diagnostics
+//! to stderr and applies the exit policy: non-zero when the selected
+//! (provider-filtered) stream terminates in error, or when the unfiltered
+//! aggregate's last branch terminates in error.
 
 use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
@@ -57,10 +58,20 @@ pub fn server_url_from_env(env: Option<&str>) -> String {
 /// One parsed SSE frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SseFrame {
-    /// `event: message` with raw JSON data.
-    Message(String),
-    /// `event: error` with raw JSON data.
-    Error(String),
+    /// `event: message` with its frame-local SSE ID and raw JSON data.
+    Message {
+        /// The `id:` field on this frame, if one was present.
+        id: Option<String>,
+        /// The raw JSON data payload.
+        data: String,
+    },
+    /// `event: error` with its frame-local SSE ID and raw JSON data.
+    Error {
+        /// The `id:` field on this frame, if one was present.
+        id: Option<String>,
+        /// The raw JSON error payload.
+        data: String,
+    },
     /// A comment line (`: …`), e.g. heartbeats.
     Comment,
 }
@@ -73,8 +84,11 @@ pub enum SseFrame {
 /// and join with `\n`. Lines starting with `:` are comments.
 #[derive(Debug, Default)]
 pub struct SseParser {
-    buffer: String,
+    /// Bytes are buffered until a complete line is available so a UTF-8 code
+    /// point split across HTTP chunks is decoded exactly once.
+    buffer: Vec<u8>,
     event: Option<String>,
+    id: Option<String>,
     data_lines: Vec<String>,
     /// Whether a comment line arrived since the last yielded frame.
     pending_comment: bool,
@@ -89,29 +103,38 @@ impl SseParser {
 
     /// Feed raw bytes; return every complete frame they closed.
     ///
-    /// Lines may end with LF, CRLF, or a lone CR (SSE spec). A CR is a
-    /// terminator immediately: if it turns out to be the first half of a
-    /// CRLF pair, the leftover LF reads as a blank line, which dispatches
-    /// the accumulated frame at exactly the point CRLF would have. This
-    /// keeps a server that pauses right after a bare CR from stalling the
-    /// parser.
+    /// Lines may end with LF, CRLF, or a lone CR (SSE spec). A CR at the end of
+    /// one HTTP chunk is retained until the next chunk so a split CRLF pair does
+    /// not dispatch a spurious empty event; a CR followed by any other byte is
+    /// treated as a lone-CR terminator.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        self.buffer.extend_from_slice(chunk);
         let mut frames = Vec::new();
-        while let Some(pos) = self.buffer.find(['\r', '\n']) {
-            let bytes = self.buffer.as_bytes();
-            let is_cr = bytes[pos] == b'\r';
-            let crlf = is_cr && bytes.get(pos + 1) == Some(&b'\n');
+        while let Some(pos) = self
+            .buffer
+            .iter()
+            .position(|byte| *byte == b'\r' || *byte == b'\n')
+        {
+            let is_cr = self.buffer[pos] == b'\r';
+            // A CR at the end of an HTTP chunk may be the first half of CRLF.
+            // Keep it until the next chunk so the following LF does not look
+            // like a separate empty event and clear the pending frame ID.
+            if is_cr && pos + 1 == self.buffer.len() {
+                break;
+            }
+            let crlf = is_cr && self.buffer.get(pos + 1) == Some(&b'\n');
             let terminator_len = usize::from(crlf) + 1;
-            let line: String = self.buffer.drain(..pos + terminator_len).collect();
-            let line = line.trim_end_matches(['\r', '\n']);
-            self.feed_line(line, &mut frames);
+            let line_with_terminator: Vec<u8> = self.buffer.drain(..pos + terminator_len).collect();
+            self.feed_line(
+                &line_with_terminator[..line_with_terminator.len() - terminator_len],
+                &mut frames,
+            );
         }
         frames
     }
 
     /// Process one complete line.
-    fn feed_line(&mut self, line: &str, frames: &mut Vec<SseFrame>) {
+    fn feed_line(&mut self, line: &[u8], frames: &mut Vec<SseFrame>) {
         if line.is_empty() {
             if let Some(frame) = self.take_frame() {
                 frames.push(frame);
@@ -121,18 +144,23 @@ impl SseParser {
             }
             return;
         }
-        if let Some(comment) = line.strip_prefix(':') {
-            let _ = comment;
+        if line.first() == Some(&b':') {
             self.pending_comment = true;
             return;
         }
-        let (field, value) = match line.split_once(':') {
-            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
-            None => (line, ""),
-        };
+        let (field, mut value) = line.iter().position(|byte| *byte == b':').map_or_else(
+            || (line, &[][..]),
+            |index| (&line[..index], &line[index + 1..]),
+        );
+        if value.first() == Some(&b' ') {
+            value = &value[1..];
+        }
         match field {
-            "event" => self.event = Some(value.to_string()),
-            "data" => self.data_lines.push(value.to_string()),
+            b"event" => self.event = Some(String::from_utf8_lossy(value).into_owned()),
+            b"data" => self
+                .data_lines
+                .push(String::from_utf8_lossy(value).into_owned()),
+            b"id" => self.id = Some(String::from_utf8_lossy(value).into_owned()),
             _ => {}
         }
     }
@@ -142,7 +170,12 @@ impl SseParser {
         let mut frames = Vec::new();
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
-            self.feed_line(line.trim_end_matches(['\r', '\n']), &mut frames);
+            let line = if line.last() == Some(&b'\r') {
+                &line[..line.len() - 1]
+            } else {
+                &line[..]
+            };
+            self.feed_line(line, &mut frames);
         }
         if let Some(frame) = self.take_frame() {
             frames.push(frame);
@@ -156,14 +189,16 @@ impl SseParser {
     /// Consume accumulated fields into one frame, if there is data.
     fn take_frame(&mut self) -> Option<SseFrame> {
         let event = self.event.take().unwrap_or_else(|| "message".into());
-        if self.data_lines.is_empty() {
+        let id = self.id.take();
+        let data_lines = std::mem::take(&mut self.data_lines);
+        if data_lines.is_empty() {
             return None;
         }
-        let data = self.data_lines.join("\n");
-        self.data_lines.clear();
+        self.pending_comment = false;
+        let data = data_lines.join("\n");
         match event.as_str() {
-            "message" => Some(SseFrame::Message(data)),
-            "error" => Some(SseFrame::Error(data)),
+            "message" => Some(SseFrame::Message { id, data }),
+            "error" => Some(SseFrame::Error { id, data }),
             _ => None,
         }
     }
@@ -171,10 +206,11 @@ impl SseParser {
 
 /// Streaming watch core against explicit IO — the testable seam.
 ///
-/// Writes every `message` JSON line to `out`, `error` diagnostics to
-/// `err`, and returns the exit code: success on clean end, non-zero when
-/// the exit policy fires (a filtered stream's error, or the unfiltered
-/// aggregate ending in error).
+/// Writes every `message` JSON line to `out` (or a cursor envelope when
+/// requested), `error` diagnostics to `err`, and returns the exit code:
+/// success on clean end, non-zero when the exit policy fires (a filtered
+/// stream's error, an invalid checkpoint frame, or the unfiltered aggregate
+/// ending in error).
 ///
 /// # Errors
 /// Returns an error for connection/request failures only, not for stream
@@ -197,6 +233,9 @@ where
     if let Some(thread_id) = &args.thread_id {
         request = request.query(&[("thread_id", thread_id)]);
     }
+    if let Some(cursor) = &args.cursor {
+        request = request.query(&[("cursor", cursor)]);
+    }
 
     let response = request.send().await?;
     let status = response.status();
@@ -216,13 +255,31 @@ where
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         for frame in parser.feed(&chunk) {
-            if handle_frame(frame, filtered, &mut out, &mut err, &mut ended_in_error).await? {
+            if handle_frame(
+                frame,
+                filtered,
+                args.include_cursor,
+                &mut out,
+                &mut err,
+                &mut ended_in_error,
+            )
+            .await?
+            {
                 return Ok(std::process::ExitCode::from(WATCH_EXIT_ERROR));
             }
         }
     }
     for frame in parser.finish() {
-        if handle_frame(frame, filtered, &mut out, &mut err, &mut ended_in_error).await? {
+        if handle_frame(
+            frame,
+            filtered,
+            args.include_cursor,
+            &mut out,
+            &mut err,
+            &mut ended_in_error,
+        )
+        .await?
+        {
             return Ok(std::process::ExitCode::from(WATCH_EXIT_ERROR));
         }
     }
@@ -240,6 +297,7 @@ where
 async fn handle_frame<W, E>(
     frame: SseFrame,
     filtered: bool,
+    include_cursor: bool,
     out: &mut W,
     err: &mut E,
     ended_in_error: &mut bool,
@@ -249,11 +307,35 @@ where
     E: Send + Unpin + tokio::io::AsyncWrite,
 {
     match frame {
-        SseFrame::Message(data) => {
+        SseFrame::Message { id, data } => {
             *ended_in_error = false;
-            write_line(out, &data).await?;
+            if include_cursor {
+                let Some(cursor) = id.filter(|id| !id.is_empty()) else {
+                    write_line(
+                        err,
+                        "watch: message frame has no non-empty SSE cursor; refusing to emit a checkpoint",
+                    )
+                    .await?;
+                    return Ok(true);
+                };
+                let Ok(message) = serde_json::from_str::<serde_json::Value>(&data) else {
+                    write_line(
+                        err,
+                        "watch: message frame is not valid JSON; refusing to emit a checkpoint",
+                    )
+                    .await?;
+                    return Ok(true);
+                };
+                let envelope = serde_json::json!({
+                    "cursor": cursor,
+                    "message": message,
+                });
+                write_line(out, &serde_json::to_string(&envelope)?).await?;
+            } else {
+                write_line(out, &data).await?;
+            }
         }
-        SseFrame::Error(data) => {
+        SseFrame::Error { id: _, data } => {
             *ended_in_error = true;
             write_line(err, &format!("watch: error frame: {data}")).await?;
             // A provider-filtered stream closes after its error.
@@ -292,9 +374,82 @@ mod tests {
         assert_eq!(
             frames,
             vec![
-                SseFrame::Message("{\"body\":\"hi\"}".into()),
-                SseFrame::Error("{\"code\":\"slow_consumer\"}".into()),
+                SseFrame::Message {
+                    id: None,
+                    data: "{\"body\":\"hi\"}".into(),
+                },
+                SseFrame::Error {
+                    id: None,
+                    data: "{\"code\":\"slow_consumer\"}".into(),
+                },
             ]
+        );
+    }
+
+    /// The last repeated `id:` field wins, and the ID is attached only to its
+    /// own frame.
+    #[test]
+    fn parser_retains_the_frame_id_and_last_id_wins() {
+        let mut parser = SseParser::new();
+        assert_eq!(
+            parser.feed(b"id: first\nid: second\ndata: {\"body\":\"hi\"}\n\n"),
+            vec![SseFrame::Message {
+                id: Some("second".into()),
+                data: "{\"body\":\"hi\"}".into(),
+            }]
+        );
+    }
+
+    /// Empty IDs and error frames must not leak into the next message frame.
+    #[test]
+    fn parser_resets_ids_between_message_and_error_frames() {
+        let mut parser = SseParser::new();
+        assert_eq!(
+            parser.feed(
+                b"id: first\ndata: {\"body\":\"one\"}\n\nid:\nevent: error\ndata: {\"code\":\"bad\"}\n\ndata: {\"body\":\"two\"}\n\n"
+            ),
+            vec![
+                SseFrame::Message {
+                    id: Some("first".into()),
+                    data: "{\"body\":\"one\"}".into(),
+                },
+                SseFrame::Error {
+                    id: Some(String::new()),
+                    data: "{\"code\":\"bad\"}".into(),
+                },
+                SseFrame::Message {
+                    id: None,
+                    data: "{\"body\":\"two\"}".into(),
+                },
+            ]
+        );
+    }
+
+    /// A code point split across transport chunks and a CRLF split at the
+    /// chunk boundary must both survive unchanged.
+    #[test]
+    fn parser_preserves_split_utf8_and_crlf() {
+        let wire = "id: cursor-1\r\ndata: {\"body\":\"héllo\\n世界\"}\r\n\r\n";
+        let bytes = wire.as_bytes();
+        let first_cr = bytes
+            .iter()
+            .position(|byte| *byte == b'\r')
+            .expect("first CRLF");
+        let rest = &bytes[first_cr + 1..];
+        let utf8_split = rest
+            .windows(2)
+            .position(|pair| pair == "é".as_bytes())
+            .expect("accented code point")
+            + 1;
+        let mut parser = SseParser::new();
+        assert!(parser.feed(&bytes[..=first_cr]).is_empty());
+        assert!(parser.feed(&rest[..utf8_split]).is_empty());
+        assert_eq!(
+            parser.feed(&rest[utf8_split..]),
+            vec![SseFrame::Message {
+                id: Some("cursor-1".into()),
+                data: "{\"body\":\"héllo\\n世界\"}".into(),
+            }]
         );
     }
 
@@ -306,7 +461,10 @@ mod tests {
         assert!(parser.feed(b"sage\ndata: {\"a\":").is_empty());
         assert_eq!(
             parser.feed(b"1}\n\n"),
-            vec![SseFrame::Message("{\"a\":1}".into())]
+            vec![SseFrame::Message {
+                id: None,
+                data: "{\"a\":1}".into(),
+            }]
         );
     }
 
@@ -323,7 +481,10 @@ mod tests {
         let mut parser = SseParser::new();
         assert_eq!(
             parser.feed(b"data: {\"x\":true}\n\n"),
-            vec![SseFrame::Message("{\"x\":true}".into())]
+            vec![SseFrame::Message {
+                id: None,
+                data: "{\"x\":true}".into(),
+            }]
         );
     }
 
@@ -333,7 +494,10 @@ mod tests {
         let mut parser = SseParser::new();
         assert_eq!(
             parser.feed(b"data: line1\ndata: line2\n\n"),
-            vec![SseFrame::Message("line1\nline2".into())]
+            vec![SseFrame::Message {
+                id: None,
+                data: "line1\nline2".into(),
+            }]
         );
     }
 
@@ -348,7 +512,10 @@ mod tests {
         );
         assert_eq!(
             parser.finish(),
-            vec![SseFrame::Error("{\"code\":\"provider_failed\"}".into())]
+            vec![SseFrame::Error {
+                id: None,
+                data: "{\"code\":\"provider_failed\"}".into(),
+            }]
         );
     }
 
@@ -359,7 +526,10 @@ mod tests {
         assert!(parser.feed(b"event: message\r").is_empty());
         assert_eq!(
             parser.feed(b"data: {\"ok\":1}\n\n"),
-            vec![SseFrame::Message("{\"ok\":1}".into())]
+            vec![SseFrame::Message {
+                id: None,
+                data: "{\"ok\":1}".into(),
+            }]
         );
     }
 
@@ -406,6 +576,79 @@ mod tests {
         assert!(stdout.contains("\"body\":\"e2e body\""), "stdout: {stdout}");
         assert!(stdout.contains('\n'), "JSONL: one line per message");
         assert!(stderr.is_empty(), "stderr: {stderr}");
+    }
+
+    /// Opt-in output carries the server-issued SSE ID without changing the
+    /// message object.
+    #[tokio::test]
+    async fn watch_include_cursor_emits_a_checkpoint_envelope() {
+        let (addr, _flag) = spawn_test_server(Ending::Clean).await;
+        let args = WatchArgs {
+            provider: None,
+            thread_id: None,
+            cursor: None,
+            include_cursor: true,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = watch_with_io(
+            &args,
+            &format!("http://{addr}"),
+            &reqwest::Client::new(),
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+        let values: Vec<serde_json::Value> = out
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("checkpoint JSONL"))
+            .collect();
+        assert!(
+            !values.is_empty(),
+            "stdout: {}",
+            String::from_utf8_lossy(&out)
+        );
+        let value = &values[0];
+        assert!(
+            value["cursor"]
+                .as_str()
+                .is_some_and(|cursor| !cursor.is_empty()),
+            "value: {value}"
+        );
+        assert_eq!(value["message"]["body"], "wrong thread");
+        assert!(values.iter().all(|value| value["message"].is_object()));
+        assert!(err.is_empty(), "stderr: {}", String::from_utf8_lossy(&err));
+    }
+
+    /// A message without an ID cannot be represented as a resumable success.
+    #[tokio::test]
+    async fn include_cursor_rejects_a_message_without_an_id() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut ended_in_error = false;
+        let should_exit = handle_frame(
+            SseFrame::Message {
+                id: None,
+                data: "{\"body\":\"no cursor\"}".into(),
+            },
+            false,
+            true,
+            &mut out,
+            &mut err,
+            &mut ended_in_error,
+        )
+        .await
+        .unwrap();
+        assert!(should_exit);
+        assert!(out.is_empty());
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("no non-empty SSE cursor")
+        );
     }
 
     /// An error followed by a later message (another branch outlived it)
