@@ -86,8 +86,21 @@ jobs:
           npm run typecheck
           npm run build
 
+      - name: Check whether this version is already published
+        id: published
+        working-directory: generated/ts-client
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if npm view "@techgodhq/iris-client@$version" version >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "@techgodhq/iris-client@$version already on npm — skipping publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish public npm package (OIDC trusted publishing)
         working-directory: generated/ts-client
         # OIDC trusted publishing: no NODE_AUTH_TOKEN here on purpose — its
         # presence would make npm fall back to token auth and skip OIDC.
+        if: steps.published.outputs.skip != 'true'
         run: npm publish --access public
