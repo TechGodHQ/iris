@@ -1,5 +1,5 @@
 {
-  "name": "@techgodhq/iris-client",
+  "name": "@techgod/iris-client",
   "version": "0.1.0",
   "description": "Generated TypeScript fetch client for Iris.",
   "license": "MIT",
