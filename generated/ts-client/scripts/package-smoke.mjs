@@ -44,7 +44,7 @@ try {
         private: true,
         type: "module",
         dependencies: {
-          "@techgodhq/iris-client": `file:${dependencyPath}`,
+          "@techgod/iris-client": `file:${dependencyPath}`,
         },
       },
       null,
@@ -72,7 +72,7 @@ try {
   );
   await writeFile(
     join(consumer, "smoke.ts"),
-    `import { IrisClient, type ListThreadsResult } from "@techgodhq/iris-client";\n\nconst client = new IrisClient({ baseUrl: "http://127.0.0.1:9876" });\nconst typedCall = (value: IrisClient): Promise<ListThreadsResult> =>\n  value.listThreads({ limit: 1 });\nvoid typedCall;\nvoid client;\n`,
+    `import { IrisClient, type ListThreadsResult } from "@techgod/iris-client";\n\nconst client = new IrisClient({ baseUrl: "http://127.0.0.1:9876" });\nconst typedCall = (value: IrisClient): Promise<ListThreadsResult> =>\n  value.listThreads({ limit: 1 });\nvoid typedCall;\nvoid client;\n`,
   );
 
   run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], consumer);
@@ -85,7 +85,7 @@ try {
   run(tsc, ["--project", "tsconfig.json", "--pretty", "false"], consumer);
 
   const runtimeProbe = `
-const pkg = await import("@techgodhq/iris-client");
+const pkg = await import("@techgod/iris-client");
 if (typeof pkg.IrisClient !== "function") throw new Error("IrisClient export missing");
 const baseUrl = process.env.IRIS_URL;
 if (!baseUrl) {

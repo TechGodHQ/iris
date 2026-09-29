@@ -43,11 +43,11 @@ from the same `api/operations.yaml` contract. Release tags publish the package
 with the matching Iris version:
 
 ```bash
-npm install @techgodhq/iris-client
+npm install @techgod/iris-client
 ```
 
 ```ts
-import { IrisClient } from "@techgodhq/iris-client";
+import { IrisClient } from "@techgod/iris-client";
 
 const client = new IrisClient({
   baseUrl: process.env.IRIS_URL ?? "http://127.0.0.1:9876",

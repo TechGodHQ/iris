@@ -91,9 +91,9 @@ jobs:
         working-directory: generated/ts-client
         run: |
           version=$(node -p "require('./package.json').version")
-          if npm view "@techgodhq/iris-client@$version" version >/dev/null 2>&1; then
+          if npm view "@techgod/iris-client@$version" version >/dev/null 2>&1; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "@techgodhq/iris-client@$version already on npm — skipping publish"
+            echo "@techgod/iris-client@$version already on npm — skipping publish"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi

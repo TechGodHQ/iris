@@ -1,4 +1,4 @@
-# `@techgodhq/iris-client`
+# `@techgod/iris-client`
 
 The generated, zero-runtime-dependency TypeScript fetch client for
 [Iris](https://github.com/TechGodHQ/iris). The module is projected from Iris's
@@ -7,7 +7,7 @@ The generated, zero-runtime-dependency TypeScript fetch client for
 ## Install
 
 ```bash
-npm install @techgodhq/iris-client
+npm install @techgod/iris-client
 ```
 
 The package version is aligned with the Iris release tag that published it.
@@ -17,7 +17,7 @@ fetch implementation for tests or custom runtimes.
 ## Use
 
 ```ts
-import { IrisClient } from "@techgodhq/iris-client";
+import { IrisClient } from "@techgod/iris-client";
 
 const client = new IrisClient({
   baseUrl: process.env.IRIS_URL ?? "http://127.0.0.1:9876",
