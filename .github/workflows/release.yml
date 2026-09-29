@@ -52,6 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -59,10 +60,13 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
           cache: npm
           cache-dependency-path: generated/ts-client/package-lock.json
+
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
 
       - name: Install SDK dependencies
         working-directory: generated/ts-client
@@ -82,8 +86,8 @@ jobs:
           npm run typecheck
           npm run build
 
-      - name: Publish public npm package
+      - name: Publish public npm package (OIDC trusted publishing)
         working-directory: generated/ts-client
+        # OIDC trusted publishing: no NODE_AUTH_TOKEN here on purpose — its
+        # presence would make npm fall back to token auth and skip OIDC.
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
