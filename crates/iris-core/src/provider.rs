@@ -51,6 +51,9 @@ impl ProviderMetadata {
 /// Providers normalize their source-specific data into Iris's unified model.
 /// The trait is async because all providers involve some form of I/O
 /// (API calls, database queries, webhook processing).
+// Trait methods return `Result`, which is already `#[must_use]`; suppress the
+// redundant-attribute lint that rust 1.99's clippy raises on async traits.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait MessageProvider: Send + Sync {
     /// Static metadata about this provider.

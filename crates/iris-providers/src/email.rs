@@ -1274,7 +1274,7 @@ mod tests {
         let store = test_store();
 
         // Before storage, the URL is a provider pseudo-URL.
-        assert!(!email.attachments.is_empty());
+        assert_ne!(email.attachments, [] as [iris_core::Attachment; 0]);
         assert!(email.attachments[0].url.starts_with("email:message:"));
 
         email
@@ -1312,7 +1312,7 @@ mod tests {
             .store_attachments(&store)
             .await
             .expect("no-op succeeds");
-        assert!(email.attachments.is_empty());
+        assert_eq!(email.attachments, [] as [iris_core::Attachment; 0]);
     }
 
     #[test]
@@ -1510,7 +1510,7 @@ mod tests {
             ..Default::default()
         };
         let selected = select_uids(Vec::new(), &opts, 500);
-        assert!(selected.is_empty());
+        assert_eq!(selected, [] as [u32; 0]);
     }
 
     #[test]

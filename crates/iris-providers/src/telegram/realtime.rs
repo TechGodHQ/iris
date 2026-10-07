@@ -1292,7 +1292,10 @@ mod tests {
             TelegramProvider::with_base_url("123:abc", server.uri(), Arc::new(InMemoryStore))
                 .expect("provider builds");
         let hub = provider.realtime_hub().expect("valid realtime settings");
-        assert!(hub.snapshot_messages(provider.clone()).is_empty());
+        assert_eq!(
+            hub.snapshot_messages(provider.clone()),
+            [] as [iris_core::Message; 0]
+        );
 
         for _ in 0..200 {
             if hub.cursor() == 101 {

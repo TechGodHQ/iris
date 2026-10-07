@@ -437,7 +437,7 @@ mod tests {
             .send_message("thread-7", &OutboundMessage::text("plain"))
             .await
             .expect("text send succeeds");
-        assert!(message.attachments.is_empty());
+        assert_eq!(message.attachments, [] as [iris_core::Attachment; 0]);
         assert_eq!(
             provider.recorded_sends().expect("records readable").len(),
             2

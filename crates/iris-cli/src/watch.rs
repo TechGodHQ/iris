@@ -462,8 +462,8 @@ mod tests {
             .expect("accented code point")
             + 1;
         let mut parser = SseParser::new();
-        assert!(parser.feed(&bytes[..=first_cr]).is_empty());
-        assert!(parser.feed(&rest[..utf8_split]).is_empty());
+        assert_eq!(parser.feed(&bytes[..=first_cr]), Vec::<SseFrame>::new());
+        assert_eq!(parser.feed(&rest[..utf8_split]), Vec::<SseFrame>::new());
         assert_eq!(
             parser.feed(&rest[utf8_split..]),
             vec![SseFrame::Message {
@@ -477,8 +477,8 @@ mod tests {
     #[test]
     fn parser_handles_split_chunks() {
         let mut parser = SseParser::new();
-        assert!(parser.feed(b"event: mes").is_empty());
-        assert!(parser.feed(b"sage\ndata: {\"a\":").is_empty());
+        assert_eq!(parser.feed(b"event: mes"), Vec::<SseFrame>::new());
+        assert_eq!(parser.feed(b"sage\ndata: {\"a\":"), Vec::<SseFrame>::new());
         assert_eq!(
             parser.feed(b"1}\n\n"),
             vec![SseFrame::Message {
@@ -525,10 +525,9 @@ mod tests {
     #[test]
     fn parser_finish_flushes_partial_frame() {
         let mut parser = SseParser::new();
-        assert!(
-            parser
-                .feed(b"event: error\ndata: {\"code\":\"provider_failed\"}")
-                .is_empty()
+        assert_eq!(
+            parser.feed(b"event: error\ndata: {\"code\":\"provider_failed\"}"),
+            Vec::<SseFrame>::new()
         );
         assert_eq!(
             parser.finish(),
@@ -543,7 +542,7 @@ mod tests {
     #[test]
     fn parser_handles_cr_newlines() {
         let mut parser = SseParser::new();
-        assert!(parser.feed(b"event: message\r").is_empty());
+        assert_eq!(parser.feed(b"event: message\r"), Vec::<SseFrame>::new());
         assert_eq!(
             parser.feed(b"data: {\"ok\":1}\n\n"),
             vec![SseFrame::Message {
@@ -572,8 +571,8 @@ mod tests {
     #[test]
     fn parser_split_crlf_does_not_clear_frame_id_or_duplicate_frame() {
         let mut parser = SseParser::new();
-        assert!(parser.feed(b"id: cursor-1\r").is_empty());
-        assert!(parser.feed(&[]).is_empty());
+        assert_eq!(parser.feed(b"id: cursor-1\r"), Vec::<SseFrame>::new());
+        assert_eq!(parser.feed(&[]), Vec::<SseFrame>::new());
         assert_eq!(
             parser.feed(b"\ndata: {\"ok\":1}\r\n\r\n"),
             vec![SseFrame::Message {
@@ -581,7 +580,7 @@ mod tests {
                 data: "{\"ok\":1}".into(),
             }]
         );
-        assert!(parser.finish().is_empty());
+        assert_eq!(parser.finish(), Vec::<SseFrame>::new());
     }
 
     /// The server URL comes from the environment with a sane default.
@@ -694,7 +693,7 @@ mod tests {
         .await
         .unwrap();
         assert!(should_exit);
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<u8>::new());
         assert!(
             String::from_utf8(err)
                 .unwrap()
@@ -771,7 +770,7 @@ mod tests {
             .await
             .unwrap();
             assert!(should_exit);
-            assert!(out.is_empty());
+            assert_eq!(out, Vec::<u8>::new());
             let diagnostic = String::from_utf8(err).unwrap();
             assert!(diagnostic.contains(expected_diagnostic), "{diagnostic}");
             assert!(
@@ -803,7 +802,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!should_exit);
-        assert!(err.is_empty());
+        assert_eq!(err, Vec::<u8>::new());
         let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(value["cursor"], "cursor-1");
         assert_eq!(
