@@ -1,7 +1,7 @@
 //! Compiled-CLI acceptance for replay checkpoints and reconnects.
 
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -19,8 +19,11 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::timeout;
+use tokio_stream::StreamExt;
 
 const THREAD_ID: &str = "00000000-0000-0000-0000-000000000042";
+const OTHER_THREAD_ID: &str = "00000000-0000-0000-0000-000000000043";
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Default)]
 struct Probe {
@@ -33,35 +36,47 @@ struct Probe {
 
 impl Probe {
     async fn wait_until_subscribed(&self) {
-        loop {
-            let notified = self.subscribed.notified();
-            if self.sender.lock().expect("probe sender mutex").is_some() {
-                return;
+        timeout(FIXTURE_TIMEOUT, async {
+            loop {
+                let notified = self.subscribed.notified();
+                if self.sender.lock().expect("probe sender mutex").is_some() {
+                    return;
+                }
+                notified.await;
             }
-            notified.await;
-        }
+        })
+        .await
+        .expect("realtime subscription timeout");
     }
 
     async fn send(&self, message: Message) {
-        self.wait_until_subscribed().await;
-        let target = self.delivered.load(Ordering::SeqCst) + 1;
-        let sender = self
-            .sender
-            .lock()
-            .expect("probe sender mutex")
-            .clone()
-            .expect("realtime sender");
-        sender
-            .send(Ok(message))
-            .await
-            .expect("broker keeps the provider stream open");
-        loop {
-            let notified = self.progress.notified();
-            if self.drained.load(Ordering::SeqCst) >= target {
-                return;
+        timeout(FIXTURE_TIMEOUT, async {
+            self.wait_until_subscribed().await;
+            let target = self.delivered.load(Ordering::SeqCst) + 1;
+            let sender = self
+                .sender
+                .lock()
+                .expect("probe sender mutex")
+                .clone()
+                .expect("realtime sender");
+            sender
+                .send(Ok(message))
+                .await
+                .expect("broker keeps the provider stream open");
+            loop {
+                let notified = self.progress.notified();
+                if self.drained.load(Ordering::SeqCst) >= target {
+                    return;
+                }
+                notified.await;
             }
-            notified.await;
-        }
+        })
+        .await
+        .expect("realtime delivery drain timeout");
+    }
+
+    fn close(&self) {
+        self.sender.lock().expect("probe sender mutex").take();
     }
 }
 
@@ -189,15 +204,19 @@ impl AuditLog for NullAudit {
 }
 
 fn message(id: &str, body: &str, source_id: &str) -> Message {
+    message_for("fake", THREAD_ID, id, body, source_id)
+}
+
+fn message_for(source: &str, thread_id: &str, id: &str, body: &str, source_id: &str) -> Message {
     Message {
         id: uuid::Uuid::parse_str(id).expect("message UUID"),
-        thread_id: uuid::Uuid::parse_str(THREAD_ID).expect("thread UUID"),
-        source: "fake".into(),
+        thread_id: uuid::Uuid::parse_str(thread_id).expect("thread UUID"),
+        source: source.into(),
         source_id: source_id.into(),
         sender: Contact {
             id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000099").expect("sender UUID"),
-            source: "fake".into(),
-            provider_instance: None,
+            source: source.into(),
+            provider_instance: Some(source.into()),
             source_id: "sender".into(),
             display_name: Some("Synthetic sender".into()),
             avatar_url: None,
@@ -224,6 +243,7 @@ fn launch_watch(base_url: &str, args: &[&str]) -> RunningWatch {
         .arg("watch")
         .args(args)
         .env("IRIS_SERVER_URL", base_url)
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn compiled iris binary");
@@ -235,7 +255,7 @@ fn launch_watch(base_url: &str, args: &[&str]) -> RunningWatch {
 }
 
 async fn next_line(lines: &mut Lines<BufReader<ChildStdout>>) -> String {
-    timeout(Duration::from_secs(5), lines.next_line())
+    timeout(FIXTURE_TIMEOUT, lines.next_line())
         .await
         .expect("watch output timeout")
         .expect("watch output read")
@@ -243,23 +263,46 @@ async fn next_line(lines: &mut Lines<BufReader<ChildStdout>>) -> String {
 }
 
 async fn stop_watch(mut watch: RunningWatch) {
-    let _ = watch.child.kill().await;
-    let _ = watch.child.wait().await;
+    timeout(FIXTURE_TIMEOUT, async move {
+        let _ = watch.child.kill().await;
+        let _ = watch.child.wait().await;
+    })
+    .await
+    .expect("watch process shutdown timeout");
 }
 
-async fn next_request(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
-    timeout(Duration::from_secs(5), rx.recv())
+async fn finish_watch(mut watch: RunningWatch) {
+    let status = timeout(FIXTURE_TIMEOUT, watch.child.wait())
         .await
-        .expect("SSE request timeout")
+        .expect("watch clean-end timeout")
+        .expect("watch clean-end wait");
+    assert!(status.success(), "watch exited unsuccessfully: {status}");
+    let extra = timeout(FIXTURE_TIMEOUT, watch.lines.next_line())
+        .await
+        .expect("watch output drain timeout")
+        .expect("watch output drain read");
+    assert!(
+        extra.is_none(),
+        "watch emitted an unexpected extra line: {extra:?}"
+    );
+}
+
+async fn next_request(rx: &mut mpsc::UnboundedReceiver<String>, label: &str) -> String {
+    timeout(FIXTURE_TIMEOUT, rx.recv())
+        .await
+        .unwrap_or_else(|error| panic!("SSE request timeout ({label}): {error}"))
         .expect("SSE request signal")
 }
 
 async fn run_watch_error(base_url: &str, cursor: &str) -> (String, String, i32) {
-    let output = Command::new(env!("CARGO_BIN_EXE_iris"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_iris"));
+    command
         .args(["watch", "--provider", "fake", "--cursor", cursor])
         .env("IRIS_SERVER_URL", base_url)
-        .output()
+        .kill_on_drop(true);
+    let output = timeout(FIXTURE_TIMEOUT, command.output())
         .await
+        .expect("compiled iris error-path timeout")
         .expect("run compiled iris error path");
     (
         String::from_utf8(output.stdout).expect("stdout UTF-8"),
@@ -268,38 +311,152 @@ async fn run_watch_error(base_url: &str, cursor: &str) -> (String, String, i32) 
     )
 }
 
+#[derive(Debug)]
+struct KeeperObservation {
+    id: String,
+    message: serde_json::Value,
+}
+
+/// Parse the small SSE subset emitted by the real replay router. This is kept
+/// independent from the CLI parser so the keeper is an authoritative wire
+/// observer rather than another invocation of the code under test.
+fn parse_keeper_frames(buffer: &mut Vec<u8>) -> Vec<KeeperObservation> {
+    let mut observations = Vec::new();
+    while let Some(position) = buffer.windows(2).position(|window| window == b"\n\n") {
+        let frame: Vec<u8> = buffer.drain(..position + 2).collect();
+        let text = String::from_utf8(frame).expect("keeper SSE UTF-8");
+        let mut event = None;
+        let mut id = None;
+        let mut data = Vec::new();
+        for line in text[..text.len() - 2].split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if let Some(value) = line.strip_prefix("event: ") {
+                event = Some(value.to_owned());
+            } else if let Some(value) = line.strip_prefix("id: ") {
+                id = Some(value.to_owned());
+            } else if let Some(value) = line.strip_prefix("data: ") {
+                data.push(value);
+            }
+        }
+        if event.as_deref().unwrap_or("message") == "message" && !data.is_empty() {
+            let id = id.expect("keeper message SSE ID");
+            let data = data.join("\n");
+            observations.push(KeeperObservation {
+                id,
+                message: serde_json::from_str(&data).expect("keeper message JSON"),
+            });
+        }
+    }
+    observations
+}
+
+fn spawn_keeper(
+    base_url: &str,
+) -> (
+    tokio::task::JoinHandle<()>,
+    mpsc::Receiver<KeeperObservation>,
+) {
+    let (observation_tx, observation_rx) = mpsc::channel(32);
+    let url = format!("{base_url}/v1/events");
+    let handle = tokio::spawn(async move {
+        let response = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .expect("keeper response");
+        assert!(response.status().is_success());
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("keeper SSE bytes");
+            buffer.extend_from_slice(&chunk);
+            for observation in parse_keeper_frames(&mut buffer) {
+                observation_tx
+                    .send(observation)
+                    .await
+                    .expect("keeper observation receiver");
+            }
+        }
+        assert!(buffer.is_empty(), "keeper ended with a partial SSE frame");
+    });
+    (handle, observation_rx)
+}
+
+async fn next_keeper_observation(
+    observations: &mut mpsc::Receiver<KeeperObservation>,
+) -> KeeperObservation {
+    timeout(FIXTURE_TIMEOUT, observations.recv())
+        .await
+        .expect("keeper observation timeout")
+        .expect("keeper observation channel closed")
+}
+
+async fn watch_help() -> String {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_iris"));
+    command.arg("watch").arg("--help").kill_on_drop(true);
+    let output = timeout(FIXTURE_TIMEOUT, command.output())
+        .await
+        .expect("watch --help timeout")
+        .expect("run compiled watch --help");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).expect("watch help UTF-8")
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compiled_cli_saves_checkpoint_and_reconnects_through_real_router() {
-    let probe = Probe::default();
-    let provider = Arc::new(MockRealtimeProvider {
+    let help = watch_help().await;
+    assert!(help.contains("--cursor"), "watch help: {help}");
+    assert!(help.contains("--include-cursor"), "watch help: {help}");
+
+    let fake_probe = Probe::default();
+    let other_probe = Probe::default();
+    let fake_provider = Arc::new(MockRealtimeProvider {
         metadata: ProviderMetadata {
             id: "fake",
             name: "Synthetic fake",
             capabilities: &[ProviderCapability::ReceiveRealtime],
         },
-        probe: probe.clone(),
+        probe: fake_probe.clone(),
+    });
+    let other_provider = Arc::new(MockRealtimeProvider {
+        metadata: ProviderMetadata {
+            id: "other",
+            name: "Synthetic other",
+            capabilities: &[ProviderCapability::ReceiveRealtime],
+        },
+        probe: other_probe.clone(),
     });
     let (request_tx, mut request_rx) = mpsc::unbounded_channel::<String>();
+    let resume_gate = Arc::new(Notify::new());
+    let hold_resume = Arc::new(AtomicBool::new(false));
     let app = create_app_with_sse(
-        vec![provider],
+        vec![fake_provider, other_provider],
         Arc::new(NullStore),
         Arc::new(NullAudit),
         SseSettings {
             heartbeat_interval: Duration::from_secs(15),
         },
     );
+    let resume_gate_for_middleware = resume_gate.clone();
+    let hold_resume_for_middleware = hold_resume.clone();
     let app = app.layer(axum::middleware::from_fn(
         move |request: Request, next: Next| {
             let request_tx = request_tx.clone();
+            let resume_gate = resume_gate_for_middleware.clone();
+            let hold_resume = hold_resume_for_middleware.clone();
             async move {
                 let is_events = request.uri().path() == "/v1/events";
                 let query = request.uri().query().unwrap_or_default().to_owned();
-                let response = next.run(request).await;
+                let should_hold_resume =
+                    is_events && query.contains("cursor=") && hold_resume.load(Ordering::SeqCst);
                 if is_events {
                     let _ = request_tx.send(query);
                 }
-                response
+                if should_hold_resume {
+                    resume_gate.notified().await;
+                }
+                next.run(request).await
             }
         },
     ));
@@ -314,112 +471,216 @@ async fn compiled_cli_saves_checkpoint_and_reconnects_through_real_router() {
     });
     let base_url = format!("http://{address}");
 
-    let mut first = launch_watch(&base_url, &["--provider", "fake", "--include-cursor"]);
-    let first_request = next_request(&mut request_rx).await;
+    // Synthetic discovery -> checkpoint -> reconnect transcript. The keeper
+    // observes authoritative SSE IDs and complete payloads independently of
+    // the compiled CLI under test, while its aggregate filter exposes events
+    // that the exact fake/thread-filtered CLI must reject.
+    let (mut keeper, mut keeper_observations) = spawn_keeper(&base_url);
+    let keeper_request = next_request(&mut request_rx, "keeper").await;
     assert!(
-        first_request.contains("provider=fake"),
+        keeper_request.is_empty(),
+        "aggregate keeper query: {keeper_request}"
+    );
+    fake_probe.wait_until_subscribed().await;
+    other_probe.wait_until_subscribed().await;
+
+    let mut first = launch_watch(
+        &base_url,
+        &[
+            "--provider",
+            "fake",
+            "--thread-id",
+            THREAD_ID,
+            "--include-cursor",
+        ],
+    );
+    let first_request = next_request(&mut request_rx, "first").await;
+    assert!(
+        first_request.contains("provider=fake") && first_request.contains("thread_id="),
         "query: {first_request}"
     );
     assert!(
         !first_request.contains("include_cursor"),
         "CLI-only output flag leaked into HTTP query: {first_request}"
     );
-    probe.wait_until_subscribed().await;
 
-    // A separate HTTP subscriber keeps provider demand alive while the CLI
-    // disconnects and reconnects.
-    let keeper_client = reqwest::Client::new();
-    let keeper_url = format!("{base_url}/v1/events?provider=fake");
-    let keeper = tokio::spawn(async move {
-        let response = keeper_client
-            .get(keeper_url)
-            .send()
-            .await
-            .expect("keeper response");
-        assert!(response.status().is_success());
-        std::future::pending::<()>().await;
-        drop(response);
-    });
-    let keeper_request = next_request(&mut request_rx).await;
-    assert!(keeper_request.contains("provider=fake"));
+    let wrong_thread = message_for(
+        "fake",
+        OTHER_THREAD_ID,
+        "00000000-0000-0000-0000-000000000201",
+        "excluded wrong thread",
+        "source-wrong-thread",
+    );
+    fake_probe.send(wrong_thread.clone()).await;
+    let wrong_thread_observation = next_keeper_observation(&mut keeper_observations).await;
+    assert_eq!(
+        wrong_thread_observation.message,
+        serde_json::to_value(&wrong_thread).unwrap()
+    );
+
+    let wrong_provider = message_for(
+        "other",
+        THREAD_ID,
+        "00000000-0000-0000-0000-000000000202",
+        "excluded wrong provider instance",
+        "source-other-instance",
+    );
+    other_probe.send(wrong_provider.clone()).await;
+    let wrong_provider_observation = next_keeper_observation(&mut keeper_observations).await;
+    assert_eq!(
+        wrong_provider_observation.message,
+        serde_json::to_value(&wrong_provider).unwrap()
+    );
 
     let first_message = message(
         "00000000-0000-0000-0000-000000000101",
         "same body — first\nline",
         "source-1",
     );
-    probe.send(first_message).await;
+    fake_probe.send(first_message.clone()).await;
+    let first_observation = next_keeper_observation(&mut keeper_observations).await;
     let first_line = next_line(&mut first.lines).await;
     let first_value: serde_json::Value =
         serde_json::from_str(&first_line).expect("first checkpoint JSON");
+    let expected_first = serde_json::to_value(&first_message).unwrap();
+    assert_eq!(first_observation.message, expected_first);
     let saved_cursor = first_value["cursor"]
         .as_str()
         .expect("first cursor")
         .to_owned();
-    assert_eq!(first_value["message"]["body"], "same body — first\nline");
-    assert_eq!(
-        first_value["message"]["id"],
-        "00000000-0000-0000-0000-000000000101"
+    assert_eq!(first_value["message"], expected_first);
+    assert_eq!(first_value["cursor"], first_observation.id);
+
+    // Keep the original compiled consumer alive while the resumed consumer
+    // registers. This avoids racing broker teardown with the reconnect path;
+    // its next two matching messages are drained explicitly below. Hold the
+    // reconnect handler after query arrival so events below are unambiguously
+    // part of the replay snapshot.
+    hold_resume.store(true, Ordering::SeqCst);
+    let mut resumed = launch_watch(
+        &base_url,
+        &[
+            "--provider",
+            "fake",
+            "--thread-id",
+            THREAD_ID,
+            "--cursor",
+            &saved_cursor,
+            "--include-cursor",
+        ],
     );
-    stop_watch(first).await;
+    let resumed_request = next_request(&mut request_rx, "resumed").await;
+    assert!(
+        resumed_request.contains("provider=fake")
+            && resumed_request.contains("thread_id=")
+            && resumed_request.contains("cursor="),
+        "query: {resumed_request}"
+    );
+    assert!(
+        !resumed_request.contains("include_cursor"),
+        "CLI-only output flag leaked into HTTP query: {resumed_request}"
+    );
 
     let replay_message = message(
         "00000000-0000-0000-0000-000000000102",
         "same body — replay/live identity stays distinct",
         "source-2",
     );
-    probe.send(replay_message).await;
+    fake_probe.send(replay_message.clone()).await;
+    let replay_observation = next_keeper_observation(&mut keeper_observations).await;
+    assert_eq!(
+        replay_observation.message,
+        serde_json::to_value(&replay_message).unwrap()
+    );
 
-    let mut resumed = launch_watch(
-        &base_url,
-        &[
-            "--provider",
-            "fake",
-            "--cursor",
-            &saved_cursor,
-            "--include-cursor",
-        ],
+    // These mismatches are emitted after the saved cursor but before the
+    // reconnect handler is released, so they are genuinely in the replay
+    // snapshot and prove the resumed provider/thread filters rather than only
+    // the live path.
+    let replay_wrong_provider = message_for(
+        "other",
+        THREAD_ID,
+        "00000000-0000-0000-0000-000000000204",
+        "excluded during replay provider",
+        "source-other-replay",
     );
-    let resumed_request = next_request(&mut request_rx).await;
-    assert!(
-        resumed_request.contains("provider=fake") && resumed_request.contains("cursor="),
-        "query: {resumed_request}"
+    other_probe.send(replay_wrong_provider.clone()).await;
+    let replay_wrong_provider_observation = next_keeper_observation(&mut keeper_observations).await;
+    assert_eq!(
+        replay_wrong_provider_observation.message,
+        serde_json::to_value(&replay_wrong_provider).unwrap()
     );
-    assert!(
-        !resumed_request.contains("include_cursor"),
-        "CLI-only output flag leaked into reconnect query: {resumed_request}"
+
+    let replay_wrong_thread = message_for(
+        "fake",
+        OTHER_THREAD_ID,
+        "00000000-0000-0000-0000-000000000205",
+        "excluded during replay thread",
+        "source-fake-replay-wrong-thread",
     );
+    fake_probe.send(replay_wrong_thread.clone()).await;
+    let replay_wrong_thread_observation = next_keeper_observation(&mut keeper_observations).await;
+    assert_eq!(
+        replay_wrong_thread_observation.message,
+        serde_json::to_value(&replay_wrong_thread).unwrap()
+    );
+
+    hold_resume.store(false, Ordering::SeqCst);
+    resume_gate.notify_one();
+    let replay_line = next_line(&mut resumed.lines).await;
+    let replay_value: serde_json::Value =
+        serde_json::from_str(&replay_line).expect("replay checkpoint JSON");
+    assert_eq!(
+        replay_value["message"],
+        serde_json::to_value(&replay_message).unwrap()
+    );
+    assert_eq!(replay_value["cursor"], replay_observation.id);
 
     let live_message = message(
         "00000000-0000-0000-0000-000000000103",
         "same body — replay/live identity stays distinct",
         "source-3",
     );
-    probe.send(live_message).await;
-    let replay_line = next_line(&mut resumed.lines).await;
+    fake_probe.send(live_message.clone()).await;
+    let live_observation = next_keeper_observation(&mut keeper_observations).await;
+    assert_eq!(
+        live_observation.message,
+        serde_json::to_value(&live_message).unwrap()
+    );
+
     let live_line = next_line(&mut resumed.lines).await;
-    let replay_value: serde_json::Value =
-        serde_json::from_str(&replay_line).expect("replay checkpoint JSON");
     let live_value: serde_json::Value =
         serde_json::from_str(&live_line).expect("live checkpoint JSON");
     assert_eq!(
-        replay_value["message"]["id"],
-        "00000000-0000-0000-0000-000000000102"
+        live_value["message"],
+        serde_json::to_value(&live_message).unwrap()
     );
-    assert_eq!(
-        live_value["message"]["id"],
-        "00000000-0000-0000-0000-000000000103"
-    );
+    assert_eq!(live_value["cursor"], live_observation.id);
     assert_eq!(
         replay_value["message"]["body"],
         live_value["message"]["body"]
     );
     assert_ne!(replay_value["message"]["id"], live_value["message"]["id"]);
     assert_ne!(replay_value["cursor"], live_value["cursor"]);
-    stop_watch(resumed).await;
+
+    let first_replay_line = next_line(&mut first.lines).await;
+    let first_live_line = next_line(&mut first.lines).await;
+    let first_replay_value: serde_json::Value =
+        serde_json::from_str(&first_replay_line).expect("original replay JSON");
+    let first_live_value: serde_json::Value =
+        serde_json::from_str(&first_live_line).expect("original live JSON");
+    assert_eq!(
+        first_replay_value["message"]["id"],
+        replay_message.id.to_string()
+    );
+    assert_eq!(
+        first_live_value["message"]["id"],
+        live_message.id.to_string()
+    );
+    stop_watch(first).await;
 
     let (stdout, stderr, code) = run_watch_error(&base_url, "bad cursor/%").await;
-    let invalid_request = next_request(&mut request_rx).await;
+    let invalid_request = next_request(&mut request_rx, "invalid").await;
     assert!(
         invalid_request.contains("cursor=bad+cursor%2F%25"),
         "cursor was not safely query-encoded: {invalid_request}"
@@ -433,7 +694,7 @@ async fn compiled_cli_saves_checkpoint_and_reconnects_through_real_router() {
     );
 
     let (stdout, stderr, code) = run_watch_error(&base_url, "AAAAAAAAAAAAAAAAAAAAAA.1").await;
-    let expired_request = next_request(&mut request_rx).await;
+    let expired_request = next_request(&mut request_rx, "expired").await;
     assert!(expired_request.contains("cursor=AAAAAAAAAAAAAAAAAAAAAA.1"));
     assert_eq!(code, 1);
     assert!(stdout.is_empty(), "expired cursor stdout: {stdout}");
@@ -443,8 +704,17 @@ async fn compiled_cli_saves_checkpoint_and_reconnects_through_real_router() {
         "expired cursor stderr: {stderr}"
     );
 
-    keeper.abort();
-    let _ = keeper.await;
+    // Drop both synthetic provider senders: the real router closes its SSE
+    // subscriptions, giving the resumed CLI and independent keeper a bounded,
+    // controlled end rather than killing them after reading expected lines.
+    fake_probe.close();
+    other_probe.close();
+    finish_watch(resumed).await;
+    timeout(FIXTURE_TIMEOUT, &mut keeper)
+        .await
+        .expect("keeper clean-end timeout")
+        .expect("keeper task failed");
+
     server.abort();
     let _ = server.await;
 }

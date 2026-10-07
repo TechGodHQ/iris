@@ -92,6 +92,13 @@ pub struct SseParser {
     data_lines: Vec<String>,
     /// Whether a comment line arrived since the last yielded frame.
     pending_comment: bool,
+    /// Whether the last consumed line ended with a CR at a chunk boundary.
+    ///
+    /// The CR is already a complete line terminator, so it must be processed
+    /// immediately. If the next chunk starts with LF, that byte is the second
+    /// half of a split CRLF pair and must be ignored rather than treated as a
+    /// second blank line.
+    pending_crlf: bool,
 }
 
 impl SseParser {
@@ -104,31 +111,36 @@ impl SseParser {
     /// Feed raw bytes; return every complete frame they closed.
     ///
     /// Lines may end with LF, CRLF, or a lone CR (SSE spec). A CR at the end of
-    /// one HTTP chunk is retained until the next chunk so a split CRLF pair does
-    /// not dispatch a spurious empty event; a CR followed by any other byte is
-    /// treated as a lone-CR terminator.
+    /// one HTTP chunk is processed immediately as a line terminator; if the
+    /// next chunk starts with LF, that byte is consumed as the second half of a
+    /// split CRLF pair rather than dispatching a spurious empty event. A CR
+    /// followed by any other byte is treated as a lone-CR terminator.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
         self.buffer.extend_from_slice(chunk);
         let mut frames = Vec::new();
+        if self.pending_crlf && !self.buffer.is_empty() {
+            if self.buffer.first() == Some(&b'\n') {
+                self.buffer.remove(0);
+            }
+            self.pending_crlf = false;
+        }
         while let Some(pos) = self
             .buffer
             .iter()
             .position(|byte| *byte == b'\r' || *byte == b'\n')
         {
             let is_cr = self.buffer[pos] == b'\r';
-            // A CR at the end of an HTTP chunk may be the first half of CRLF.
-            // Keep it until the next chunk so the following LF does not look
-            // like a separate empty event and clear the pending frame ID.
-            if is_cr && pos + 1 == self.buffer.len() {
-                break;
-            }
             let crlf = is_cr && self.buffer.get(pos + 1) == Some(&b'\n');
             let terminator_len = usize::from(crlf) + 1;
+            let split_crlf = is_cr && pos + 1 == self.buffer.len();
             let line_with_terminator: Vec<u8> = self.buffer.drain(..pos + terminator_len).collect();
             self.feed_line(
                 &line_with_terminator[..line_with_terminator.len() - terminator_len],
                 &mut frames,
             );
+            if split_crlf {
+                self.pending_crlf = true;
+            }
         }
         frames
     }
@@ -326,6 +338,14 @@ where
                     .await?;
                     return Ok(true);
                 };
+                if !message.is_object() {
+                    write_line(
+                        err,
+                        "watch: message frame JSON must be an object; refusing to emit a checkpoint",
+                    )
+                    .await?;
+                    return Ok(true);
+                }
                 let envelope = serde_json::json!({
                     "cursor": cursor,
                     "message": message,
@@ -533,6 +553,37 @@ mod tests {
         );
     }
 
+    /// A complete CR-only frame is emitted as soon as its final delimiter is
+    /// available, without waiting for EOF or another byte.
+    #[test]
+    fn parser_emits_complete_cr_only_frame_without_finish() {
+        let mut parser = SseParser::new();
+        assert_eq!(
+            parser.feed(b"id: cursor-1\rdata: {\"ok\":1}\r\r"),
+            vec![SseFrame::Message {
+                id: Some("cursor-1".into()),
+                data: "{\"ok\":1}".into(),
+            }]
+        );
+    }
+
+    /// A CRLF split across chunks preserves the frame ID and does not turn the
+    /// delayed LF into a second blank frame.
+    #[test]
+    fn parser_split_crlf_does_not_clear_frame_id_or_duplicate_frame() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed(b"id: cursor-1\r").is_empty());
+        assert!(parser.feed(&[]).is_empty());
+        assert_eq!(
+            parser.feed(b"\ndata: {\"ok\":1}\r\n\r\n"),
+            vec![SseFrame::Message {
+                id: Some("cursor-1".into()),
+                data: "{\"ok\":1}".into(),
+            }]
+        );
+        assert!(parser.finish().is_empty());
+    }
+
     /// The server URL comes from the environment with a sane default.
     #[test]
     fn server_url_defaults_and_env_override() {
@@ -648,6 +699,120 @@ mod tests {
             String::from_utf8(err)
                 .unwrap()
                 .contains("no non-empty SSE cursor")
+        );
+    }
+
+    /// Checkpoint mode accepts only message objects and never emits a
+    /// checkpoint for a scalar/array/null payload.
+    #[tokio::test]
+    async fn include_cursor_rejects_non_object_checkpoint_payloads() {
+        for data in ["null", "[]", "\"text\"", "42", "true"] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let mut ended_in_error = false;
+            let should_exit = handle_frame(
+                SseFrame::Message {
+                    id: Some("cursor-1".into()),
+                    data: data.into(),
+                },
+                false,
+                true,
+                &mut out,
+                &mut err,
+                &mut ended_in_error,
+            )
+            .await
+            .unwrap();
+            assert!(should_exit, "payload should be rejected: {data}");
+            assert!(out.is_empty(), "payload emitted a checkpoint: {data}");
+            let diagnostic = String::from_utf8(err).unwrap();
+            assert!(
+                diagnostic.contains("must be an object"),
+                "diagnostic: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(data),
+                "raw payload leaked: {diagnostic}"
+            );
+        }
+    }
+
+    /// Malformed JSON and an explicitly empty frame ID are rejected without
+    /// emitting a checkpoint or echoing the malformed payload.
+    #[tokio::test]
+    async fn include_cursor_rejects_malformed_json_and_empty_id() {
+        let cases = [
+            (
+                Some(String::new()),
+                r#"{"body":"valid"}"#,
+                "no non-empty SSE cursor",
+            ),
+            (
+                Some("cursor-1".into()),
+                r#"{"body":"unterminated"#,
+                "not valid JSON",
+            ),
+        ];
+        for (id, data, expected_diagnostic) in cases {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let mut ended_in_error = false;
+            let should_exit = handle_frame(
+                SseFrame::Message {
+                    id,
+                    data: data.into(),
+                },
+                false,
+                true,
+                &mut out,
+                &mut err,
+                &mut ended_in_error,
+            )
+            .await
+            .unwrap();
+            assert!(should_exit);
+            assert!(out.is_empty());
+            let diagnostic = String::from_utf8(err).unwrap();
+            assert!(diagnostic.contains(expected_diagnostic), "{diagnostic}");
+            assert!(
+                !diagnostic.contains(data),
+                "raw payload leaked: {diagnostic}"
+            );
+        }
+    }
+
+    /// A valid object checkpoint retains every field, including Unicode,
+    /// escaped newlines, and nested extra data.
+    #[tokio::test]
+    async fn include_cursor_preserves_the_complete_message_object() {
+        let data = r#"{"body":"héllo\n世界","extra":{"answer":42},"items":[true,null]}"#;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut ended_in_error = false;
+        let should_exit = handle_frame(
+            SseFrame::Message {
+                id: Some("cursor-1".into()),
+                data: data.into(),
+            },
+            false,
+            true,
+            &mut out,
+            &mut err,
+            &mut ended_in_error,
+        )
+        .await
+        .unwrap();
+        assert!(!should_exit);
+        assert!(err.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["cursor"], "cursor-1");
+        assert_eq!(
+            value["message"],
+            serde_json::json!({
+                "body": "héllo\n世界",
+                "extra": {"answer": 42},
+                "items": [true, null],
+            })
         );
     }
 
