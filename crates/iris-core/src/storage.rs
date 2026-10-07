@@ -40,6 +40,9 @@ pub struct AttachmentRef {
 /// Implementations are responsible for persisting attachment bytes and
 /// returning stable, resolvable references. The trait is async because
 /// all storage backends involve I/O.
+// Trait methods return `Result`, which is already `#[must_use]`; suppress the
+// redundant-attribute lint that rust 1.99's clippy raises on async traits.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AttachmentStore: std::fmt::Debug + Send + Sync {
     /// Store attachment content, returning a reference with assigned ID and URL.

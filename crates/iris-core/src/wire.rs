@@ -265,9 +265,18 @@ mod tests {
 
     #[test]
     fn absent_and_null_attachments_decode_to_empty() {
-        assert!(decode_attachments(None).unwrap().is_empty());
-        assert!(decode(&json!(null)).unwrap().is_empty());
-        assert!(decode(&json!([])).unwrap().is_empty());
+        assert_eq!(
+            decode_attachments(None).unwrap(),
+            Vec::<OutboundAttachment>::new()
+        );
+        assert_eq!(
+            decode(&json!(null)).unwrap(),
+            Vec::<OutboundAttachment>::new()
+        );
+        assert_eq!(
+            decode(&json!([])).unwrap(),
+            Vec::<OutboundAttachment>::new()
+        );
     }
 
     #[test]

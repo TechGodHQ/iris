@@ -69,7 +69,7 @@ pub struct ProviderResponse {
 }
 
 pub fn router(state: AppState) -> Router {
-    debug_assert!(!generated::GENERATED_ROUTES.is_empty());
+    debug_assert_ne!(generated::GENERATED_ROUTES, []);
     let generated = generated::generated_router()
         .layer(middleware::from_fn_with_state(state.clone(), ingest_auth));
     let router = Router::new()

@@ -525,7 +525,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(batch.mutations.is_empty());
+        assert_eq!(batch.mutations, [] as [iris_core::IngestMutation; 0]);
         let audit = batch
             .audit
             .as_ref()

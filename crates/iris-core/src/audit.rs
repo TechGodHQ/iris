@@ -93,6 +93,9 @@ pub enum RecordOutcome {
 }
 
 /// Append-only, provider-agnostic audit storage.
+// Trait methods return `Result`, which is already `#[must_use]`; suppress the
+// redundant-attribute lint that rust 1.99's clippy raises on async traits.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AuditLog: std::fmt::Debug + Send + Sync {
     /// Append an event and return its hash-linked entry.

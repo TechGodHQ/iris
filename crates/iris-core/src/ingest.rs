@@ -94,6 +94,9 @@ pub enum IngestOutcome {
 }
 
 /// Durable all-or-nothing normalized-object ingestion.
+// Trait methods return `Result`, which is already `#[must_use]`; suppress the
+// redundant-attribute lint that rust 1.99's clippy raises on async traits.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait IngestStore: std::fmt::Debug + Send + Sync {
     /// Apply the batch, replay record, cursor, and audit event atomically.
