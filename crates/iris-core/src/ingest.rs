@@ -24,8 +24,12 @@ pub enum IngestMutation {
     UpsertThread(Thread),
     /// Mark a source-backed thread archived without deleting its history.
     ArchiveThread { source: String, source_id: String },
-    /// Append a normalized message. Replays are controlled by the batch key.
-    AppendMessage(Message),
+    /// Append a normalized message. The nested field keeps the mutation tag
+    /// distinct from `Message::kind` in the JSON representation.
+    AppendMessage {
+        /// Normalized message to append to its source-backed thread.
+        message: Message,
+    },
 }
 
 /// A source cursor committed only when the complete batch commits.
@@ -128,6 +132,7 @@ fn canonicalize(value: serde_json::Value) -> serde_json::Value {
 mod tests {
     use chrono::TimeZone;
     use serde_json::json;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -180,6 +185,42 @@ mod tests {
         assert_ne!(
             first.canonical_hash().unwrap(),
             second.canonical_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn append_message_mutation_round_trips_without_colliding_with_message_kind() {
+        let sender = Contact {
+            id: Uuid::from_u128(1),
+            source: "herdr".into(),
+            provider_instance: None,
+            source_id: "bridge".into(),
+            display_name: Some("Bridge".into()),
+            avatar_url: None,
+            metadata: json!({}),
+        };
+        let mutation = IngestMutation::AppendMessage {
+            message: Message {
+                id: Uuid::from_u128(2),
+                thread_id: Uuid::from_u128(3),
+                source: "herdr".into(),
+                source_id: "event-1".into(),
+                sender,
+                kind: crate::MessageKind::System,
+                body: "heartbeat".into(),
+                attachments: Vec::new(),
+                timestamp: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                is_outbound: false,
+                metadata: json!({}),
+            },
+        };
+
+        let value = serde_json::to_value(&mutation).unwrap();
+        assert_eq!(value["kind"], "append_message");
+        assert_eq!(value["message"]["kind"], "system");
+        assert_eq!(
+            serde_json::from_value::<IngestMutation>(value).unwrap(),
+            mutation
         );
     }
 }

@@ -9,6 +9,7 @@ members = [
     "crates/iris-cli",
     "crates/iris-mcp",
     "crates/iris-codegen",
+    "crates/iris-herdr-bridge",
 ]
 
 [workspace.package]
