@@ -775,8 +775,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use iris_core::{
         AttachmentContent, AttachmentRef, AttachmentStore, AuditAction, AuditEvent, AuditLog,
-        IngestBatch, IngestCursor, IngestOutcome, IngestStore, IrisError, MessageKind,
-        ProviderMetadata, RealtimeState, RealtimeStatus,
+        IngestBatch, IngestCursor, IngestMutation, IngestOutcome, IngestStore, IrisError,
+        MessageKind, ProviderMetadata, RealtimeState, RealtimeStatus,
     };
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
@@ -1274,6 +1274,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conflict_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn ingest_route_accepts_append_message_mutation_and_idempotent_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn IngestStore> =
+            Arc::new(iris_storage::LocalFsIngestStore::new(temp.path()));
+        let mut batch = ingest_batch("message-event-1");
+        batch.mutations.push(IngestMutation::AppendMessage {
+            message: message(Uuid::new_v4(), "alpha", 3, "bridge message"),
+        });
+        let body = serde_json::to_vec(&batch).unwrap();
+
+        let applied = router(ingest_state(store.clone(), "secret"))
+            .oneshot(
+                Request::post("/ingest")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied.status(), StatusCode::CREATED);
+
+        let retried = router(ingest_state(store, "secret"))
+            .oneshot(
+                Request::post("/ingest")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.status(), StatusCode::OK);
     }
 
     #[tokio::test]

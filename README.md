@@ -17,6 +17,11 @@ Point Iris at your messaging sources. Query all of them through one API — via 
 - **Self-hostable**: MIT licensed, no cloud dependencies, runs anywhere Rust runs.
 - **Extensible**: Adding a provider = implementing one trait.
 
+Herdr workstation events can be bridged to Iris's existing authenticated
+`POST /ingest` contract by the separate `iris-herdr-bridge` daemon. See
+[`docs/providers/herdr-bridge.md`](docs/providers/herdr-bridge.md) for its
+protocol-19, bounded-spool, retry, and manual systemd installation contract.
+
 ## Quick Start
 
 ```bash
