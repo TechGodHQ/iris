@@ -1060,6 +1060,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-herdr-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "iris-core",
+ "iris-providers",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "iris-mcp"
 version = "0.1.0"
 dependencies = [

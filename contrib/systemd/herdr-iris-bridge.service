@@ -1,0 +1,18 @@
+[Unit]
+Description=Herdr to Iris durable event bridge
+After=default.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/herdr-iris-bridge/env
+ExecStart=%h/.local/bin/herdr-iris-bridge
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/herdr-iris-bridge
+
+[Install]
+WantedBy=default.target
