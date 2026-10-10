@@ -1073,7 +1073,7 @@ mod tests {
             .await
             .unwrap();
         let mut spool_guard = spool.lock().await;
-        assert!(spool_guard.unmapped_event_payloads().unwrap().is_empty());
+        assert_eq!(spool_guard.unmapped_event_payloads().unwrap(), Vec::new());
         assert!(spool_guard.flush_due(Utc::now()).unwrap());
         let batch = spool_guard.oldest_batch().unwrap().unwrap();
         assert!(batch.body.contains("authoritative current label"));
@@ -1131,7 +1131,7 @@ mod tests {
             .unwrap();
 
         let mut spool = spool.lock().await;
-        assert!(spool.unmapped_event_payloads().unwrap().is_empty());
+        assert_eq!(spool.unmapped_event_payloads().unwrap(), Vec::new());
         assert!(
             spool
                 .flush_due(Utc::now() + chrono::Duration::seconds(5))
@@ -1183,7 +1183,7 @@ mod tests {
             .await
             .unwrap();
         let mut spool = spool.lock().await;
-        assert!(spool.unmapped_event_payloads().unwrap().is_empty());
+        assert_eq!(spool.unmapped_event_payloads().unwrap(), Vec::new());
         assert!(spool.flush_due(Utc::now()).unwrap());
         let batch = spool.oldest_batch().unwrap().unwrap();
         drop(spool);
@@ -1457,7 +1457,7 @@ mod tests {
             .iter()
             .filter(|mutation| mutation["kind"] == "upsert_thread")
             .collect::<Vec<_>>();
-        assert!(!threads.is_empty());
+        assert_ne!(threads, Vec::<&Value>::new());
         assert!(threads.iter().all(|thread| {
             thread["metadata"]["panes"][0]["title"].is_null()
                 && thread["metadata"]["panes"][0]["pane_id"] == "pane-1"

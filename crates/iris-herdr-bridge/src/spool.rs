@@ -954,7 +954,7 @@ mod tests {
             enrich_thread_snapshots(&payload, &mut mutations, received_at),
             (1, true)
         );
-        assert!(mutations.is_empty());
+        assert_eq!(mutations, Vec::new());
     }
 
     #[test]
@@ -1014,7 +1014,7 @@ mod tests {
         // must survive because it is newer than the event inside the batch.
         spool.max_events = 1;
         assert_eq!(spool.enforce_bound().unwrap(), 1);
-        assert!(spool.batch_paths().unwrap().is_empty());
+        assert_eq!(spool.batch_paths().unwrap(), Vec::new());
         let remaining = spool.event_records().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].sequence, 2);
