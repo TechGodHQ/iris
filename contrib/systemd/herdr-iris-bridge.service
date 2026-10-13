@@ -5,7 +5,7 @@ After=default.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/herdr-iris-bridge/env
-ExecStart=%h/.local/bin/herdr-iris-bridge
+ExecStart=%h/.local/bin/iris-herdr-bridge
 Restart=on-failure
 RestartSec=2s
 UMask=0077
