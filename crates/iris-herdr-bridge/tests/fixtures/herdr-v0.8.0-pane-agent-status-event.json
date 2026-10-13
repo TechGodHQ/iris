@@ -1,0 +1,1 @@
+{"event":"pane.agent_status_changed","data":{"pane_id":"pane-1","workspace_id":"workspace-1","agent_status":"idle","agent":"claude","display_agent":"Claude","title":"private-pane-title-do-not-forward","cwd":"/private/herdr/worktree","tokens":{"access":"fixture-only-do-not-forward"},"private_payload":"fixture-only-do-not-forward"}}

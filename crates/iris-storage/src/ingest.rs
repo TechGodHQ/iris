@@ -100,7 +100,7 @@ impl LocalFsIngestStore {
                             .or_default()
                             .insert(source_id, true);
                     }
-                    IngestMutation::AppendMessage(message) => state.messages.push(message),
+                    IngestMutation::AppendMessage { message } => state.messages.push(message),
                 }
             }
             if let Some(cursor) = batch.cursor {
