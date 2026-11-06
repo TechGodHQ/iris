@@ -29,14 +29,14 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Guard — package must not already exist on npm
+      - name: Validate bootstrap package directory
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
         run: |
-          PKG_NAME=$(jq -r '.name' "${{ inputs.package_dir }}/package.json")
-          if npm view "$PKG_NAME" version >/dev/null 2>&1; then
-            echo "::error::$PKG_NAME already exists on npm. Use release.yml (OIDC) instead."
+          if [[ "$PACKAGE_DIR" != "generated/ts-client" ]]; then
+            printf 'npm bootstrap preflight: unauthorized package directory\n' >&2
             exit 1
           fi
-          echo "bootstrapping $PKG_NAME"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -44,24 +44,34 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           cache: npm
-          cache-dependency-path: ${{ inputs.package_dir }}/package-lock.json
+          cache-dependency-path: generated/ts-client/package-lock.json
+
+      # This unauthenticated phase always denies. Positive authoritative absence
+      # remains blocked; no response (including structured 404) enables publish.
+      - name: Deny unauthenticated bootstrap
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: bash scripts/npm-bootstrap-preflight.sh
 
       - name: Install dependencies
-        working-directory: ${{ inputs.package_dir }}
+        working-directory: generated/ts-client
         run: npm ci --ignore-scripts
 
       - name: Set bootstrap version
-        working-directory: ${{ inputs.package_dir }}
-        run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
+        working-directory: generated/ts-client
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: npm version "$REQUESTED_VERSION" --no-git-tag-version --allow-same-version
 
       - name: Verify and build
-        working-directory: ${{ inputs.package_dir }}
+        working-directory: generated/ts-client
         run: |
           npm run typecheck
           npm run build
 
       - name: Publish bootstrap version (token, one time only)
-        working-directory: ${{ inputs.package_dir }}
+        working-directory: generated/ts-client
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
