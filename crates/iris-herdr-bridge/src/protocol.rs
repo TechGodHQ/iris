@@ -558,6 +558,10 @@ fn changed_pane(kind: &str, subscribed: &BTreeSet<String>, current: &BTreeSet<St
 }
 
 fn refresh_pane_snapshot(kind: &str) -> bool {
+    // Focus events move the per-pane `focused` flag without touching pane
+    // membership or agent statuses; pane.list is the only authoritative
+    // source for those flags, so reusing cached pane_infos here would enrich
+    // the replacement thread with a stale focus split and persist it.
     matches!(
         kind,
         "tab_closed"
@@ -568,6 +572,9 @@ fn refresh_pane_snapshot(kind: &str) -> bool {
             | "pane_exited"
             | "pane_agent_detected"
             | "pane_agent_status_changed"
+            | "workspace_focused"
+            | "tab_focused"
+            | "pane_focused"
     )
 }
 
@@ -1734,6 +1741,158 @@ mod tests {
         assert_eq!(subscription_end, SubscriptionEnd::PaneSetChanged);
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn focus_events_refresh_authoritative_pane_attributes_before_spooling() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut ping_stream, _) = listener.accept().await.unwrap();
+            let ping = read_request(&mut ping_stream).await;
+            super::write_json_line(
+                &mut ping_stream,
+                &json!({
+                    "id": ping["id"],
+                    "result": {"type": "pong", "version": "0.8.0", "protocol": 19}
+                }),
+            )
+            .await
+            .unwrap();
+            drop(ping_stream);
+
+            // Startup snapshots focus pane-1; pane-2 exists unfocused.
+            let mut startup_focused = synthetic_pane();
+            startup_focused["pane_id"] = json!("pane-1");
+            startup_focused["focused"] = json!(true);
+            let mut startup_unfocused = synthetic_pane();
+            startup_unfocused["pane_id"] = json!("pane-2");
+            startup_unfocused["focused"] = json!(false);
+            let initial_panes = json!([startup_focused.clone(), startup_unfocused.clone()]);
+            respond_pane_list(&listener, initial_panes.clone()).await;
+            respond_workspace_list_with_counts(&listener, 2, 2).await;
+
+            let (mut event_stream, _) = listener.accept().await.unwrap();
+            let subscribe = read_request(&mut event_stream).await;
+            assert_eq!(subscribe["method"], "events.subscribe");
+            let ack = ACK.replace("fixture-id", subscribe["id"].as_str().unwrap());
+            event_stream.write_all(ack.as_bytes()).await.unwrap();
+            event_stream.write_all(b"\n").await.unwrap();
+
+            respond_pane_list(&listener, initial_panes).await;
+            respond_workspace_list_with_counts(&listener, 2, 2).await;
+
+            // Pinned Herdr v0.8.0 emits workspace.focused, tab.focused, then
+            // pane.focused when pane focus moves; pane membership and agent
+            // statuses stay unchanged across the whole sequence. Only the
+            // final pane.list carries the flipped authoritative flags.
+            let focus_sequence = [(true, false), (true, false), (false, true)];
+            for (event_kind, (pane_1_focused, pane_2_focused)) in
+                ["workspace.focused", "tab.focused", "pane.focused"]
+                    .into_iter()
+                    .zip(focus_sequence)
+            {
+                let event = json!({
+                    "event": event_kind,
+                    "data": {"workspace_id": "workspace-1", "pane_id": "pane-2"}
+                });
+                super::write_json_line(&mut event_stream, &event)
+                    .await
+                    .unwrap();
+
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                        .await
+                        .expect("workspace.list refresh must arrive")
+                        .unwrap();
+                let request = read_request(&mut stream).await;
+                assert_eq!(request["method"], "workspace.list");
+                let mut response: Value = serde_json::from_str(WORKSPACE_LIST_RESPONSE).unwrap();
+                response["id"] = request["id"].clone();
+                response["result"]["workspaces"][0]["pane_count"] = json!(2);
+                response["result"]["workspaces"][0]["tab_count"] = json!(2);
+                super::write_json_line(&mut stream, &response)
+                    .await
+                    .unwrap();
+                drop(stream);
+
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                        .await
+                        .expect("pane.list refresh must arrive")
+                        .unwrap();
+                let request = read_request(&mut stream).await;
+                assert_eq!(request["method"], "pane.list");
+                let mut pane_1 = synthetic_pane();
+                pane_1["pane_id"] = json!("pane-1");
+                pane_1["focused"] = json!(pane_1_focused);
+                let mut pane_2 = synthetic_pane();
+                pane_2["pane_id"] = json!("pane-2");
+                pane_2["focused"] = json!(pane_2_focused);
+                super::write_json_line(
+                    &mut stream,
+                    &json!({
+                        "id": request["id"],
+                        "result": {"type": "pane_list", "panes": [pane_1, pane_2]}
+                    }),
+                )
+                .await
+                .unwrap();
+                drop(stream);
+            }
+            event_stream.shutdown().await.unwrap();
+        });
+
+        let spool = Arc::new(Mutex::new(Spool::open(dir.path().join("state")).unwrap()));
+        let subscription_end = consume_subscription(&socket_path, &spool).await.unwrap();
+        server.await.unwrap();
+
+        let mut spool = spool.lock().await;
+        assert!(
+            spool
+                .flush_due(Utc::now() + chrono::Duration::seconds(6))
+                .unwrap()
+        );
+        let batch = spool.oldest_batch().unwrap().unwrap();
+        drop(spool);
+        let value: Value = serde_json::from_str(&batch.body).unwrap();
+        let final_thread = value["mutations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|mutation| {
+                mutation["kind"] == "upsert_thread" && mutation["source_id"] == "workspace-1"
+            })
+            .unwrap();
+        let pane_count = final_thread["metadata"]["pane_count"].as_u64().unwrap();
+        let panes = final_thread["metadata"]["panes"].as_array().unwrap();
+        assert_eq!(
+            pane_count, 2,
+            "focus events must not change pane membership"
+        );
+        assert_eq!(panes.len(), 2);
+        let pane_1 = panes
+            .iter()
+            .find(|pane| pane["pane_id"] == "pane-1")
+            .expect("pane-1 must remain in the snapshot");
+        let pane_2 = panes
+            .iter()
+            .find(|pane| pane["pane_id"] == "pane-2")
+            .expect("pane-2 must remain in the snapshot");
+        assert_eq!(
+            pane_1["focused"],
+            json!(false),
+            "stale pane-1 focus must be replaced by authoritative pane.list"
+        );
+        assert_eq!(pane_2["focused"], json!(true), "pane-2 must now be focused");
+        assert_eq!(
+            subscription_end,
+            SubscriptionEnd::PeerClosed,
+            "membership-preserving focus change must not reconnect the subscription"
+        );
+    }
+
     #[test]
     fn planned_pane_refresh_is_immediate_but_peer_close_retries_after_two_seconds() {
         assert_eq!(
@@ -1765,6 +1924,21 @@ mod tests {
         assert!(!changed_pane("pane_moved", &pane_id, &pane_id));
         let replacement_id = BTreeSet::from(["replacement-pane".to_owned()]);
         assert!(changed_pane("pane_moved", &pane_id, &replacement_id));
+    }
+
+    #[test]
+    fn focus_events_refresh_pane_attributes_without_changing_membership() {
+        let subscribed = BTreeSet::from(["pane-1".to_owned(), "pane-2".to_owned()]);
+        for kind in ["workspace_focused", "tab_focused", "pane_focused"] {
+            assert!(
+                refresh_pane_snapshot(kind),
+                "{kind} must refresh authoritative pane.list"
+            );
+            assert!(
+                !changed_pane(kind, &subscribed, &subscribed),
+                "{kind} must not reconnect the subscription"
+            );
+        }
     }
 
     #[test]
