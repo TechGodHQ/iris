@@ -106,7 +106,7 @@ pub fn map_event(event: &HerdrEvent<'_>) -> HerdrMapping {
                 }]
             })
             .unwrap_or_else(|| dropped(&kind, "missing workspace_id")),
-        ("workspace_moved" | "workspace_reordered" | "workspace_focused", Some(data)) => {
+        ("workspace_moved" | "workspace_reordered", Some(data)) => {
             let ids = workspace_ids(data);
             if ids.is_empty() {
                 dropped(&kind, "missing workspace identity")
@@ -115,45 +115,55 @@ pub fn map_event(event: &HerdrEvent<'_>) -> HerdrMapping {
                     .map(|id| {
                         HerdrIntent::UpsertThread(thread_with_metadata(
                             id,
-                            None,
+                            workspace_label_for(data, id),
                             event.received_at,
-                            json!({"event": kind, "data": canonical_value(&Value::Object(data.clone()))}),
+                            json!({"event": kind}),
                         ))
                     })
                     .collect()
             }
         }
-        (
-            "tab_created" | "tab_closed" | "tab_renamed" | "tab_moved" | "tab_focused",
-            Some(data),
-        ) => workspace_id_from_tab_event(data)
-            .map(|id| {
-                vec![HerdrIntent::UpsertThread(thread_with_metadata(
-                    id,
-                    None,
-                    event.received_at,
-                    json!({"event": kind, "data": canonical_value(&Value::Object(data.clone()))}),
-                ))]
-            })
-            .unwrap_or_else(|| dropped(&kind, "missing workspace_id")),
+        ("workspace_focused", Some(data)) => focus_reconciliation_intents(
+            &kind,
+            data,
+            event.payload,
+            event.received_at,
+            "missing workspace identity",
+        ),
+        ("tab_created" | "tab_closed" | "tab_renamed" | "tab_moved", Some(data)) => {
+            workspace_id_from_tab_event(data)
+                .map(|id| {
+                    vec![HerdrIntent::UpsertThread(thread_with_metadata(
+                        id,
+                        workspace_label(data),
+                        event.received_at,
+                        json!({"event": kind}),
+                    ))]
+                })
+                .unwrap_or_else(|| dropped(&kind, "missing workspace_id"))
+        }
         ("pane_moved", Some(data)) => map_pane_moved(&kind, data, event.received_at),
-        (
-            "pane_created"
-            | "pane_updated"
-            | "pane_focused"
-            | "pane_exited"
-            | "pane_agent_detected",
-            Some(data),
-        ) => workspace_id_from_pane_event(data)
-            .map(|id| {
-                vec![HerdrIntent::UpsertThread(thread_with_metadata(
-                    id,
-                    None,
-                    event.received_at,
-                    json!({"event": kind, "data": canonical_value(&Value::Object(data.clone()))}),
-                ))]
-            })
-            .unwrap_or_else(|| dropped(&kind, "missing workspace_id")),
+        ("pane_created" | "pane_updated" | "pane_exited" | "pane_agent_detected", Some(data)) => {
+            workspace_id_from_pane_event(data)
+                .map(|id| {
+                    vec![HerdrIntent::UpsertThread(thread_with_metadata(
+                        id,
+                        workspace_label(data),
+                        event.received_at,
+                        json!({"event": kind}),
+                    ))]
+                })
+                .unwrap_or_else(|| dropped(&kind, "missing workspace_id"))
+        }
+        // Identical reconciliation bodies share one arm; the helper derives
+        // the named-workspace extraction from the event kind itself.
+        ("tab_focused" | "pane_focused", Some(data)) => focus_reconciliation_intents(
+            &kind,
+            data,
+            event.payload,
+            event.received_at,
+            "missing workspace_id",
+        ),
         ("pane_agent_status_changed", Some(data)) => map_agent_status(&kind, data, event),
         (
             "worktree_created"
@@ -201,7 +211,7 @@ pub fn map_ingest_batch(event: &HerdrEvent<'_>) -> Result<IngestBatch> {
                 source: SOURCE.to_owned(),
                 source_id,
             }),
-            HerdrIntent::AppendMessage(message) => Some(IngestMutation::AppendMessage(message)),
+            HerdrIntent::AppendMessage(message) => Some(IngestMutation::AppendMessage { message }),
             HerdrIntent::Dropped { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -266,16 +276,15 @@ fn map_agent_status(
             "pane_id": pane_id,
             "agent_status": status,
             "state_labels": labels,
-            "data": canonical_value(&Value::Object(data.clone())),
         }),
     };
     vec![
         HerdrIntent::UpsertContact(contact),
         HerdrIntent::UpsertThread(thread_with_metadata(
             workspace_id,
-            None,
+            workspace_label(data),
             event.received_at,
-            json!({"event": kind, "data": canonical_value(&Value::Object(data.clone()))}),
+            json!({"event": kind}),
         )),
         HerdrIntent::AppendMessage(message),
     ]
@@ -298,12 +307,25 @@ fn map_pane_moved(
             source_id: closed_workspace_id.to_owned(),
         });
     }
-    if let Some(workspace_id) = workspace_id_from_pane_event(data) {
+    let current_workspace_id = workspace_id_from_pane_event(data);
+    let closed_workspace_id = data.get("closed_workspace_id").and_then(Value::as_str);
+    if let Some(previous_workspace_id) = data.get("previous_workspace_id").and_then(Value::as_str)
+        && Some(previous_workspace_id) != current_workspace_id
+        && Some(previous_workspace_id) != closed_workspace_id
+    {
         intents.push(HerdrIntent::UpsertThread(thread_with_metadata(
-            workspace_id,
+            previous_workspace_id,
             None,
             received_at,
-            json!({"event": kind, "data": canonical_value(&Value::Object(data.clone()))}),
+            json!({"event": kind}),
+        )));
+    }
+    if let Some(workspace_id) = current_workspace_id {
+        intents.push(HerdrIntent::UpsertThread(thread_with_metadata(
+            workspace_id,
+            workspace_label(data),
+            received_at,
+            json!({"event": kind}),
         )));
     }
     if intents.is_empty() {
@@ -313,6 +335,71 @@ fn map_pane_moved(
     }
 }
 
+/// Reconciles every workspace whose persisted focus attributes a focus event
+/// can change, not just the workspace the event names.
+///
+/// Herdr derives both focus flags from the globally active workspace (pinned
+/// v0.8.0 api.rs:814-871, creation.rs:439-505): a cross-workspace switch emits
+/// workspace/tab/pane .focused events naming only the new workspace, so the
+/// previously focused workspace silently loses its workspace- and pane-level
+/// focus flags without an event of its own. Upsert replacement threads rebuilt
+/// from `bridge.workspace_snapshots` carry the corrected flags, and unchanged
+/// pane IDs/statuses make those upserts pure focus repairs. Workspaces named
+/// by the event but absent from the snapshot set keep the event-derived
+/// fallback thread.
+fn focus_reconciliation_intents(
+    kind: &str,
+    data: &Map<String, Value>,
+    payload: &Value,
+    received_at: DateTime<Utc>,
+    missing_reason: &'static str,
+) -> Vec<HerdrIntent> {
+    let snapshots = payload
+        .pointer("/bridge/workspace_snapshots")
+        .and_then(Value::as_object);
+    let named: Vec<String> = match kind {
+        "pane_focused" => workspace_id_from_pane_event(data)
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+        "tab_focused" => workspace_id_from_tab_event(data)
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => workspace_ids(data)
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+    };
+    let mut ids = named;
+    if let Some(snapshots) = snapshots {
+        for id in snapshots.keys() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+    }
+    if ids.is_empty() {
+        return dropped(kind, missing_reason);
+    }
+    ids.into_iter()
+        .map(|id| {
+            let thread = snapshots
+                .and_then(|items| items.get(&id))
+                .and_then(|snapshot| map_workspace_snapshot(snapshot, received_at))
+                .unwrap_or_else(|| {
+                    thread_with_metadata(
+                        &id,
+                        workspace_label_for(data, &id),
+                        received_at,
+                        json!({"event": kind}),
+                    )
+                });
+            HerdrIntent::UpsertThread(thread)
+        })
+        .collect()
+}
+
 fn workspace_thread(value: &Value, received_at: DateTime<Utc>) -> Option<Thread> {
     let workspace = value.as_object()?;
     let id = workspace_id(workspace)?;
@@ -320,8 +407,85 @@ fn workspace_thread(value: &Value, received_at: DateTime<Utc>) -> Option<Thread>
         id,
         workspace.get("label").and_then(Value::as_str),
         received_at,
-        Value::Object(sorted_object(Some(workspace))),
+        normalized_workspace_metadata(workspace),
     ))
+}
+
+fn normalized_workspace_metadata(workspace: &Map<String, Value>) -> Value {
+    let mut metadata = Map::new();
+    for field in ["workspace_id", "label", "active_tab_id", "agent_status"] {
+        if let Some(value) = workspace.get(field).filter(|value| value.is_string()) {
+            metadata.insert(field.to_owned(), value.clone());
+        }
+    }
+    for field in ["number", "pane_count", "tab_count"] {
+        if let Some(value) = workspace.get(field).filter(|value| value.is_number()) {
+            metadata.insert(field.to_owned(), value.clone());
+        }
+    }
+    if let Some(value) = workspace.get("focused").filter(|value| value.is_boolean()) {
+        metadata.insert("focused".to_owned(), value.clone());
+    }
+    if let Some(panes) = workspace.get("panes").and_then(Value::as_array) {
+        let panes = panes
+            .iter()
+            .filter_map(normalized_pane_metadata)
+            .collect::<Vec<_>>();
+        metadata.insert("panes".to_owned(), Value::Array(panes));
+    }
+    Value::Object(metadata)
+}
+
+fn normalized_pane_metadata(value: &Value) -> Option<Value> {
+    let pane = value.as_object()?;
+    let mut metadata = Map::new();
+    for field in [
+        "pane_id",
+        "workspace_id",
+        "tab_id",
+        "agent",
+        "display_agent",
+        "agent_status",
+    ] {
+        if let Some(value) = pane.get(field).filter(|value| value.is_string()) {
+            metadata.insert(field.to_owned(), value.clone());
+        }
+    }
+    if let Some(value) = pane.get("focused").filter(|value| value.is_boolean()) {
+        metadata.insert("focused".to_owned(), value.clone());
+    }
+    if let Some(labels) = pane.get("state_labels").and_then(Value::as_object) {
+        metadata.insert(
+            "state_labels".to_owned(),
+            Value::Object(
+                labels
+                    .iter()
+                    .filter(|(_, value)| value.is_string())
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    Some(Value::Object(metadata))
+}
+
+/// Maps an authoritative workspace snapshot to a complete Iris thread record.
+///
+/// The bridge uses this when replacing partial event-derived thread updates so
+/// storage's replace-on-upsert semantics cannot erase workspace metadata.
+pub fn map_workspace_snapshot(value: &Value, received_at: DateTime<Utc>) -> Option<Thread> {
+    workspace_thread(value, received_at)
+}
+
+fn workspace_label(data: &Map<String, Value>) -> Option<&str> {
+    data.get("workspace_label").and_then(Value::as_str)
+}
+
+fn workspace_label_for<'a>(data: &'a Map<String, Value>, workspace_id: &str) -> Option<&'a str> {
+    data.get("workspace_labels")
+        .and_then(|labels| labels.get(workspace_id))
+        .and_then(Value::as_str)
+        .or_else(|| workspace_label(data))
 }
 
 fn thread_with_metadata(
@@ -367,13 +531,18 @@ fn workspace_id(data: &Map<String, Value>) -> Option<&str> {
 }
 
 fn workspace_ids(data: &Map<String, Value>) -> Vec<&str> {
+    let mut ids = Vec::new();
     if let Some(id) = workspace_id(data) {
-        return vec![id];
+        ids.push(id);
     }
-    data.get("workspace_ids")
-        .and_then(Value::as_array)
-        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default()
+    if let Some(workspace_ids) = data.get("workspace_ids").and_then(Value::as_array) {
+        for id in workspace_ids.iter().filter_map(Value::as_str) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
 }
 
 fn workspace_id_from_tab_event(data: &Map<String, Value>) -> Option<&str> {
@@ -410,19 +579,6 @@ fn sorted_object(object: Option<&Map<String, Value>>) -> Map<String, Value> {
         .into_iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
-}
-
-fn canonical_value(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => Value::Object(
-            object
-                .iter()
-                .map(|(key, value)| (key.clone(), canonical_value(value)))
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(values.iter().map(canonical_value).collect()),
-        value => value.clone(),
-    }
 }
 
 fn labels_suffix(labels: &Map<String, Value>) -> String {
@@ -473,6 +629,93 @@ mod tests {
     }
 
     #[test]
+    fn cross_workspace_focus_reconciles_the_previous_workspace() {
+        let payload = json!({
+            "event": "workspace.focused",
+            "data": {"workspace_id": "workspace-new", "pane_id": "pane-2"},
+            "bridge": {"workspace_snapshots": {
+                "workspace-old": {"workspace_id": "workspace-old", "label": "Old", "focused": false, "panes": [
+                    {"pane_id": "pane-1", "workspace_id": "workspace-old", "agent_status": "working", "focused": false}
+                ]},
+                "workspace-new": {"workspace_id": "workspace-new", "label": "New", "focused": true, "panes": [
+                    {"pane_id": "pane-2", "workspace_id": "workspace-new", "agent_status": "working", "focused": true}
+                ]}
+            }}
+        });
+        let mapping = map_event(&HerdrEvent {
+            event_id: "bridge-event-focus",
+            payload: &payload,
+            received_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        });
+
+        let upserts: Vec<&Thread> = mapping
+            .intents
+            .iter()
+            .filter_map(|intent| match intent {
+                HerdrIntent::UpsertThread(thread) => Some(thread),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            upserts.len(),
+            2,
+            "focus events must reconcile every snapshot workspace"
+        );
+
+        let previous = upserts
+            .iter()
+            .find(|thread| thread.source_id == "workspace-old")
+            .expect("the previously focused workspace must lose focus");
+        assert_eq!(
+            previous.metadata["focused"],
+            json!(false),
+            "workspace-level focus loss must be persisted"
+        );
+        let panes = previous.metadata["panes"].as_array().unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0]["pane_id"], json!("pane-1"));
+        assert_eq!(
+            panes[0]["focused"],
+            json!(false),
+            "pane-level focus loss must be persisted"
+        );
+        assert_eq!(panes[0]["agent_status"], json!("working"));
+
+        let current = upserts
+            .iter()
+            .find(|thread| thread.source_id == "workspace-new")
+            .expect("the newly focused workspace must be reconciled");
+        assert_eq!(current.metadata["focused"], json!(true));
+        let panes = current.metadata["panes"].as_array().unwrap();
+        assert_eq!(panes[0]["pane_id"], json!("pane-2"));
+        assert_eq!(panes[0]["focused"], json!(true));
+    }
+
+    #[test]
+    fn focus_event_without_snapshots_keeps_named_fallback_thread() {
+        let mapping = map(
+            "bridge-event-focus",
+            "workspace.focused",
+            json!({"workspace_id": "workspace-new"}),
+        );
+        let upserts: Vec<&Thread> = mapping
+            .intents
+            .iter()
+            .filter_map(|intent| match intent {
+                HerdrIntent::UpsertThread(thread) => Some(thread),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            upserts.len(),
+            1,
+            "without bridge snapshots only the named workspace is mapped"
+        );
+        assert_eq!(upserts[0].source_id, "workspace-new");
+        assert_eq!(upserts[0].metadata["event"], json!("workspace_focused"));
+    }
+
+    #[test]
     fn ingest_batch_converts_status_intents_and_uses_bridge_key_for_audit() {
         let payload = json!({
             "event": "pane_agent_status_changed",
@@ -511,7 +754,7 @@ mod tests {
         ));
         assert!(matches!(
             batch.mutations[2],
-            IngestMutation::AppendMessage(_)
+            IngestMutation::AppendMessage { .. }
         ));
     }
 
@@ -548,13 +791,14 @@ mod tests {
     }
 
     #[test]
-    fn maps_agent_status_with_deterministic_contact_thread_and_message() {
+    fn maps_agent_status_without_copying_the_source_payload_into_metadata() {
         let mapping = map(
             "evt-1",
             "pane_agent_status_changed",
             json!({
                 "workspace_id": "workspace-1", "pane_id": "pane-2", "agent": "codex",
-                "agent_status": "working", "state_labels": {"branch": "main", "task": "COD-438"}
+                "agent_status": "working", "state_labels": {"branch": "main", "task": "COD-438"},
+                "title": "private pane title", "private_payload": "fixture-only-do-not-forward"
             }),
         );
         assert_eq!(mapping.dedupe_key, "herdr:evt-1");
@@ -566,6 +810,102 @@ mod tests {
         assert_eq!(message.sender.source_id, "unknown-host:codex");
         assert_eq!(message.source_id, "evt-1");
         assert_eq!(message.thread_id, thread_uuid("workspace-1"));
+        assert!(message.metadata.get("data").is_none());
+        assert!(!message.metadata.to_string().contains("private pane title"));
+        assert!(
+            !message
+                .metadata
+                .to_string()
+                .contains("fixture-only-do-not-forward")
+        );
+    }
+
+    #[test]
+    fn enriched_workspace_label_survives_partial_agent_status_update() {
+        let mapping = map(
+            "evt-labeled",
+            "pane_agent_status_changed",
+            json!({
+                "workspace_id": "workspace-1", "workspace_label": "Iris Pilot",
+                "pane_id": "pane-2", "agent": "codex", "agent_status": "working"
+            }),
+        );
+        let HerdrIntent::UpsertThread(thread) = &mapping.intents[1] else {
+            panic!("thread intent")
+        };
+        assert_eq!(thread.title.as_deref(), Some("Iris Pilot"));
+    }
+
+    #[test]
+    fn workspace_thread_metadata_contains_only_normalized_summary_fields() {
+        let mapping = map(
+            "evt-workspace",
+            "workspace_created",
+            json!({
+                "workspace": {
+                    "workspace_id": "workspace-1",
+                    "label": "Iris Pilot",
+                    "tokens": {"access": "fixture-only-do-not-forward"},
+                    "worktree": {"repo_root": "/private/repo"},
+                    "private_payload": "fixture-only-do-not-forward"
+                }
+            }),
+        );
+        let HerdrIntent::UpsertThread(thread) = &mapping.intents[0] else {
+            panic!("thread intent")
+        };
+        assert_eq!(thread.title.as_deref(), Some("Iris Pilot"));
+        assert!(
+            !thread
+                .metadata
+                .to_string()
+                .contains("fixture-only-do-not-forward")
+        );
+        assert!(thread.metadata.get("tokens").is_none());
+        assert!(thread.metadata.get("worktree").is_none());
+        assert_eq!(thread.metadata["workspace_id"], "workspace-1");
+        assert_eq!(thread.metadata["label"], "Iris Pilot");
+    }
+
+    #[test]
+    fn workspace_snapshot_keeps_safe_pane_summary_but_drops_raw_details() {
+        let snapshot = json!({
+            "workspace_id": "workspace-1",
+            "label": "Iris Pilot",
+            "number": 1,
+            "focused": true,
+            "pane_count": 1,
+            "tab_count": 1,
+            "active_tab_id": "tab-1",
+            "agent_status": "working",
+            "worktree": {"repo_root": "/private/repo"},
+            "tokens": {"access": "fixture-only-do-not-forward"},
+            "panes": [{
+                "pane_id": "pane-1",
+                "workspace_id": "workspace-1",
+                "tab_id": "tab-1",
+                "agent": "codex",
+                "agent_status": "working",
+                "state_labels": {"phase": "test"},
+                "title": "private pane title",
+                "cwd": "/private/repo",
+                "tokens": {"access": "fixture-only-do-not-forward"}
+            }]
+        });
+        let thread =
+            map_workspace_snapshot(&snapshot, Utc.timestamp_opt(1_700_000_000, 0).unwrap())
+                .unwrap();
+        assert_eq!(thread.metadata["panes"][0]["pane_id"], "pane-1");
+        assert_eq!(thread.metadata["panes"][0]["tab_id"], "tab-1");
+        assert_eq!(thread.metadata["panes"][0]["agent_status"], "working");
+        assert!(!thread.metadata.to_string().contains("private pane title"));
+        assert!(!thread.metadata.to_string().contains("/private/repo"));
+        assert!(
+            !thread
+                .metadata
+                .to_string()
+                .contains("fixture-only-do-not-forward")
+        );
     }
 
     #[test]
@@ -611,7 +951,7 @@ mod tests {
             "move-1",
             "pane_moved",
             json!({
-                "closed_workspace_id":"old", "created_workspace":{"workspace_id":"new","label":"New"},
+                "previous_workspace_id":"old", "closed_workspace_id":"old", "created_workspace":{"workspace_id":"new","label":"New"},
                 "pane":{"workspace_id":"current","pane_id":"p"}
             }),
         );
@@ -624,6 +964,28 @@ mod tests {
         assert!(
             matches!(&mapping.intents[2], HerdrIntent::UpsertThread(thread) if thread.source_id == "current")
         );
+    }
+
+    #[test]
+    fn pane_moved_upserts_previous_and_current_open_workspaces() {
+        let mapping = map(
+            "move-active-1",
+            "pane_moved",
+            json!({
+                "previous_workspace_id": "old",
+                "pane": {"workspace_id": "current", "pane_id": "p"}
+            }),
+        );
+
+        let upserted_workspaces = mapping
+            .intents
+            .iter()
+            .filter_map(|intent| match intent {
+                HerdrIntent::UpsertThread(thread) => Some(thread.source_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(upserted_workspaces, ["old", "current"]);
     }
 
     #[test]
