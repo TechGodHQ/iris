@@ -1158,6 +1158,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_recovery_drops_dotted_status_when_workspace_is_missing() {
+        let dir = tempdir().unwrap();
+        let spool = Arc::new(Mutex::new(Spool::open(dir.path().join("state")).unwrap()));
+        let mut source_event: Value = serde_json::from_str(STATUS_EVENT).unwrap();
+        source_event["data"]["workspace_id"] = json!("workspace-closed");
+        sanitize_event_payload(&mut source_event).unwrap();
+        assert_eq!(source_event["event"], "pane.agent_status_changed");
+        spool
+            .lock()
+            .await
+            .append_unmapped_upstream_event(
+                source_event,
+                Utc::now() - chrono::Duration::seconds(10),
+            )
+            .unwrap();
+
+        resolve_unmapped_events(&spool, &BTreeMap::new(), &BTreeMap::new())
+            .await
+            .unwrap();
+        let mut spool = spool.lock().await;
+        assert!(spool.unmapped_event_payloads().unwrap().is_empty());
+        assert!(spool.flush_due(Utc::now()).unwrap());
+
+        let batch = spool.oldest_batch().unwrap().unwrap();
+        drop(spool);
+        let value: Value = serde_json::from_str(&batch.body).unwrap();
+        assert_eq!(value["audit"]["metadata"]["dropped_count"], 1);
+        assert_eq!(
+            value["audit"]["metadata"]["missing_workspace_snapshot_event_count"],
+            1
+        );
+        assert_eq!(value["audit"]["metadata"]["mutation_count"], 0);
+        assert_eq!(value["mutations"], json!([]));
+    }
+
+    #[tokio::test]
     async fn interrupted_status_snapshot_reconciles_to_current_pane_state() {
         let dir = tempdir().unwrap();
         let spool = Arc::new(Mutex::new(Spool::open(dir.path().join("state")).unwrap()));

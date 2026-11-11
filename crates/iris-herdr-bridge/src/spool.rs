@@ -574,7 +574,10 @@ fn enrich_thread_snapshots(
         .get("event")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if event_kind == "pane_agent_status_changed" {
+    if matches!(
+        event_kind,
+        "pane_agent_status_changed" | "pane.agent_status_changed"
+    ) {
         let workspace_id = payload
             .pointer("/data/workspace_id")
             .and_then(Value::as_str);
@@ -955,6 +958,29 @@ mod tests {
             (1, true)
         );
         assert_eq!(mutations, Vec::new());
+    }
+
+    #[test]
+    fn dotted_status_without_an_authoritative_workspace_drops_the_whole_batch() {
+        let dir = tempdir().unwrap();
+        let mut spool = Spool::open_with_limit(dir.path().join("spool"), 10).unwrap();
+        let received_at = Utc::now();
+        let mut payload = pane_status_event(8);
+        payload["bridge"]["workspace_snapshots"] = json!({});
+        assert_eq!(payload["event"], "pane.agent_status_changed");
+
+        spool.append_upstream_event(payload, received_at).unwrap();
+        assert!(spool.flush_due(received_at + Duration::seconds(5)).unwrap());
+
+        let batch = spool.oldest_batch().unwrap().unwrap();
+        let value: Value = serde_json::from_str(&batch.body).unwrap();
+        assert_eq!(value["audit"]["metadata"]["dropped_count"], 1);
+        assert_eq!(
+            value["audit"]["metadata"]["missing_workspace_snapshot_event_count"],
+            1
+        );
+        assert_eq!(value["audit"]["metadata"]["mutation_count"], 0);
+        assert_eq!(value["mutations"], json!([]));
     }
 
     #[test]
