@@ -1178,7 +1178,7 @@ mod tests {
             .await
             .unwrap();
         let mut spool = spool.lock().await;
-        assert!(spool.unmapped_event_payloads().unwrap().is_empty());
+        assert_eq!(spool.unmapped_event_payloads().unwrap(), Vec::new());
         assert!(spool.flush_due(Utc::now()).unwrap());
 
         let batch = spool.oldest_batch().unwrap().unwrap();
