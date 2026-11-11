@@ -552,7 +552,7 @@ fn subscription_request(request_id: &str, pane_ids: &BTreeSet<String>) -> Value 
 
 fn changed_pane(kind: &str, subscribed: &BTreeSet<String>, current: &BTreeSet<String>) -> bool {
     match kind {
-        "pane_created" | "pane_moved" | "pane_closed" => current != subscribed,
+        "tab_closed" | "pane_created" | "pane_moved" | "pane_closed" => current != subscribed,
         _ => false,
     }
 }
@@ -560,7 +560,8 @@ fn changed_pane(kind: &str, subscribed: &BTreeSet<String>, current: &BTreeSet<St
 fn refresh_pane_snapshot(kind: &str) -> bool {
     matches!(
         kind,
-        "pane_created"
+        "tab_closed"
+            | "pane_created"
             | "pane_closed"
             | "pane_updated"
             | "pane_moved"
@@ -811,6 +812,23 @@ mod tests {
         let mut response: Value = serde_json::from_str(WORKSPACE_LIST_RESPONSE).unwrap();
         response["id"] = request["id"].clone();
         response["result"]["workspaces"][0]["agent_status"] = json!(status);
+        super::write_json_line(&mut stream, &response)
+            .await
+            .unwrap();
+    }
+
+    async fn respond_workspace_list_with_counts(
+        listener: &UnixListener,
+        pane_count: usize,
+        tab_count: usize,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert_eq!(request["method"], "workspace.list");
+        let mut response: Value = serde_json::from_str(WORKSPACE_LIST_RESPONSE).unwrap();
+        response["id"] = request["id"].clone();
+        response["result"]["workspaces"][0]["pane_count"] = json!(pane_count);
+        response["result"]["workspaces"][0]["tab_count"] = json!(tab_count);
         super::write_json_line(&mut stream, &response)
             .await
             .unwrap();
@@ -1601,6 +1619,119 @@ mod tests {
         );
         server.await.unwrap();
         assert_eq!(spool.lock().await.pending_event_count(), 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn tab_closed_refreshes_authoritative_pane_membership_before_spooling() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut ping_stream, _) = listener.accept().await.unwrap();
+            let ping = read_request(&mut ping_stream).await;
+            super::write_json_line(
+                &mut ping_stream,
+                &json!({
+                    "id": ping["id"],
+                    "result": {"type": "pong", "version": "0.8.0", "protocol": 19}
+                }),
+            )
+            .await
+            .unwrap();
+            drop(ping_stream);
+
+            let active_pane = synthetic_pane();
+            let mut closed_tab_pane = synthetic_pane();
+            closed_tab_pane["pane_id"] = json!("pane-2");
+            closed_tab_pane["tab_id"] = json!("tab-closed");
+            closed_tab_pane["focused"] = json!(false);
+            let initial_panes = json!([active_pane.clone(), closed_tab_pane.clone()]);
+            respond_pane_list(&listener, initial_panes.clone()).await;
+            respond_workspace_list_with_counts(&listener, 2, 2).await;
+
+            let (mut event_stream, _) = listener.accept().await.unwrap();
+            let subscribe = read_request(&mut event_stream).await;
+            assert_eq!(subscribe["method"], "events.subscribe");
+            let subscriptions = subscribe["params"]["subscriptions"].as_array().unwrap();
+            for pane_id in ["pane-1", "pane-2"] {
+                assert!(subscriptions.iter().any(|item| {
+                    item["type"] == "pane.agent_status_changed" && item["pane_id"] == pane_id
+                }));
+            }
+            let ack = ACK.replace("fixture-id", subscribe["id"].as_str().unwrap());
+            event_stream.write_all(ack.as_bytes()).await.unwrap();
+            event_stream.write_all(b"\n").await.unwrap();
+
+            respond_pane_list(&listener, initial_panes).await;
+            respond_workspace_list_with_counts(&listener, 2, 2).await;
+
+            let event = json!({
+                "event": "tab.closed",
+                "data": {"workspace_id": "workspace-1", "tab_id": "tab-closed"}
+            });
+            super::write_json_line(&mut event_stream, &event)
+                .await
+                .unwrap();
+            event_stream.shutdown().await.unwrap();
+
+            respond_workspace_list_with_counts(&listener, 1, 1).await;
+            match tokio::time::timeout(Duration::from_millis(750), listener.accept()).await {
+                Ok(Ok((mut refresh_stream, _))) => {
+                    let refresh = read_request(&mut refresh_stream).await;
+                    assert_eq!(refresh["method"], "pane.list");
+                    super::write_json_line(
+                        &mut refresh_stream,
+                        &json!({
+                            "id": refresh["id"],
+                            "result": {
+                                "type": "pane_list",
+                                "panes": [active_pane]
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    true
+                }
+                Ok(Err(error)) => panic!("accepting pane.list failed: {error}"),
+                Err(_) => false,
+            }
+        });
+
+        let spool = Arc::new(Mutex::new(Spool::open(dir.path().join("state")).unwrap()));
+        let subscription_end = consume_subscription(&socket_path, &spool).await.unwrap();
+        let pane_list_refreshed = server.await.unwrap();
+
+        let mut spool = spool.lock().await;
+        assert!(
+            spool
+                .flush_due(Utc::now() + chrono::Duration::seconds(6))
+                .unwrap()
+        );
+        let batch = spool.oldest_batch().unwrap().unwrap();
+        drop(spool);
+        let value: Value = serde_json::from_str(&batch.body).unwrap();
+        let final_thread = value["mutations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|mutation| {
+                mutation["kind"] == "upsert_thread" && mutation["source_id"] == "workspace-1"
+            })
+            .unwrap();
+        let pane_count = final_thread["metadata"]["pane_count"].as_u64().unwrap();
+        let panes = final_thread["metadata"]["panes"].as_array().unwrap();
+        assert_eq!(
+            u64::try_from(panes.len()).unwrap(),
+            pane_count,
+            "snapshot pane count must match membership"
+        );
+        assert_eq!(pane_count, 1);
+        assert_eq!(panes[0]["pane_id"], "pane-1");
+        assert!(pane_list_refreshed, "tab.closed must refresh pane.list");
+        assert_eq!(subscription_end, SubscriptionEnd::PaneSetChanged);
     }
 
     #[test]
