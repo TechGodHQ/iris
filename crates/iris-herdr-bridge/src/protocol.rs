@@ -138,14 +138,39 @@ async fn consume_subscription(
         // independent event kinds without a total source order. Refresh the
         // authoritative workspace snapshot before normalizing any event that
         // can upsert a thread; never let an old event payload regress it.
-        if refresh_workspace_snapshot(&event_kind) {
-            workspace_snapshots = list_workspace_snapshots(socket_path).await?;
-        }
+        let previous_workspace_snapshots = if refresh_workspace_snapshot(&event_kind) {
+            let refreshed = list_workspace_snapshots(socket_path).await?;
+            Some(std::mem::replace(&mut workspace_snapshots, refreshed))
+        } else {
+            None
+        };
         let current_panes = if refresh_pane_snapshot(&event_kind) {
             list_panes(socket_path).await?
         } else {
             pane_infos.clone()
         };
+        if matches!(
+            event_kind.as_str(),
+            "workspace_moved" | "workspace_reordered"
+        ) && let Some(previous) = previous_workspace_snapshots.as_ref()
+        {
+            let mut ids = payload
+                .get("data")
+                .and_then(Value::as_object)
+                .map(workspace_ids_in)
+                .unwrap_or_default();
+            ids.extend(changed_workspace_snapshot_ids(
+                previous,
+                &workspace_snapshots,
+                &current_panes,
+            ));
+            if let Some(data) = payload.get_mut("data").and_then(Value::as_object_mut) {
+                data.insert(
+                    "workspace_ids".to_owned(),
+                    Value::Array(ids.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
         enrich_workspace_snapshots(&mut payload, &workspace_snapshots, &current_panes);
         spool
             .lock()
@@ -725,6 +750,25 @@ fn normalized_workspace_snapshot(
     Value::Object(normalized)
 }
 
+fn changed_workspace_snapshot_ids(
+    previous: &BTreeMap<String, Value>,
+    current: &BTreeMap<String, Value>,
+    pane_infos: &BTreeMap<String, Value>,
+) -> BTreeSet<String> {
+    current
+        .iter()
+        .filter_map(|(id, snapshot)| {
+            let current = normalized_workspace_snapshot(id, snapshot, pane_infos);
+            previous
+                .get(id)
+                .is_none_or(|snapshot| {
+                    normalized_workspace_snapshot(id, snapshot, pane_infos) != current
+                })
+                .then(|| id.clone())
+        })
+        .collect()
+}
+
 fn enrich_workspace_snapshots(
     payload: &mut Value,
     workspace_snapshots: &BTreeMap<String, Value>,
@@ -754,6 +798,17 @@ fn enrich_workspace_snapshots(
     ) {
         ids.extend(workspace_snapshots.keys().cloned());
     }
+    let recover_move = matches!(
+        event_kind.as_str(),
+        "workspace_moved" | "workspace_reordered"
+    ) && data.get("workspace_ids").is_none();
+    if recover_move {
+        // Unmapped events recovered after restart have no pre-event snapshot
+        // to diff, so restore every current workspace before sealing them.
+        ids.extend(workspace_snapshots.keys().cloned());
+    }
+    let recovered_workspace_ids =
+        recover_move.then(|| ids.iter().cloned().map(Value::String).collect::<Vec<_>>());
     let primary_id = primary_workspace_id(data).map(ToOwned::to_owned);
     let mut current_snapshots = Map::new();
     let mut current_labels = Map::new();
@@ -769,6 +824,9 @@ fn enrich_workspace_snapshots(
     }
 
     if let Some(data) = payload.get_mut("data").and_then(Value::as_object_mut) {
+        if let Some(workspace_ids) = recovered_workspace_ids {
+            data.insert("workspace_ids".to_owned(), Value::Array(workspace_ids));
+        }
         data.remove("workspace_label");
         data.remove("workspace_labels");
         if let Some(label) = primary_id.as_deref().and_then(|id| current_labels.get(id)) {
@@ -809,6 +867,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    use iris_core::{IngestBatch, IngestMutation, IngestStore};
+    use iris_storage::LocalFsIngestStore;
     use tempfile::tempdir;
     use tokio::net::UnixListener;
 
@@ -861,6 +921,21 @@ mod tests {
             .unwrap();
     }
 
+    async fn respond_workspace_list_with_workspaces(listener: &UnixListener, workspaces: Value) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        assert_eq!(request["method"], "workspace.list");
+        super::write_json_line(
+            &mut stream,
+            &json!({
+                "id": request["id"],
+                "result": {"type": "workspace_list", "workspaces": workspaces}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
     async fn respond_pane_list(listener: &UnixListener, panes: Value) {
         let (mut stream, _) = listener.accept().await.unwrap();
         let request = read_request(&mut stream).await;
@@ -904,6 +979,187 @@ mod tests {
             "active_tab_id": if workspace_id == "workspace-old" { "tab-1" } else { "tab-2" },
             "agent_status": "working"
         })
+    }
+
+    #[test]
+    fn unresolved_workspace_move_rebuilds_all_snapshots_during_recovery() {
+        let mut payload = json!({
+            "event": "workspace_moved",
+            "data": {"workspace_id": "workspace-a"}
+        });
+        let snapshots = BTreeMap::from([
+            (
+                "workspace-a".to_owned(),
+                json!({"workspace_id":"workspace-a", "label":"A", "number":2}),
+            ),
+            (
+                "workspace-b".to_owned(),
+                json!({"workspace_id":"workspace-b", "label":"B", "number":1}),
+            ),
+        ]);
+
+        enrich_workspace_snapshots(&mut payload, &snapshots, &BTreeMap::new());
+
+        let reconciled = payload["bridge"]["workspace_snapshots"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            reconciled,
+            BTreeSet::from(["workspace-a".to_owned(), "workspace-b".to_owned()]),
+            "a recovered move without its pre-event snapshot must rebuild all current workspaces"
+        );
+        let mapper_ids = payload["data"]["workspace_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            mapper_ids,
+            BTreeSet::from(["workspace-a".to_owned(), "workspace-b".to_owned()]),
+            "recovery must pass every current workspace ID into the move mapper"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn workspace_move_persists_reordered_numbers_for_displaced_workspaces() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let ingest_dir = dir.path().join("ingest");
+        let store = LocalFsIngestStore::new(&ingest_dir);
+        let initial_workspaces = json!([
+            {"workspace_id":"workspace-a", "label":"A", "number":1},
+            {"workspace_id":"workspace-b", "label":"B", "number":2},
+            {"workspace_id":"workspace-c", "label":"C", "number":3}
+        ]);
+        let initial_mutations = initial_workspaces
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|workspace| {
+                IngestMutation::UpsertThread(
+                    iris_providers::herdr::map_workspace_snapshot(workspace, Utc::now()).unwrap(),
+                )
+            })
+            .collect();
+        store
+            .apply_batch(IngestBatch {
+                source: "herdr".to_owned(),
+                replay_key: "seed-workspace-order".to_owned(),
+                mutations: initial_mutations,
+                cursor: None,
+                audit: None,
+            })
+            .await
+            .unwrap();
+
+        let moved_workspaces = json!([
+            {"workspace_id":"workspace-b", "label":"B", "number":1},
+            {"workspace_id":"workspace-a", "label":"A", "number":2},
+            {"workspace_id":"workspace-c", "label":"C", "number":3}
+        ]);
+        let server = tokio::spawn(async move {
+            let (mut ping_stream, _) = listener.accept().await.unwrap();
+            let ping = read_request(&mut ping_stream).await;
+            assert_eq!(ping["method"], "ping");
+            super::write_json_line(
+                &mut ping_stream,
+                &json!({
+                    "id": ping["id"],
+                    "result": {"type": "pong", "version": "0.8.0", "protocol": 19}
+                }),
+            )
+            .await
+            .unwrap();
+            drop(ping_stream);
+
+            respond_pane_list(&listener, json!([])).await;
+            respond_workspace_list_with_workspaces(&listener, initial_workspaces.clone()).await;
+
+            let (mut event_stream, _) = listener.accept().await.unwrap();
+            let subscribe = read_request(&mut event_stream).await;
+            assert_eq!(subscribe["method"], "events.subscribe");
+            let ack = ACK.replace("fixture-id", subscribe["id"].as_str().unwrap());
+            event_stream.write_all(ack.as_bytes()).await.unwrap();
+            event_stream.write_all(b"\n").await.unwrap();
+
+            respond_pane_list(&listener, json!([])).await;
+            respond_workspace_list_with_workspaces(&listener, initial_workspaces).await;
+
+            super::write_json_line(
+                &mut event_stream,
+                &json!({
+                    "event": "workspace.moved",
+                    "data": {"workspace_id": "workspace-a"}
+                }),
+            )
+            .await
+            .unwrap();
+            respond_workspace_list_with_workspaces(&listener, moved_workspaces).await;
+            event_stream.shutdown().await.unwrap();
+        });
+
+        let spool = Arc::new(Mutex::new(Spool::open(dir.path().join("spool")).unwrap()));
+        assert_eq!(
+            consume_subscription(&socket_path, &spool).await.unwrap(),
+            SubscriptionEnd::PeerClosed
+        );
+        server.await.unwrap();
+
+        let mut spool = spool.lock().await;
+        assert!(
+            spool
+                .flush_due(Utc::now() + chrono::Duration::seconds(6))
+                .unwrap()
+        );
+        let batch_body = spool.oldest_batch().unwrap().unwrap().body;
+        drop(spool);
+
+        let batch: IngestBatch = serde_json::from_str(&batch_body).unwrap();
+        let upserted_workspaces = batch
+            .mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                IngestMutation::UpsertThread(thread) => Some(thread.source_id.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            upserted_workspaces,
+            BTreeSet::from(["workspace-a".to_owned(), "workspace-b".to_owned()]),
+            "the moved workspace and displaced peer must both be refreshed"
+        );
+        store.apply_batch(batch).await.unwrap();
+
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(ingest_dir.join("ingest-state.json")).unwrap())
+                .unwrap();
+        let persisted_numbers = state["threads"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|thread| {
+                (
+                    thread["source_id"].as_str().unwrap().to_owned(),
+                    thread["metadata"]["number"].as_u64().unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            persisted_numbers,
+            std::collections::BTreeMap::from([
+                ("workspace-a".to_owned(), 2),
+                ("workspace-b".to_owned(), 1),
+                ("workspace-c".to_owned(), 3),
+            ]),
+            "the persisted store must contain the full authoritative workspace order"
+        );
     }
 
     fn synthetic_idle_pane() -> Value {

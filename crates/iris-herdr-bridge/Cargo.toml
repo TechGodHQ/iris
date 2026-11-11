@@ -23,5 +23,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+iris-storage = { path = "../iris-storage" }
 tempfile = "3"
 wiremock = { workspace = true }

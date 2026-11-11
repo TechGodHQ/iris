@@ -531,13 +531,18 @@ fn workspace_id(data: &Map<String, Value>) -> Option<&str> {
 }
 
 fn workspace_ids(data: &Map<String, Value>) -> Vec<&str> {
+    let mut ids = Vec::new();
     if let Some(id) = workspace_id(data) {
-        return vec![id];
+        ids.push(id);
     }
-    data.get("workspace_ids")
-        .and_then(Value::as_array)
-        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default()
+    if let Some(workspace_ids) = data.get("workspace_ids").and_then(Value::as_array) {
+        for id in workspace_ids.iter().filter_map(Value::as_str) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
 }
 
 fn workspace_id_from_tab_event(data: &Map<String, Value>) -> Option<&str> {

@@ -1067,6 +1067,7 @@ dependencies = [
  "chrono",
  "iris-core",
  "iris-providers",
+ "iris-storage",
  "reqwest",
  "serde",
  "serde_json",
