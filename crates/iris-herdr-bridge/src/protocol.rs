@@ -733,7 +733,27 @@ fn enrich_workspace_snapshots(
     let Some(data) = payload.get("data").and_then(Value::as_object) else {
         return;
     };
-    let ids = workspace_ids_in(data);
+    let mut ids = workspace_ids_in(data);
+    // Herdr derives both focus flags from the globally active workspace
+    // (pinned v0.8.0 api.rs:814-871, creation.rs:439-505): a focus switch
+    // emits workspace/tab/pane .focused events naming only the newly focused
+    // workspace while the previously focused workspace loses both flags
+    // silently, with no blur event of its own. Drain-time reconciliation
+    // rebuilds persisted threads from bridge.workspace_snapshots, so focus
+    // events must attach every workspace's authoritative snapshot — not just
+    // the event's target — or the old workspace's stale focused=true persists
+    // with nothing to repair it.
+    let event_kind = payload
+        .get("event")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .replace('.', "_");
+    if matches!(
+        event_kind.as_str(),
+        "workspace_focused" | "tab_focused" | "pane_focused"
+    ) {
+        ids.extend(workspace_snapshots.keys().cloned());
+    }
     let primary_id = primary_workspace_id(data).map(ToOwned::to_owned);
     let mut current_snapshots = Map::new();
     let mut current_labels = Map::new();
@@ -870,6 +890,19 @@ mod tests {
             "state_labels": {"phase": "working"},
             "tokens": {},
             "revision": 1
+        })
+    }
+
+    fn cross_workspace(workspace_id: &str, number: u64, label: &str, focused: bool) -> Value {
+        json!({
+            "workspace_id": workspace_id,
+            "number": number,
+            "label": label,
+            "focused": focused,
+            "pane_count": 1,
+            "tab_count": 1,
+            "active_tab_id": if workspace_id == "workspace-old" { "tab-1" } else { "tab-2" },
+            "agent_status": "working"
         })
     }
 
@@ -1890,6 +1923,232 @@ mod tests {
             subscription_end,
             SubscriptionEnd::PeerClosed,
             "membership-preserving focus change must not reconnect the subscription"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn cross_workspace_focus_switch_unfocuses_the_previous_workspace() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut ping_stream, _) = listener.accept().await.unwrap();
+            let ping = read_request(&mut ping_stream).await;
+            super::write_json_line(
+                &mut ping_stream,
+                &json!({
+                    "id": ping["id"],
+                    "result": {"type": "pong", "version": "0.8.0", "protocol": 19}
+                }),
+            )
+            .await
+            .unwrap();
+            drop(ping_stream);
+
+            // Startup snapshots focus workspace-old/pane-1; workspace-new and
+            // pane-2 exist unfocused. Pane IDs and agent statuses never change
+            // across the switch; only the focus flags flip.
+            let mut startup_old_pane = synthetic_pane();
+            startup_old_pane["pane_id"] = json!("pane-1");
+            startup_old_pane["workspace_id"] = json!("workspace-old");
+            startup_old_pane["tab_id"] = json!("tab-1");
+            startup_old_pane["focused"] = json!(true);
+            let mut startup_new_pane = synthetic_pane();
+            startup_new_pane["pane_id"] = json!("pane-2");
+            startup_new_pane["workspace_id"] = json!("workspace-new");
+            startup_new_pane["tab_id"] = json!("tab-2");
+            startup_new_pane["focused"] = json!(false);
+            respond_pane_list(&listener, json!([startup_old_pane, startup_new_pane])).await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request["method"], "workspace.list");
+            super::write_json_line(
+                &mut stream,
+                &json!({
+                    "id": request["id"],
+                    "result": {"type": "workspace_list", "workspaces": [
+                        cross_workspace("workspace-old", 1, "Old", true),
+                        cross_workspace("workspace-new", 2, "New", false)
+                    ]}
+                }),
+            )
+            .await
+            .unwrap();
+            drop(stream);
+
+            let (mut event_stream, _) = listener.accept().await.unwrap();
+            let subscribe = read_request(&mut event_stream).await;
+            assert_eq!(subscribe["method"], "events.subscribe");
+            let ack = ACK.replace("fixture-id", subscribe["id"].as_str().unwrap());
+            event_stream.write_all(ack.as_bytes()).await.unwrap();
+            event_stream.write_all(b"\n").await.unwrap();
+
+            // Post-ACK baseline refresh: pane.list then workspace.list.
+            let mut baseline_old_pane = synthetic_pane();
+            baseline_old_pane["pane_id"] = json!("pane-1");
+            baseline_old_pane["workspace_id"] = json!("workspace-old");
+            baseline_old_pane["tab_id"] = json!("tab-1");
+            baseline_old_pane["focused"] = json!(true);
+            let mut baseline_new_pane = synthetic_pane();
+            baseline_new_pane["pane_id"] = json!("pane-2");
+            baseline_new_pane["workspace_id"] = json!("workspace-new");
+            baseline_new_pane["tab_id"] = json!("tab-2");
+            baseline_new_pane["focused"] = json!(false);
+            respond_pane_list(&listener, json!([baseline_old_pane, baseline_new_pane])).await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request["method"], "workspace.list");
+            super::write_json_line(
+                &mut stream,
+                &json!({
+                    "id": request["id"],
+                    "result": {"type": "workspace_list", "workspaces": [
+                        cross_workspace("workspace-old", 1, "Old", true),
+                        cross_workspace("workspace-new", 2, "New", false)
+                    ]}
+                }),
+            )
+            .await
+            .unwrap();
+            drop(stream);
+
+            // Pinned Herdr v0.8.0 emits workspace.focused, tab.focused, then
+            // pane.focused when focus moves cross-workspace. Every event names
+            // only the NEW workspace; no blur event exists for workspace-old,
+            // whose workspace- and pane-level focus flags simply flip. The
+            // workspace.list/pane.list caches lag behind the switch until the
+            // final event, mirroring a real poll race.
+            let focus_sequence = [(true, false), (true, false), (false, true)];
+            for (event_kind, (old_focused, new_focused)) in
+                ["workspace.focused", "tab.focused", "pane.focused"]
+                    .into_iter()
+                    .zip(focus_sequence)
+            {
+                let event = json!({
+                    "event": event_kind,
+                    "data": {"workspace_id": "workspace-new", "pane_id": "pane-2"}
+                });
+                super::write_json_line(&mut event_stream, &event)
+                    .await
+                    .unwrap();
+
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                        .await
+                        .expect("workspace.list refresh must arrive")
+                        .unwrap();
+                let request = read_request(&mut stream).await;
+                assert_eq!(request["method"], "workspace.list");
+                super::write_json_line(
+                    &mut stream,
+                    &json!({
+                        "id": request["id"],
+                        "result": {"type": "workspace_list", "workspaces": [
+                            cross_workspace("workspace-old", 1, "Old", old_focused),
+                            cross_workspace("workspace-new", 2, "New", new_focused)
+                        ]}
+                    }),
+                )
+                .await
+                .unwrap();
+                drop(stream);
+
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                        .await
+                        .expect("pane.list refresh must arrive")
+                        .unwrap();
+                let request = read_request(&mut stream).await;
+                assert_eq!(request["method"], "pane.list");
+                let mut pane_1 = synthetic_pane();
+                pane_1["pane_id"] = json!("pane-1");
+                pane_1["workspace_id"] = json!("workspace-old");
+                pane_1["tab_id"] = json!("tab-1");
+                pane_1["focused"] = json!(old_focused);
+                let mut pane_2 = synthetic_pane();
+                pane_2["pane_id"] = json!("pane-2");
+                pane_2["workspace_id"] = json!("workspace-new");
+                pane_2["tab_id"] = json!("tab-2");
+                pane_2["focused"] = json!(new_focused);
+                super::write_json_line(
+                    &mut stream,
+                    &json!({
+                        "id": request["id"],
+                        "result": {"type": "pane_list", "panes": [pane_1, pane_2]}
+                    }),
+                )
+                .await
+                .unwrap();
+                drop(stream);
+            }
+            event_stream.shutdown().await.unwrap();
+        });
+
+        let spool = Arc::new(Mutex::new(Spool::open(dir.path().join("state")).unwrap()));
+        let subscription_end = consume_subscription(&socket_path, &spool).await.unwrap();
+        server.await.unwrap();
+
+        let mut spool = spool.lock().await;
+        assert!(
+            spool
+                .flush_due(Utc::now() + chrono::Duration::seconds(6))
+                .unwrap()
+        );
+        let batch = spool.oldest_batch().unwrap().unwrap();
+        drop(spool);
+        let value: Value = serde_json::from_str(&batch.body).unwrap();
+        let mutations = value["mutations"].as_array().unwrap();
+
+        let previous = mutations
+            .iter()
+            .rev()
+            .find(|mutation| {
+                mutation["kind"] == "upsert_thread" && mutation["source_id"] == "workspace-old"
+            })
+            .expect(
+                "the previously focused workspace must receive a replacement thread that clears its focus",
+            );
+        assert_eq!(
+            previous["metadata"]["focused"],
+            json!(false),
+            "stale workspace-old focused=true must be replaced by the authoritative workspace.list"
+        );
+        let previous_panes = previous["metadata"]["panes"].as_array().unwrap();
+        assert_eq!(
+            previous_panes.len(),
+            1,
+            "pane membership must not change across the focus switch"
+        );
+        assert_eq!(previous_panes[0]["pane_id"], json!("pane-1"));
+        assert_eq!(
+            previous_panes[0]["focused"],
+            json!(false),
+            "the previous pane must lose focus with its workspace"
+        );
+        assert_eq!(
+            previous_panes[0]["agent_status"],
+            json!("working"),
+            "unchanged agent statuses must survive the focus repair"
+        );
+
+        let current = mutations
+            .iter()
+            .rev()
+            .find(|mutation| {
+                mutation["kind"] == "upsert_thread" && mutation["source_id"] == "workspace-new"
+            })
+            .expect("the newly focused workspace must receive a replacement thread");
+        assert_eq!(current["metadata"]["focused"], json!(true));
+        let current_panes = current["metadata"]["panes"].as_array().unwrap();
+        assert_eq!(current_panes.len(), 1);
+        assert_eq!(current_panes[0]["pane_id"], json!("pane-2"));
+        assert_eq!(current_panes[0]["focused"], json!(true));
+
+        assert_eq!(
+            subscription_end,
+            SubscriptionEnd::PeerClosed,
+            "membership-preserving cross-workspace focus change must not reconnect"
         );
     }
 

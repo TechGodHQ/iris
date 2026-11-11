@@ -106,7 +106,7 @@ pub fn map_event(event: &HerdrEvent<'_>) -> HerdrMapping {
                 }]
             })
             .unwrap_or_else(|| dropped(&kind, "missing workspace_id")),
-        ("workspace_moved" | "workspace_reordered" | "workspace_focused", Some(data)) => {
+        ("workspace_moved" | "workspace_reordered", Some(data)) => {
             let ids = workspace_ids(data);
             if ids.is_empty() {
                 dropped(&kind, "missing workspace identity")
@@ -123,37 +123,47 @@ pub fn map_event(event: &HerdrEvent<'_>) -> HerdrMapping {
                     .collect()
             }
         }
-        (
-            "tab_created" | "tab_closed" | "tab_renamed" | "tab_moved" | "tab_focused",
-            Some(data),
-        ) => workspace_id_from_tab_event(data)
-            .map(|id| {
-                vec![HerdrIntent::UpsertThread(thread_with_metadata(
-                    id,
-                    workspace_label(data),
-                    event.received_at,
-                    json!({"event": kind}),
-                ))]
-            })
-            .unwrap_or_else(|| dropped(&kind, "missing workspace_id")),
+        ("workspace_focused", Some(data)) => focus_reconciliation_intents(
+            &kind,
+            data,
+            event.payload,
+            event.received_at,
+            "missing workspace identity",
+        ),
+        ("tab_created" | "tab_closed" | "tab_renamed" | "tab_moved", Some(data)) => {
+            workspace_id_from_tab_event(data)
+                .map(|id| {
+                    vec![HerdrIntent::UpsertThread(thread_with_metadata(
+                        id,
+                        workspace_label(data),
+                        event.received_at,
+                        json!({"event": kind}),
+                    ))]
+                })
+                .unwrap_or_else(|| dropped(&kind, "missing workspace_id"))
+        }
         ("pane_moved", Some(data)) => map_pane_moved(&kind, data, event.received_at),
-        (
-            "pane_created"
-            | "pane_updated"
-            | "pane_focused"
-            | "pane_exited"
-            | "pane_agent_detected",
-            Some(data),
-        ) => workspace_id_from_pane_event(data)
-            .map(|id| {
-                vec![HerdrIntent::UpsertThread(thread_with_metadata(
-                    id,
-                    workspace_label(data),
-                    event.received_at,
-                    json!({"event": kind}),
-                ))]
-            })
-            .unwrap_or_else(|| dropped(&kind, "missing workspace_id")),
+        ("pane_created" | "pane_updated" | "pane_exited" | "pane_agent_detected", Some(data)) => {
+            workspace_id_from_pane_event(data)
+                .map(|id| {
+                    vec![HerdrIntent::UpsertThread(thread_with_metadata(
+                        id,
+                        workspace_label(data),
+                        event.received_at,
+                        json!({"event": kind}),
+                    ))]
+                })
+                .unwrap_or_else(|| dropped(&kind, "missing workspace_id"))
+        }
+        // Identical reconciliation bodies share one arm; the helper derives
+        // the named-workspace extraction from the event kind itself.
+        ("tab_focused" | "pane_focused", Some(data)) => focus_reconciliation_intents(
+            &kind,
+            data,
+            event.payload,
+            event.received_at,
+            "missing workspace_id",
+        ),
         ("pane_agent_status_changed", Some(data)) => map_agent_status(&kind, data, event),
         (
             "worktree_created"
@@ -323,6 +333,71 @@ fn map_pane_moved(
     } else {
         intents
     }
+}
+
+/// Reconciles every workspace whose persisted focus attributes a focus event
+/// can change, not just the workspace the event names.
+///
+/// Herdr derives both focus flags from the globally active workspace (pinned
+/// v0.8.0 api.rs:814-871, creation.rs:439-505): a cross-workspace switch emits
+/// workspace/tab/pane .focused events naming only the new workspace, so the
+/// previously focused workspace silently loses its workspace- and pane-level
+/// focus flags without an event of its own. Upsert replacement threads rebuilt
+/// from `bridge.workspace_snapshots` carry the corrected flags, and unchanged
+/// pane IDs/statuses make those upserts pure focus repairs. Workspaces named
+/// by the event but absent from the snapshot set keep the event-derived
+/// fallback thread.
+fn focus_reconciliation_intents(
+    kind: &str,
+    data: &Map<String, Value>,
+    payload: &Value,
+    received_at: DateTime<Utc>,
+    missing_reason: &'static str,
+) -> Vec<HerdrIntent> {
+    let snapshots = payload
+        .pointer("/bridge/workspace_snapshots")
+        .and_then(Value::as_object);
+    let named: Vec<String> = match kind {
+        "pane_focused" => workspace_id_from_pane_event(data)
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+        "tab_focused" => workspace_id_from_tab_event(data)
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => workspace_ids(data)
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+    };
+    let mut ids = named;
+    if let Some(snapshots) = snapshots {
+        for id in snapshots.keys() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+    }
+    if ids.is_empty() {
+        return dropped(kind, missing_reason);
+    }
+    ids.into_iter()
+        .map(|id| {
+            let thread = snapshots
+                .and_then(|items| items.get(&id))
+                .and_then(|snapshot| map_workspace_snapshot(snapshot, received_at))
+                .unwrap_or_else(|| {
+                    thread_with_metadata(
+                        &id,
+                        workspace_label_for(data, &id),
+                        received_at,
+                        json!({"event": kind}),
+                    )
+                });
+            HerdrIntent::UpsertThread(thread)
+        })
+        .collect()
 }
 
 fn workspace_thread(value: &Value, received_at: DateTime<Utc>) -> Option<Thread> {
@@ -546,6 +621,93 @@ mod tests {
             payload: &json!({"event": event, "data": data}),
             received_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         })
+    }
+
+    #[test]
+    fn cross_workspace_focus_reconciles_the_previous_workspace() {
+        let payload = json!({
+            "event": "workspace.focused",
+            "data": {"workspace_id": "workspace-new", "pane_id": "pane-2"},
+            "bridge": {"workspace_snapshots": {
+                "workspace-old": {"workspace_id": "workspace-old", "label": "Old", "focused": false, "panes": [
+                    {"pane_id": "pane-1", "workspace_id": "workspace-old", "agent_status": "working", "focused": false}
+                ]},
+                "workspace-new": {"workspace_id": "workspace-new", "label": "New", "focused": true, "panes": [
+                    {"pane_id": "pane-2", "workspace_id": "workspace-new", "agent_status": "working", "focused": true}
+                ]}
+            }}
+        });
+        let mapping = map_event(&HerdrEvent {
+            event_id: "bridge-event-focus",
+            payload: &payload,
+            received_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        });
+
+        let upserts: Vec<&Thread> = mapping
+            .intents
+            .iter()
+            .filter_map(|intent| match intent {
+                HerdrIntent::UpsertThread(thread) => Some(thread),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            upserts.len(),
+            2,
+            "focus events must reconcile every snapshot workspace"
+        );
+
+        let previous = upserts
+            .iter()
+            .find(|thread| thread.source_id == "workspace-old")
+            .expect("the previously focused workspace must lose focus");
+        assert_eq!(
+            previous.metadata["focused"],
+            json!(false),
+            "workspace-level focus loss must be persisted"
+        );
+        let panes = previous.metadata["panes"].as_array().unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0]["pane_id"], json!("pane-1"));
+        assert_eq!(
+            panes[0]["focused"],
+            json!(false),
+            "pane-level focus loss must be persisted"
+        );
+        assert_eq!(panes[0]["agent_status"], json!("working"));
+
+        let current = upserts
+            .iter()
+            .find(|thread| thread.source_id == "workspace-new")
+            .expect("the newly focused workspace must be reconciled");
+        assert_eq!(current.metadata["focused"], json!(true));
+        let panes = current.metadata["panes"].as_array().unwrap();
+        assert_eq!(panes[0]["pane_id"], json!("pane-2"));
+        assert_eq!(panes[0]["focused"], json!(true));
+    }
+
+    #[test]
+    fn focus_event_without_snapshots_keeps_named_fallback_thread() {
+        let mapping = map(
+            "bridge-event-focus",
+            "workspace.focused",
+            json!({"workspace_id": "workspace-new"}),
+        );
+        let upserts: Vec<&Thread> = mapping
+            .intents
+            .iter()
+            .filter_map(|intent| match intent {
+                HerdrIntent::UpsertThread(thread) => Some(thread),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            upserts.len(),
+            1,
+            "without bridge snapshots only the named workspace is mapped"
+        );
+        assert_eq!(upserts[0].source_id, "workspace-new");
+        assert_eq!(upserts[0].metadata["event"], json!("workspace_focused"));
     }
 
     #[test]
