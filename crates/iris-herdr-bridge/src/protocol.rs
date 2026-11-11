@@ -138,12 +138,9 @@ async fn consume_subscription(
         // independent event kinds without a total source order. Refresh the
         // authoritative workspace snapshot before normalizing any event that
         // can upsert a thread; never let an old event payload regress it.
-        let previous_workspace_snapshots = if refresh_workspace_snapshot(&event_kind) {
-            let refreshed = list_workspace_snapshots(socket_path).await?;
-            Some(std::mem::replace(&mut workspace_snapshots, refreshed))
-        } else {
-            None
-        };
+        if refresh_workspace_snapshot(&event_kind) {
+            workspace_snapshots = list_workspace_snapshots(socket_path).await?;
+        }
         let current_panes = if refresh_pane_snapshot(&event_kind) {
             list_panes(socket_path).await?
         } else {
@@ -152,18 +149,16 @@ async fn consume_subscription(
         if matches!(
             event_kind.as_str(),
             "workspace_moved" | "workspace_reordered"
-        ) && let Some(previous) = previous_workspace_snapshots.as_ref()
-        {
+        ) {
             let mut ids = payload
                 .get("data")
                 .and_then(Value::as_object)
                 .map(workspace_ids_in)
                 .unwrap_or_default();
-            ids.extend(changed_workspace_snapshot_ids(
-                previous,
-                &workspace_snapshots,
-                &current_panes,
-            ));
+            // Reordering can renumber any peer. Do not diff against the last
+            // global source read: an unrelated event may already have refreshed
+            // that cache without reconciling every workspace into Iris.
+            ids.extend(workspace_snapshots.keys().cloned());
             if let Some(data) = payload.get_mut("data").and_then(Value::as_object_mut) {
                 data.insert(
                     "workspace_ids".to_owned(),
@@ -750,25 +745,6 @@ fn normalized_workspace_snapshot(
     Value::Object(normalized)
 }
 
-fn changed_workspace_snapshot_ids(
-    previous: &BTreeMap<String, Value>,
-    current: &BTreeMap<String, Value>,
-    pane_infos: &BTreeMap<String, Value>,
-) -> BTreeSet<String> {
-    current
-        .iter()
-        .filter_map(|(id, snapshot)| {
-            let current = normalized_workspace_snapshot(id, snapshot, pane_infos);
-            previous
-                .get(id)
-                .is_none_or(|snapshot| {
-                    normalized_workspace_snapshot(id, snapshot, pane_infos) != current
-                })
-                .then(|| id.clone())
-        })
-        .collect()
-}
-
 fn enrich_workspace_snapshots(
     payload: &mut Value,
     workspace_snapshots: &BTreeMap<String, Value>,
@@ -1026,8 +1002,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)]
-    #[tokio::test]
-    async fn workspace_move_persists_reordered_numbers_for_displaced_workspaces() {
+    async fn run_workspace_move(intervening_rename: bool) -> (BTreeSet<String>, Value) {
         let dir = tempdir().unwrap();
         let socket_path = dir.path().join("herdr.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -1059,11 +1034,19 @@ mod tests {
             .await
             .unwrap();
 
-        let moved_workspaces = json!([
-            {"workspace_id":"workspace-b", "label":"B", "number":1},
-            {"workspace_id":"workspace-a", "label":"A", "number":2},
-            {"workspace_id":"workspace-c", "label":"C", "number":3}
-        ]);
+        let moved_workspaces = if intervening_rename {
+            json!([
+                {"workspace_id":"workspace-b", "label":"B", "number":1},
+                {"workspace_id":"workspace-a", "label":"A", "number":2},
+                {"workspace_id":"workspace-c", "label":"C renamed", "number":3}
+            ])
+        } else {
+            json!([
+                {"workspace_id":"workspace-b", "label":"B", "number":1},
+                {"workspace_id":"workspace-a", "label":"A", "number":2},
+                {"workspace_id":"workspace-c", "label":"C", "number":3}
+            ])
+        };
         let server = tokio::spawn(async move {
             let (mut ping_stream, _) = listener.accept().await.unwrap();
             let ping = read_request(&mut ping_stream).await;
@@ -1091,6 +1074,19 @@ mod tests {
 
             respond_pane_list(&listener, json!([])).await;
             respond_workspace_list_with_workspaces(&listener, initial_workspaces).await;
+
+            if intervening_rename {
+                super::write_json_line(
+                    &mut event_stream,
+                    &json!({
+                        "event": "workspace.renamed",
+                        "data": {"workspace_id": "workspace-c", "label": "C renamed"}
+                    }),
+                )
+                .await
+                .unwrap();
+                respond_workspace_list_with_workspaces(&listener, moved_workspaces.clone()).await;
+            }
 
             super::write_json_line(
                 &mut event_stream,
@@ -1130,17 +1126,18 @@ mod tests {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(
-            upserted_workspaces,
-            BTreeSet::from(["workspace-a".to_owned(), "workspace-b".to_owned()]),
-            "the moved workspace and displaced peer must both be refreshed"
-        );
         store.apply_batch(batch).await.unwrap();
 
         let state: Value =
             serde_json::from_slice(&std::fs::read(ingest_dir.join("ingest-state.json")).unwrap())
                 .unwrap();
-        let persisted_numbers = state["threads"]
+        (upserted_workspaces, state)
+    }
+
+    fn workspace_numbers_from_ingest_state(
+        state: &Value,
+    ) -> std::collections::BTreeMap<String, u64> {
+        state["threads"]
             .as_object()
             .unwrap()
             .values()
@@ -1150,15 +1147,59 @@ mod tests {
                     thread["metadata"]["number"].as_u64().unwrap(),
                 )
             })
-            .collect::<std::collections::BTreeMap<_, _>>();
+            .collect::<std::collections::BTreeMap<_, _>>()
+    }
+
+    #[tokio::test]
+    async fn workspace_move_persists_reordered_numbers_for_displaced_workspaces() {
+        let (upserted_workspaces, state) = run_workspace_move(false).await;
         assert_eq!(
-            persisted_numbers,
+            workspace_numbers_from_ingest_state(&state),
             std::collections::BTreeMap::from([
                 ("workspace-a".to_owned(), 2),
                 ("workspace-b".to_owned(), 1),
                 ("workspace-c".to_owned(), 3),
             ]),
             "the persisted store must contain the full authoritative workspace order"
+        );
+        assert_eq!(
+            upserted_workspaces,
+            BTreeSet::from([
+                "workspace-a".to_owned(),
+                "workspace-b".to_owned(),
+                "workspace-c".to_owned()
+            ]),
+            "the move must reconcile every current workspace from the authoritative snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_workspace_refresh_does_not_hide_displaced_move() {
+        let (upserted_workspaces, state) = run_workspace_move(true).await;
+        assert_eq!(
+            workspace_numbers_from_ingest_state(&state),
+            std::collections::BTreeMap::from([
+                ("workspace-a".to_owned(), 2),
+                ("workspace-b".to_owned(), 1),
+                ("workspace-c".to_owned(), 3),
+            ]),
+            "the reconciled order must survive an unrelated rename refreshing the global source cache"
+        );
+        let workspace_c = state["threads"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|thread| thread["source_id"] == "workspace-c")
+            .unwrap();
+        assert_eq!(workspace_c["title"], "C renamed");
+        assert_eq!(
+            upserted_workspaces,
+            BTreeSet::from([
+                "workspace-a".to_owned(),
+                "workspace-b".to_owned(),
+                "workspace-c".to_owned()
+            ]),
+            "the move must reconcile every current workspace, not just its named workspace"
         );
     }
 
